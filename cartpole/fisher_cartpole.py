@@ -46,6 +46,36 @@ def get_env_dims(env: Env):
     return state_dim, action_dim
 
 
+class WarmupLR(torch.optim.lr_scheduler.LRScheduler):
+    def __init__(
+        self,
+        optimizer,
+        warmup_steps: int,
+        gamma: float = 0.95,
+        min_lr: float = 0.0,
+        last_epoch: int = -1,
+    ):
+        self.warmup_steps = warmup_steps
+        self.gamma = gamma
+        self.min_lr = min_lr
+
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = self.last_epoch + 1
+
+        if step <= self.warmup_steps:
+            factor = step / max(1, self.warmup_steps)
+            return [base_lr * factor for base_lr in self.base_lrs]
+
+        decay_step = step - self.warmup_steps
+
+        return [
+            max(self.min_lr, base_lr * (self.gamma**decay_step))
+            for base_lr in self.base_lrs
+        ]
+
+
 class Policy(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=64):
         super().__init__()
@@ -305,28 +335,24 @@ class PolicyNLL(nn.Module):
         return nll / len(expert_trajs)
 
 
-class InnerOptimizer(nn.Module):
+class InnerOptimizer:
     def __init__(
         self,
         reward: Reward,
         policy: Policy,
         lr: float,
-        use_baseline: bool = True,
+        max_grad_norm: float,
+        use_baseline: bool = False,
         normalize_coef: bool = False,
-        max_grad_norm: float = 10.0,
     ):
-        super().__init__()
-
         self.policy = policy
         self.reward = reward
         self.use_baseline = use_baseline
         self.normalize_coef = normalize_coef
         self.max_grad_norm = max_grad_norm
 
-        self.optimizer = torch.optim.Adam(
-            self.policy.parameters(),
-            lr=lr,
-        )
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr)
+        self.scheduler = None
 
     def grad(self, trajs) -> torch.Tensor:
         params = list(self.policy.parameters())
@@ -363,24 +389,28 @@ class InnerOptimizer(nn.Module):
 
         return grad
 
+    def step(self, trajs):
+        grad = self.grad(trajs)
+
+        grad_norm = grad.norm().item()
+        if grad_norm > self.max_grad_norm:
+            grad = grad * (self.max_grad_norm / grad_norm)
+
+        self.optimizer.zero_grad()
+        assign_flat_gradients(self.policy, grad)
+        self.optimizer.step()
+
+        if self.scheduler:
+            self.scheduler.step()
+
     def optimize(self, env, n_steps: int, n_traj: int):
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, n_steps, eta_min=1e-6
+        )
+
         for _ in tqdm(range(n_steps), desc="inner", leave=False):
-            trajs = collect_trajectories(
-                env,
-                self.policy,
-                n=n_traj,
-            )
-
-            grad = self.grad(trajs)
-
-            grad_norm = grad.norm().item()
-
-            if grad_norm > self.max_grad_norm:
-                grad = grad * (self.max_grad_norm / grad_norm)
-
-            self.optimizer.zero_grad()
-            assign_flat_gradients(self.policy, grad)
-            self.optimizer.step()
+            trajs = collect_trajectories(env, self.policy, n_traj)
+            self.step(trajs)
 
 
 class OuterOptimizer:
@@ -389,21 +419,22 @@ class OuterOptimizer:
         reward: Reward,
         policy: Policy,
         lr: float,
-        fisher_eps: float = 1e-2,
-        max_grad_norm: float = 100.0,
+        max_grad_norm: float,
+        warmup_steps: int = 10,
+        min_lr: float = 0.0,
+        fisher_reg: float = 1e-2,
+        gamma: float = 0.99,
     ):
         self.reward = reward
         self.policy = policy
-        self.fisher_eps = fisher_eps
+        self.fisher_reg = fisher_reg
+
         self.max_grad_norm = max_grad_norm
-
-        self.optimizer = torch.optim.SGD(
-            self.reward.parameters(),
-            lr=lr,
-        )
-
         self.raw_grad_norm = None
         self.clipped_grad_norm = None
+
+        self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
+        self.scheduler = WarmupLR(self.optimizer, warmup_steps, gamma, min_lr=min_lr)
 
     def update_policy(self, policy: Policy):
         self.policy = policy
@@ -425,7 +456,7 @@ class OuterOptimizer:
             F_mat += torch.outer(score, score)
 
         F_mat /= len(trajs)
-        F_mat += self.fisher_eps * torch.eye(d)
+        F_mat += self.fisher_reg * torch.eye(d)
 
         return F_mat
 
@@ -494,6 +525,9 @@ class OuterOptimizer:
         assign_flat_gradients(self.reward, hypergrad)
         self.optimizer.step()
 
+        if self.scheduler:
+            self.scheduler.step()
+
         return hypergrad
 
 
@@ -527,17 +561,46 @@ def train_expert(env_name, save_path, total_timesteps, seed, verbose=1):
 
 
 def load_expert(env_name, load_path, seed):
-    tmp_env = gym.make(env_name)
-    tmp_env.reset(seed=seed)
-    tmp_env.action_space.seed(seed)
-    tmp_env.observation_space.seed(seed)
-
     model = PPO.load(load_path)
-
     expert_policy = SB3PolicyWrapper(model)
-    tmp_env.close()
-
     return expert_policy
+
+
+def save_irl_checkpoint(
+    path: str,
+    policy: Policy,
+    reward: Reward,
+    state_dim: int,
+    action_dim: int,
+):
+    checkpoint = {
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "policy_state_dict": policy.state_dict(),
+        "reward_state_dict": reward.state_dict(),
+    }
+
+    torch.save(checkpoint, path)
+    print(f"Saved IRL checkpoint to {path}")
+
+
+def load_irl_checkpoint(path: str):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+
+    policy = Policy(
+        state_dim=checkpoint["state_dim"],
+        action_dim=checkpoint["action_dim"],
+    )
+
+    reward = Reward(
+        state_dim=checkpoint["state_dim"],
+        action_dim=checkpoint["action_dim"],
+    )
+
+    policy.load_state_dict(checkpoint["policy_state_dict"])
+    reward.load_state_dict(checkpoint["reward_state_dict"])
+
+    return policy, reward, checkpoint
 
 
 def bilevel_irl(
@@ -607,15 +670,18 @@ def bilevel_irl(
         reward=reward,
         policy=policy,
         lr=lr_outer,
-        fisher_eps=1e-2,
+        fisher_reg=1e-2,
         max_grad_norm=100.0,
+        warmup_steps=5,
+        min_lr=1e-6,
+        gamma=0.99,
     )
 
     inner_optimizer = InnerOptimizer(
         reward=reward,
         policy=policy,
         lr=lr_inner,
-        use_baseline=True,
+        use_baseline=False,
         normalize_coef=False,
         max_grad_norm=10.0,
     )
@@ -629,15 +695,25 @@ def bilevel_irl(
         "l_outer": [],
         "l_inner": [],
         "agent_len": [],
+        "expert_len": [],
         "agent_return": [],
         "expert_return": [],
-        "agent_learned_return": [],
-        "expert_learned_return": [],
         "rank_corr": [],
         "policy_nll": [],
         "raw_hypgrad_norm": [],
         "clipped_hypgrad_norm": [],
+        "lr_outer": [],
     }
+
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    best_checkpoint_path = os.path.join(
+        checkpoint_dir,
+        "fisher_cartpole_checkpoint.pt",
+    )
+
+    best_l_outer = float("inf")
 
     print("\nStep 3: bilevel optimization")
     print("=" * 190)
@@ -646,35 +722,23 @@ def bilevel_irl(
         f"{'L_outer':>10} | "
         f"{'L_inner':>10} | "
         f"{'agent_len':>10} | "
+        f"{'expert_len':>10} | "
         f"{'agent_ret':>10} | "
         f"{'expert_ret':>10} | "
-        f"{'agent_Rphi':>12} | "
-        f"{'expert_Rphi':>12} | "
         f"{'RankCorr':>9} | "
         f"{'PolicyNLL':>10} | "
         f"{'hyp_raw':>10} | "
-        f"{'hyp_clip':>10}"
+        f"{'hyp_clip':>10} |"
+        f"{'lr_outer':>12}"
     )
     print("-" * 190)
 
     for outer_step in range(1, n_outer_steps + 1):
-        inner_optimizer.optimize(
-            env,
-            n_steps=n_inner_steps,
-            n_traj=n_agent_traj,
-        )
+        inner_optimizer.optimize(env, n_inner_steps, n_agent_traj)
+        agent_trajs = collect_trajectories(env, policy, n_agent_traj)
+        outer_optimizer.step(expert_trajs, agent_trajs)
 
-        agent_trajs = collect_trajectories(
-            env,
-            policy,
-            n=n_agent_traj,
-        )
-
-        outer_optimizer.step(
-            expert_trajs=expert_trajs,
-            agent_trajs=agent_trajs,
-        )
-
+        lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
@@ -682,23 +746,10 @@ def bilevel_irl(
         l_inner = inner_loss_fn(policy, reward, agent_trajs).item()
 
         agent_len = np.mean([len(t["states"]) for t in agent_trajs])
+        expert_len = np.mean([len(t["states"]) for t in expert_trajs])
+
         agent_return = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_return = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-
-        with torch.no_grad():
-            agent_learned_return = np.mean(
-                [
-                    reward.trajectory_return(t["states"], t["actions"]).item()
-                    for t in agent_trajs
-                ]
-            )
-
-            expert_learned_return = np.mean(
-                [
-                    reward.trajectory_return(t["states"], t["actions"]).item()
-                    for t in expert_trajs
-                ]
-            )
 
         rank_corr = rank_corr_fn(reward, expert_trajs + agent_trajs)
         policy_nll = policy_nll_fn(policy, expert_trajs)
@@ -706,38 +757,47 @@ def bilevel_irl(
         history["l_outer"].append(l_outer)
         history["l_inner"].append(l_inner)
         history["agent_len"].append(agent_len)
+        history["expert_len"].append(expert_len)
         history["agent_return"].append(agent_return)
         history["expert_return"].append(expert_return)
-        history["agent_learned_return"].append(agent_learned_return)
-        history["expert_learned_return"].append(expert_learned_return)
         history["rank_corr"].append(rank_corr)
         history["policy_nll"].append(policy_nll)
         history["raw_hypgrad_norm"].append(raw_hypgrad_norm)
         history["clipped_hypgrad_norm"].append(clipped_hypgrad_norm)
+        history["lr_outer"].append(lr_outer_current)
+
+        if l_outer < best_l_outer:
+            best_l_outer = l_outer
+
+            save_irl_checkpoint(
+                path=best_checkpoint_path,
+                policy=policy,
+                reward=reward,
+                state_dim=state_dim,
+                action_dim=action_dim,
+            )
 
         print(
             f"{outer_step:>5} | "
             f"{l_outer:>10.3f} | "
             f"{l_inner:>10.3f} | "
             f"{agent_len:>10.1f} | "
+            f"{expert_len:>10.1f} | "
             f"{agent_return:>10.1f} | "
             f"{expert_return:>10.1f} | "
-            f"{agent_learned_return:>12.3f} | "
-            f"{expert_learned_return:>12.3f} | "
             f"{rank_corr:>9.3f} | "
             f"{policy_nll:>10.3f} | "
             f"{raw_hypgrad_norm:>10.3f} | "
-            f"{clipped_hypgrad_norm:>10.3f}"
+            f"{clipped_hypgrad_norm:>10.3f} |"
+            f"{lr_outer_current:>12.2e}"
         )
-
-    inner_optimizer.optimize(
-        env,
-        n_steps=n_inner_steps,
-        n_traj=n_agent_traj,
-    )
 
     print("\nStep 4: final evaluation")
     print("=" * 60)
+
+    if os.path.exists(best_checkpoint_path):
+        policy, reward, checkpoint = load_irl_checkpoint(best_checkpoint_path)
+        print(f"Loaded best checkpoint from {best_checkpoint_path}")
 
     policy.eval()
     reward.eval()
@@ -797,11 +857,11 @@ def bilevel_irl(
 
 if __name__ == "__main__":
     policy, reward, history, metrics = bilevel_irl(
-        n_outer_steps=10,
-        n_inner_steps=10,
+        n_outer_steps=100,
+        n_inner_steps=100,
         n_agent_traj=100,
-        n_expert_traj=1000,
-        n_eval_traj=500,
+        n_expert_traj=10000,
+        n_eval_traj=1000,
         lr_outer=1e-4,
         lr_inner=1e-3,
         seed=42,
