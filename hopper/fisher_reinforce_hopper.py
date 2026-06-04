@@ -17,7 +17,7 @@ def num_params(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
 
 
-def assign_flat_gradients(module: nn.Module, flat_grad: torch.Tensor):
+def assign_flat_gradients(module, flat_grad: torch.Tensor):
     i = 0
     for p in module.parameters():
         n = p.numel()
@@ -41,36 +41,6 @@ def get_env_dims(env: Env):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     return state_dim, action_dim
-
-
-class WarmupLR(torch.optim.lr_scheduler.LRScheduler):
-    def __init__(
-        self,
-        optimizer,
-        warmup_steps: int,
-        gamma: float = 0.99,
-        min_lr: float = 0.0,
-        last_epoch: int = -1,
-    ):
-        self.warmup_steps = warmup_steps
-        self.gamma = gamma
-        self.min_lr = min_lr
-
-        super().__init__(optimizer, last_epoch)
-
-    def get_lr(self):
-        step = self.last_epoch + 1
-
-        if step <= self.warmup_steps:
-            factor = step / max(1, self.warmup_steps)
-            return [base_lr * factor for base_lr in self.base_lrs]
-
-        decay_step = step - self.warmup_steps
-
-        return [
-            max(self.min_lr, base_lr * (self.gamma**decay_step))
-            for base_lr in self.base_lrs
-        ]
 
 
 class Policy(nn.Module):
@@ -290,14 +260,17 @@ class InnerOptimizer:
         max_grad_norm: float,
         use_baseline: bool = False,
         normalize_coef: bool = False,
+        eta_min: float = 0.0,
     ):
         self.policy = policy
         self.reward = reward
         self.use_baseline = use_baseline
         self.normalize_coef = normalize_coef
         self.max_grad_norm = max_grad_norm
+        self.lr = lr
+        self.eta_min = eta_min
 
-        self.optimizer = torch.optim.Adam(self.policy.parameters(), lr)
+        self.optimizer = torch.optim.SGD(self.policy.parameters(), lr)
         self.scheduler = None
 
     def grad(self, trajs) -> torch.Tensor:
@@ -338,9 +311,12 @@ class InnerOptimizer:
     def step(self, trajs):
         grad = self.grad(trajs)
 
-        grad_norm = grad.norm().item()
-        if grad_norm > self.max_grad_norm:
-            grad = grad * (self.max_grad_norm / grad_norm)
+        raw_grad_norm = grad.norm().item()
+
+        if raw_grad_norm > self.max_grad_norm:
+            grad = grad * (self.max_grad_norm / raw_grad_norm)
+
+        clipped_grad_norm = grad.norm().item()
 
         self.optimizer.zero_grad()
         assign_flat_gradients(self.policy, grad)
@@ -349,14 +325,40 @@ class InnerOptimizer:
         if self.scheduler:
             self.scheduler.step()
 
+        return {
+            "inner_grad_raw": raw_grad_norm,
+            "inner_grad_clip": clipped_grad_norm,
+        }
+
     def optimize(self, env, n_steps: int, n_traj: int):
+        self.optimizer = torch.optim.Adam(self.policy.parameters(), self.lr)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, n_steps, eta_min=1e-6
+            self.optimizer, n_steps, eta_min=self.eta_min
         )
 
-        for _ in tqdm(range(n_steps), desc="inner", leave=False):
+        pbar = tqdm(range(n_steps), desc="REINFORCE inner", leave=False)
+
+        for inner_step in pbar:
             trajs = collect_trajectories(env, self.policy, n=n_traj)
-            self.step(trajs)
+
+            stats = self.step(trajs)
+
+            with torch.no_grad():
+                avg_len = np.mean([len(t["states"]) for t in trajs])
+                avg_env_ret = np.mean([sum(t["env_rewards"]) for t in trajs])
+
+                inner_loss = InnerLoss()(self.policy, self.reward, trajs).item()
+
+            lr_current = self.optimizer.param_groups[0]["lr"]
+
+            pbar.set_postfix({
+                "g_raw": f"{stats['inner_grad_raw']:.2e}",
+                "g_clip": f"{stats['inner_grad_clip']:.2e}",
+                "loss": f"{inner_loss:.2f}",
+                "len": f"{avg_len:.1f}",
+                "ret": f"{avg_env_ret:.1f}",
+                "lr": f"{lr_current:.1e}",
+            })
 
 
 class OuterOptimizer:
@@ -366,8 +368,6 @@ class OuterOptimizer:
         policy: Policy,
         lr: float,
         max_grad_norm: float,
-        warmup_steps: int = 10,
-        min_lr: float = 0.0,
         fisher_reg: float = 1e-2,
         gamma: float = 0.99,
     ):
@@ -380,7 +380,7 @@ class OuterOptimizer:
         self.clipped_grad_norm = None
 
         self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
-        self.scheduler = WarmupLR(self.optimizer, warmup_steps, gamma, min_lr=min_lr)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma)
 
     def update_policy(self, policy: Policy):
         self.policy = policy
@@ -434,6 +434,22 @@ class OuterOptimizer:
         fisher = self.fisher(agent_trajs)
         outer_grad = self.outer_grad(expert_trajs)
         cross = self.cross_derivative(agent_trajs)
+
+        with torch.no_grad():
+            eigvals = torch.linalg.eigvalsh(fisher)
+            min_eig = eigvals.min().item()
+            max_eig = eigvals.max().item()
+
+            cond_number = max_eig / max(min_eig, 1e-12)
+            print(
+                f"Fisher stats | "
+                f"min_eig={min_eig:.3e} | "
+                f"max_eig={max_eig:.3e} | "
+                f"cond={cond_number:.3e} | "
+                f"outer_grad_norm={outer_grad.norm().item():.3e} | "
+                f"cross_norm={cross.norm().item():.3e}"
+            )
+
         fisher_inv_outer_grad = torch.linalg.solve(fisher, outer_grad)
         hypergrad = -torch.einsum("tp,t->p", cross, fisher_inv_outer_grad)
         return hypergrad
@@ -458,17 +474,17 @@ class OuterOptimizer:
 
 
 class SB3PolicyWrapper:
-    def __init__(self, model, action_space):
-        self.model = model
-        self.action_low = action_space.low
-        self.action_high = action_space.high
+        def __init__(self, model, action_space):
+            self.model = model
+            self.action_low = action_space.low
+            self.action_high = action_space.high
 
-    def sample_action(self, state):
-        action, _ = self.model.predict(state, deterministic=True)
-        return np.clip(action, self.action_low, self.action_high)
+        def sample_action(self, state):
+            action, _ = self.model.predict(state, deterministic=True)
+            return np.clip(action, self.action_low, self.action_high)
 
-    def eval(self):
-        pass
+        def eval(self):
+            pass
 
 
 def train_expert(env_name, save_path, total_timesteps, seed, verbose=1):
@@ -556,7 +572,8 @@ def load_irl_checkpoint(path: str):
 def bilevel_irl(
     n_outer_steps: int,
     n_inner_steps: int,
-    n_agent_traj: int,
+    n_agent_inner_traj: int,
+    n_agent_outer_traj: int,
     n_expert_traj: int,
     n_eval_traj: int,
     lr_outer: float,
@@ -604,27 +621,16 @@ def bilevel_irl(
         f"Collected {n_expert_traj} trajectories | avg len = {avg_len:.1f} | avg return = {avg_return:.1f}"
     )
 
-    policy = Policy(state_dim, action_dim)
     reward = Reward(state_dim, action_dim)
+    policy = None
 
     outer_optimizer = OuterOptimizer(
         reward=reward,
         policy=policy,
         lr=lr_outer,
-        fisher_reg=1e-2,
-        max_grad_norm=1000.0,
-        warmup_steps=10,
-        min_lr=1e-6,
+        fisher_reg=0.01,
+        max_grad_norm=1.0,
         gamma=0.99,
-    )
-
-    inner_optimizer = InnerOptimizer(
-        reward=reward,
-        policy=policy,
-        lr=lr_inner,
-        use_baseline=False,
-        normalize_coef=False,
-        max_grad_norm=10.0,
     )
 
     outer_loss_fn = OuterLoss()
@@ -651,7 +657,7 @@ def bilevel_irl(
 
     best_checkpoint_path = os.path.join(
         checkpoint_dir,
-        "fisher_hopper_checkpoint.pt",
+        "fisher_reinforce_hopper_checkpoint.pt",
     )
 
     best_l_outer = float("inf")
@@ -675,8 +681,20 @@ def bilevel_irl(
     print("-" * 190)
 
     for outer_step in range(1, n_outer_steps + 1):
-        inner_optimizer.optimize(env, n_inner_steps, n_agent_traj)
-        agent_trajs = collect_trajectories(env, policy, n_agent_traj)
+        policy = Policy(state_dim, action_dim)
+        inner_optimizer = InnerOptimizer(
+            reward=reward,
+            policy=policy,
+            lr=lr_inner,
+            use_baseline=True,
+            normalize_coef=True,
+            max_grad_norm=1.0,
+            eta_min=1e-6
+        )
+        inner_optimizer.optimize(env, n_inner_steps, n_agent_inner_traj)
+
+        agent_trajs = collect_trajectories(env, policy, n_agent_outer_traj)
+        outer_optimizer.update_policy(policy)
         outer_optimizer.step(expert_trajs, agent_trajs)
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
@@ -785,11 +803,12 @@ def bilevel_irl(
 if __name__ == "__main__":
     policy, reward, history, metrics = bilevel_irl(
         n_outer_steps=100,
-        n_inner_steps=1000,
-        n_agent_traj=100,
+        n_inner_steps=100,
+        n_agent_inner_traj=1000,
+        n_agent_outer_traj=1000,
         n_expert_traj=1000,
         n_eval_traj=1000,
-        lr_outer=1e-4,
+        lr_outer=1e-5,
         lr_inner=1e-3,
         seed=42,
     )
