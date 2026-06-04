@@ -1,0 +1,51 @@
+==================================================
+Step 1: loading/training an expert
+==================================================
+Loading saved SAC expert from sac_hopper_expert.zip
+
+Step 2: expert's trajectories
+Collected 1000 trajectories | avg len = 1000.0 | avg return = 3398.5
+
+Step 3: bilevel optimization
+==============================================================================================================================================================================================
+ Step |    L_outer |  agent_len | expert_len |  agent_ret | expert_ret |  RankCorr |  PolicyNLL |    hyp_raw |   hyp_clip |     lr_outer
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Fisher stats | min_eig=9.804e-01 | max_eig=1.503e+05 | cond=1.533e+05 | outer_grad_norm=3.743e+06 | cross_norm=4.847e+03
+Saved IRL checkpoint to checkpoints/fisher_sac_hopper_checkpoint.pt
+    1 |  59061.828 |      481.8 |     1000.0 |      665.4 |     3398.5 |     0.616 |  59061.829 | 763004.562 | 763004.562 |     9.90e-07
+Fisher stats | min_eig=9.986e-01 | max_eig=1.282e+04 | cond=1.284e+04 | outer_grad_norm=5.454e+05 | cross_norm=3.084e+02
+Saved IRL checkpoint to checkpoints/fisher_sac_hopper_checkpoint.pt
+    2 |  18484.174 |       11.7 |     1000.0 |       -0.3 |     3398.5 |    -0.688 |  18484.173 | 300138.938 | 300138.938 |     9.80e-07
+Fisher stats | min_eig=9.981e-01 | max_eig=1.444e+04 | cond=1.447e+04 | outer_grad_norm=9.198e+06 | cross_norm=2.668e+02
+    3 | 261877.828 |        6.0 |     1000.0 |        2.2 |     3398.5 |    -0.729 | 261877.826 | 557894.500 | 557894.500 |     9.70e-07
+Fisher stats | min_eig=9.983e-01 | max_eig=1.387e+04 | cond=1.390e+04 | outer_grad_norm=8.898e+06 | cross_norm=2.171e+02
+    4 | 187635.484 |        7.0 |     1000.0 |        2.9 |     3398.5 |    -0.747 | 187635.468 | 284970.094 | 284970.094 |     9.61e-07
+Fisher stats | min_eig=9.728e-01 | max_eig=3.552e+05 | cond=3.651e+05 | outer_grad_norm=2.648e+05 | cross_norm=4.578e+03
+Saved IRL checkpoint to checkpoints/fisher_sac_hopper_checkpoint.pt
+    5 |   8150.619 |      107.8 |     1000.0 |      222.9 |     3398.5 |    -0.818 |   8150.619 |  84008.188 |  84008.188 |     9.51e-07
+Fisher stats | min_eig=9.832e-01 | max_eig=1.589e+05 | cond=1.617e+05 | outer_grad_norm=2.015e+06 | cross_norm=2.263e+03
+    6 |  44639.875 |       28.7 |     1000.0 |       37.1 |     3398.5 |    -0.384 |  44639.875 | 1716290.250 | 1716290.250 |     9.41e-07
+Fisher stats | min_eig=9.551e-01 | max_eig=5.266e+05 | cond=5.514e+05 | outer_grad_norm=9.441e+05 | cross_norm=1.559e+05
+    7 |  21958.480 |      105.6 |     1000.0 |      187.6 |     3398.5 |    -0.747 |  21958.480 | 599104.000 | 599104.000 |     9.32e-07
+Fisher stats | min_eig=9.393e-01 | max_eig=4.760e+05 | cond=5.067e+05 | outer_grad_norm=7.567e+06 | cross_norm=1.304e+04
+    8 | 147282.203 |       91.4 |     1000.0 |      170.9 |     3398.5 |    -0.817 | 147282.211 | 484033.406 | 484033.406 |     9.23e-07
+Fisher stats | min_eig=9.554e-01 | max_eig=2.733e+05 | cond=2.860e+05 | outer_grad_norm=3.645e+06 | cross_norm=1.290e+04
+    9 |  60009.016 |      158.6 |     1000.0 |      182.2 |     3398.5 |    -0.716 |  60009.018 | 3987150.750 | 3987150.750 |     9.14e-07
+Fisher stats | min_eig=9.147e-01 | max_eig=1.151e+06 | cond=1.259e+06 | outer_grad_norm=2.673e+06 | cross_norm=2.779e+04
+   10 |  51455.652 |      999.7 |     1000.0 |      975.4 |     3398.5 |    -0.783 |  51455.653 | 912312.312 | 912312.312 |     9.04e-07
+Fisher stats | min_eig=8.127e-01 | max_eig=1.861e+06 | cond=2.290e+06 | outer_grad_norm=2.447e+07 | cross_norm=3.646e+04
+   11 | 277609.594 |     1000.0 |     1000.0 |     1001.4 |     3398.5 |     0.771 | 277609.599 | 1796776.750 | 1796776.750 |     8.95e-07
+Fisher stats | min_eig=9.972e-01 | max_eig=1.828e+04 | cond=1.833e+04 | outer_grad_norm=1.466e+06 | cross_norm=3.422e+02
+   12 |  23871.988 |        6.0 |     1000.0 |        1.7 |     3398.5 |    -0.854 |  23871.989 | 115976.297 | 115976.297 |     8.86e-07
+Fisher stats | min_eig=9.984e-01 | max_eig=1.412e+04 | cond=1.414e+04 | outer_grad_norm=1.210e+06 | cross_norm=2.968e+02
+   13 |  21656.061 |        6.0 |     1000.0 |        1.4 |     3398.5 |    -0.832 |  21656.060 | 172326.375 | 172326.375 |     8.78e-07
+Fisher stats | min_eig=9.988e-01 | max_eig=7.818e+03 | cond=7.827e+03 | outer_grad_norm=1.013e+06 | cross_norm=3.529e+02
+   14 |  20953.426 |        6.2 |     1000.0 |        1.6 |     3398.5 |    -0.831 |  20953.425 | 112526.016 | 112526.016 |     8.69e-07
+Fisher stats | min_eig=9.995e-01 | max_eig=5.808e+03 | cond=5.811e+03 | outer_grad_norm=5.388e+05 | cross_norm=3.072e+02
+   15 |  12478.717 |        6.2 |     1000.0 |        1.5 |     3398.5 |    -0.825 |  12478.717 |  59087.371 |  59087.371 |     8.60e-07
+Fisher stats | min_eig=9.993e-01 | max_eig=5.096e+03 | cond=5.099e+03 | outer_grad_norm=5.425e+05 | cross_norm=2.332e+02
+   16 |  13574.704 |        6.3 |     1000.0 |        1.6 |     3398.5 |    -0.790 |  13574.705 | 196844.844 | 196844.844 |     8.51e-07
+Fisher stats | min_eig=9.994e-01 | max_eig=6.848e+03 | cond=6.852e+03 | outer_grad_norm=6.227e+05 | cross_norm=2.689e+02
+   17 |  15825.398 |        7.2 |     1000.0 |        1.8 |     3398.5 |    -0.825 |  15825.398 | 259838.422 | 259838.422 |     8.43e-07
+Fisher stats | min_eig=9.996e-01 | max_eig=5.816e+03 | cond=5.819e+03 | outer_grad_norm=6.282e+05 | cross_norm=2.229e+02
+   18 |  16660.818 |        6.3 |     1000.0 |        1.5 |     3398.5 |    -0.821 |  16660.818 |  12510.239 |  12510.239 |     8.35e-07
