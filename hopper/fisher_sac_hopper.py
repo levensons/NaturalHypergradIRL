@@ -521,6 +521,7 @@ class OuterOptimizer:
         self.reward = reward
         self.policy = policy
         self.fisher_reg = fisher_reg
+        self.gamma = gamma
 
         self.max_grad_norm = max_grad_norm
         self.raw_grad_norm = None
@@ -535,6 +536,17 @@ class OuterOptimizer:
     def score(self, states, actions) -> torch.Tensor:
         # log_prob_mean = self.policy.log_prob(states, actions).mean()
         log_prob_sum = self.policy.log_prob(states, actions).sum()
+        grads = torch.autograd.grad(log_prob_sum, self.policy.parameters())
+        return flat_grad(grads)
+
+    def discounted_score(self, states, actions) -> torch.Tensor:
+        ts = torch.arange(
+            states.size(0),
+            dtype=torch.float32,
+            device=states.device,
+        )
+        discounts = torch.pow(self.gamma.to(states.device), ts)
+        log_prob_sum = (discounts * self.policy.log_prob(states, actions)).sum()
         grads = torch.autograd.grad(log_prob_sum, self.policy.parameters())
         return flat_grad(grads)
 
@@ -557,7 +569,8 @@ class OuterOptimizer:
 
         for traj in expert_trajs:
             states, actions = traj["states"], traj["actions"]
-            grad += self.score(states, actions)
+            # grad += self.score(states, actions)
+            grad += self.discounted_score(states, actions)
 
         return -grad / len(expert_trajs)
 
@@ -578,10 +591,30 @@ class OuterOptimizer:
 
         return -H / len(trajs)
 
+    def cross_derivative_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
+        d_theta = num_params(self.policy)
+        d_phi = num_params(self.reward)
+
+        result = torch.zeros(d_theta)
+
+        for traj in trajs:
+            states, actions = traj["states"], traj["actions"]
+            s_theta = self.score(states, actions)
+
+            reward_sum = self.reward.trajectory_return(states, actions)
+            grads_phi = torch.autograd.grad(reward_sum, self.reward.parameters())
+            g_phi = flat_grad(grads_phi)
+
+            assert len(g_phi.shape) == 1
+
+            result += (s_theta * v).sum() * g_phi
+
+        return -result / len(trajs)
+
     def hypergradient(self, expert_trajs, agent_trajs) -> torch.Tensor:
         fisher = self.fisher(agent_trajs)
         outer_grad = self.outer_grad(expert_trajs)
-        cross = self.cross_derivative(agent_trajs)
+        # cross = self.cross_derivative(agent_trajs)
 
         with torch.no_grad():
             eigvals = torch.linalg.eigvalsh(fisher)
@@ -599,7 +632,8 @@ class OuterOptimizer:
             )
 
         fisher_inv_outer_grad = torch.linalg.solve(fisher, outer_grad)
-        hypergrad = -torch.matmul(cross.T, fisher_inv_outer_grad)
+        # hypergrad = -torch.matmul(cross.T, fisher_inv_outer_grad)
+        hypergrad = -self.cross_derivative_vec_product(agent_trajs, fisher_inv_outer_grad)
 
         return hypergrad
 
