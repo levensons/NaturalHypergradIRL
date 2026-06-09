@@ -545,7 +545,10 @@ class OuterOptimizer:
             dtype=torch.float32,
             device=states.device,
         )
-        discounts = torch.pow(self.gamma.to(states.device), ts)
+        discounts = torch.pow(
+            torch.tensor(self.gamma, dtype=torch.float32, device=states.device),
+            ts,
+        )
         log_prob_sum = (discounts * self.policy.log_prob(states, actions)).sum()
         grads = torch.autograd.grad(log_prob_sum, self.policy.parameters())
         return flat_grad(grads)
@@ -592,10 +595,8 @@ class OuterOptimizer:
         return -H / len(trajs)
 
     def cross_derivative_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
-        d_theta = num_params(self.policy)
         d_phi = num_params(self.reward)
-
-        result = torch.zeros(d_theta)
+        result = torch.zeros(d_phi)
 
         for traj in trajs:
             states, actions = traj["states"], traj["actions"]
@@ -605,16 +606,18 @@ class OuterOptimizer:
             grads_phi = torch.autograd.grad(reward_sum, self.reward.parameters())
             g_phi = flat_grad(grads_phi)
 
-            assert len(g_phi.shape) == 1
-
-            result += (s_theta * v).sum() * g_phi
+            result += torch.dot(s_theta, v) * g_phi
 
         return -result / len(trajs)
 
     def hypergradient(self, expert_trajs, agent_trajs) -> torch.Tensor:
         fisher = self.fisher(agent_trajs)
         outer_grad = self.outer_grad(expert_trajs)
-        # cross = self.cross_derivative(agent_trajs)
+
+        fisher_inv_outer_grad = torch.linalg.solve(fisher, outer_grad)
+        hypergrad = self.cross_derivative_vec_product(
+            agent_trajs, fisher_inv_outer_grad
+        )
 
         with torch.no_grad():
             eigvals = torch.linalg.eigvalsh(fisher)
@@ -628,12 +631,8 @@ class OuterOptimizer:
                 f"max_eig={max_eig:.3e} | "
                 f"cond={cond_number:.3e} | "
                 f"outer_grad_norm={outer_grad.norm().item():.3e} | "
-                f"cross_norm={cross.norm().item():.3e}"
+                f"hypergrad_norm={hypergrad.norm().item():.3e}"
             )
-
-        fisher_inv_outer_grad = torch.linalg.solve(fisher, outer_grad)
-        # hypergrad = -torch.matmul(cross.T, fisher_inv_outer_grad)
-        hypergrad = -self.cross_derivative_vec_product(agent_trajs, fisher_inv_outer_grad)
 
         return hypergrad
 
