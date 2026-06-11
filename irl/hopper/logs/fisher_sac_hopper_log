@@ -1,0 +1,18 @@
+==================================================
+Step 1: loading/training an expert
+==================================================
+Loading saved SAC expert from sac_hopper_expert.zip
+
+Step 2: expert's trajectories
+Collected 1000 trajectories | avg len = 1000.0 | avg return = 3398.5
+
+Step 3: bilevel optimization
+==============================================================================================================================================================================================
+ Step |    L_outer |  agent_len | expert_len |  agent_ret | expert_ret |  RankCorr |  PolicyNLL |    hyp_raw |   hyp_clip |     lr_outer
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Fisher stats | min_eig=7.781e-01 | max_eig=1.608e+06 | cond=2.067e+06 | outer_grad_norm=1.065e+05 | hypergrad_norm=1.587e+03
+Saved IRL checkpoint to checkpoints/fisher_sac_hopper_checkpoint.pt
+    1 |  43825.312 |      162.4 |     1000.0 |      408.5 |     3398.5 |    -0.687 |  43825.313 |   1586.554 |   1586.554 |     9.90e-07
+Fisher stats | min_eig=9.097e-01 | max_eig=1.145e+06 | cond=1.259e+06 | outer_grad_norm=5.963e+04 | hypergrad_norm=5.661e+03
+Saved IRL checkpoint to checkpoints/fisher_sac_hopper_checkpoint.pt
+    2 |  29572.807 |      163.5 |     1000.0 |      418.6 |     3398.5 |    -0.628 |  29572.804 |   5660.815 |   5660.815 |     9.80e-07
