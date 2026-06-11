@@ -1,0 +1,32 @@
+{
+  "env_name": "hopper",
+  "env_id": "Hopper-v5",
+  "max_steps": 1000,
+  "expert_algo": "sac",
+  "expert_path": "models/hopper/expert.zip",
+  "output_dir": "data/hopper",
+  "splits": {
+    "valid": {
+      "n": 100,
+      "seed": 2000
+    },
+    "test": {
+      "n": 100,
+      "seed": 30000
+    }
+  },
+  "files": {
+    "expert_train": "data/hopper/expert_train_trajs.pt",
+    "expert_valid": "data/hopper/expert_valid_trajs.pt",
+    "expert_test": "data/hopper/expert_test_trajs.pt",
+    "random_valid": "data/hopper/random_valid_trajs.pt",
+    "random_test": "data/hopper/random_test_trajs.pt"
+  },
+  "trajectory_format": {
+    "states": "[T, state_dim], torch.float32",
+    "actions": "[T] for discrete or [T, action_dim] for continuous",
+    "env_rewards": "[T], torch.float32",
+    "dones": "[T], torch.float32",
+    "seed": "int"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "env_name": "cartpole",
+  "env_id": "CartPole-v1",
+  "max_steps": 500,
+  "expert_algo": "ppo",
+  "expert_path": "models/cartpole/expert.zip",
+  "output_dir": "data/cartpole",
+  "splits": {
+    "valid": {
+      "n": 100,
+      "seed": 2000
+    },
+    "test": {
+      "n": 100,
+      "seed": 30000
+    }
+  },
+  "files": {
+    "expert_train": "data/cartpole/expert_train_trajs.pt",
+    "expert_valid": "data/cartpole/expert_valid_trajs.pt",
+    "expert_test": "data/cartpole/expert_test_trajs.pt",
+    "random_valid": "data/cartpole/random_valid_trajs.pt",
+    "random_test": "data/cartpole/random_test_trajs.pt"
+  },
+  "trajectory_format": {
+    "states": "[T, state_dim], torch.float32",
+    "actions": "[T] for discrete or [T, action_dim] for continuous",
+    "env_rewards": "[T], torch.float32",
+    "dones": "[T], torch.float32",
+    "seed": "int"
+  }
+}

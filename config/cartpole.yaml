@@ -1,0 +1,73 @@
+env:
+  name: cartpole
+  id: CartPole-v1
+  action_type: discrete
+  max_steps: 500
+
+expert:
+  algo: ppo
+  save_path: models/cartpole/expert
+  env_seed: 42
+  total_timesteps: 100000
+
+  params:
+    policy: MlpPolicy
+    learning_rate: 0.001
+    n_steps: 2048
+    batch_size: 64
+    n_epochs: 10
+    gamma: 0.99
+    seed: 42
+
+trajectory_collection:
+  output_dir: data/cartpole
+  random_trajs_seed: 1000000
+
+  train:
+    n: 1000
+    seed: 100
+
+  valid:
+    n: 100
+    seed: 2000
+
+  test:
+    n: 100
+    seed: 30000
+
+policy:
+  hidden: 128
+
+reward:
+  hidden: 64
+  gamma: 0.99
+
+training:
+  n_outer_steps: 100
+  n_inner_steps: 100
+  n_agent_traj: 100
+  n_expert_traj: 10000
+  lr_outer: 1.0e-4
+  lr_inner: 1.0e-3
+
+inner_optimizer:
+  max_grad_norm: 10.0
+  use_baseline: false
+  normalize_coef: false
+
+outer_optimizer:
+  fisher_reg: 1.0e-2
+  max_grad_norm: 100.0
+  warmup_steps: 5
+  min_lr: 1.0e-6
+  gamma: 0.99
+
+evaluation:
+  n_eval_traj: 1000
+  expert_train_trajs_path: data/cartpole/expert_train_trajs.pt
+  expert_valid_trajs_path: data/cartpole/expert_valid_trajs.pt
+  expert_test_trajs_path: data/cartpole/expert_test_trajs.pt
+  random_train_trajs_path: data/cartpole/random_train_trajs.pt
+  random_valid_trajs_path: data/cartpole/random_valid_trajs.pt
+  random_test_trajs_path: data/cartpole/random_test_trajs.pt
+  eval_seeds_path: data/cartpole/eval_seeds.json
