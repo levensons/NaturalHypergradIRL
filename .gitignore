@@ -221,3 +221,9 @@ __marimo__/
 
 
 .DS_Store
+
+# Training logs and reports (keep only .gitkeep placeholders)
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep

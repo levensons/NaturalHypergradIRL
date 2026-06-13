@@ -2,18 +2,9 @@ import argparse
 from pathlib import Path
 
 import gymnasium as gym
-import yaml
 from stable_baselines3 import PPO, SAC
 
-
-def load_config(path: str) -> dict:
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"Config not found: {path}")
-
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from src.common.config import load_config, resolve_config_path
 
 
 def seed_env(env, seed: int):
@@ -99,16 +90,6 @@ def parse():
     )
 
     return parser.parse_args()
-
-
-def resolve_config_path(env_name: str | None, config_path: str | None) -> str:
-    if config_path is not None:
-        return config_path
-
-    if env_name is None:
-        raise ValueError("Specify either --env or --config.")
-
-    return f"config/{env_name}.yaml"
 
 
 def main():
