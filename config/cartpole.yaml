@@ -36,38 +36,46 @@ trajectory_collection:
     seed: 30000
 
 policy:
-  hidden: 128
+  hidden: 64
+  n_hidden_layers: 2
 
 reward:
   hidden: 64
   gamma: 0.99
 
 training:
-  n_outer_steps: 100
-  n_inner_steps: 100
+  n_outer_steps: 20
+  n_inner_steps: 60
   n_agent_traj: 100
-  n_expert_traj: 10000
-  lr_outer: 1.0e-4
-  lr_inner: 1.0e-3
+  lr_outer: 5e-3
+  lr_inner: 5e-3
+  seed: 42
 
-inner_optimizer:
+inner_agent:
+  type: reinforce
   max_grad_norm: 10.0
   use_baseline: false
   normalize_coef: false
 
 outer_optimizer:
-  fisher_reg: 1.0e-2
+  fisher_reg: 1e-2
   max_grad_norm: 100.0
   warmup_steps: 5
-  min_lr: 1.0e-6
+  min_lr: 1e-6
   gamma: 0.99
 
-evaluation:
-  n_eval_traj: 1000
-  expert_train_trajs_path: data/cartpole/expert_train_trajs.pt
-  expert_valid_trajs_path: data/cartpole/expert_valid_trajs.pt
-  expert_test_trajs_path: data/cartpole/expert_test_trajs.pt
-  random_train_trajs_path: data/cartpole/random_train_trajs.pt
-  random_valid_trajs_path: data/cartpole/random_valid_trajs.pt
-  random_test_trajs_path: data/cartpole/random_test_trajs.pt
-  eval_seeds_path: data/cartpole/eval_seeds.json
+# Пути к тестовым траекториям (из data/, не пересобираем)
+data:
+  expert_train_trajs: data/cartpole/expert_train_trajs.pt
+  expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
+  expert_test_trajs: data/cartpole/expert_test_trajs.pt
+  random_valid_trajs: data/cartpole/random_valid_trajs.pt
+  random_test_trajs: data/cartpole/random_test_trajs.pt
+
+checkpoint:
+  dir: checkpoints/cartpole
+
+logging:
+  log_dir: logs
+  report_dir: reports
+  log_every: 1

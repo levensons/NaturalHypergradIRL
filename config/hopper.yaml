@@ -39,7 +39,8 @@ trajectory_collection:
     seed: 30000
 
 policy:
-  hidden: 128
+  hidden: 64
+  n_hidden_layers: 2
   log_std_min: -5
   log_std_max: 2
 
@@ -51,12 +52,44 @@ training:
   n_outer_steps: 100
   n_inner_steps: 100000
   n_agent_traj: 1000
-  n_expert_traj: 1000
-  lr_outer: 1.0e-6
-  lr_inner: 1.0e-4
+  lr_outer: 1e-6
+  lr_inner: 1e-4
+  seed: 42
 
-evaluation:
-  n_eval_traj: 1000
-  expert_trajs_path: data/hopper/expert_eval_trajs.pt
-  random_trajs_path: data/hopper/random_eval_trajs.pt
-  eval_seeds_path: data/hopper/eval_seeds.json
+inner_agent:
+  type: sac
+  max_grad_norm: 10.0
+  use_baseline: false
+  normalize_coef: false
+  sac:
+    lr_q: 1e-3
+    buffer_size: 300000
+    batch_size: 256
+    learning_starts: 500
+    tau: 0.005
+    alpha: 0.2
+    autotune: true
+    policy_frequency: 2
+    target_network_frequency: 1
+    gamma: 0.99
+
+outer_optimizer:
+  fisher_reg: 1.0
+  max_grad_norm: null
+  min_lr: 1.0e-6
+  gamma: 0.99
+
+data:
+  expert_train_trajs: data/hopper/expert_train_trajs.pt
+  expert_valid_trajs: data/hopper/expert_valid_trajs.pt
+  expert_test_trajs:  data/hopper/expert_test_trajs.pt
+  random_valid_trajs: data/hopper/random_valid_trajs.pt
+  random_test_trajs:  data/hopper/random_test_trajs.pt
+
+checkpoint:
+  dir: checkpoints/hopper
+
+logging:
+  log_dir: logs
+  report_dir: reports
+  log_every: 1
