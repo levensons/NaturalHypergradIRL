@@ -17,7 +17,7 @@ from gymnasium import Env
 from torch.distributions import Categorical
 from tqdm import tqdm
 
-from evaluation.metrics import InnerLoss, OuterLoss, PolicyNLL, RankCorr
+from evaluation.metrics import inner_loss, outer_loss, policy_nll, rank_corr
 from src.common.checkpoint import load_checkpoint, save_checkpoint
 from src.common.config import load_config, resolve_config_path, set_seed
 from src.common.logging_utils import get_logger, save_history
@@ -273,13 +273,13 @@ class OuterOptimizer:
 
 def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     """Двухуровневая оптимизация Fisher-NHD. Алгоритм не изменён."""
-    train_cfg   = config["training"]
-    inner_cfg   = config.get("inner_agent", {})
-    outer_cfg   = config.get("outer_optimizer", {})
-    policy_cfg  = config.get("policy", {})
-    reward_cfg  = config.get("reward", {})
-    ckpt_cfg    = config.get("checkpoint", {})
-    log_cfg     = config.get("logging", {})
+    train_cfg = config["training"]
+    inner_cfg = config.get("inner_agent", {})
+    outer_cfg = config.get("outer_optimizer", {})
+    policy_cfg = config.get("policy", {})
+    reward_cfg = config.get("reward", {})
+    ckpt_cfg = config.get("checkpoint", {})
+    log_cfg = config.get("logging", {})
 
     n_outer_steps = int(train_cfg["n_outer_steps"])
     n_inner_steps = int(train_cfg["n_inner_steps"])
@@ -314,11 +314,6 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         use_baseline=bool(inner_cfg.get("use_baseline", False)),
         normalize_coef=bool(inner_cfg.get("normalize_coef", False)),
     )
-
-    outer_loss_fn = OuterLoss()
-    inner_loss_fn = InnerLoss()
-    rank_corr_fn  = RankCorr()
-    policy_nll_fn = PolicyNLL()
 
     history = {
         "l_outer": [], "l_inner": [], "agent_len": [], "expert_len": [],
@@ -358,18 +353,18 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
         outer_optimizer.step(expert_trajs, agent_trajs)
 
-        lr_outer_current    = outer_optimizer.optimizer.param_groups[0]["lr"]
-        raw_hypgrad_norm    = outer_optimizer.raw_grad_norm
+        lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
+        raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
-        l_outer    = outer_loss_fn(policy, expert_trajs).item()
-        l_inner    = inner_loss_fn(policy, reward, agent_trajs).item()
-        agent_len  = np.mean([len(t["states"]) for t in agent_trajs])
+        l_outer = outer_loss(policy, expert_trajs).item()
+        l_inner = inner_loss(policy, reward, agent_trajs).item()
+        agent_len = np.mean([len(t["states"]) for t in agent_trajs])
         expert_len = np.mean([len(t["states"]) for t in expert_trajs])
-        agent_ret  = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
+        agent_ret = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_ret = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-        rank_corr  = rank_corr_fn(reward, expert_trajs + agent_trajs)
-        policy_nll = policy_nll_fn(policy, expert_trajs)
+        rank_corr_val  = rank_corr(reward, expert_trajs + agent_trajs)
+        policy_nll_val = policy_nll(policy, expert_trajs)
 
         history["l_outer"].append(l_outer)
         history["l_inner"].append(l_inner)
@@ -377,8 +372,8 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         history["expert_len"].append(expert_len)
         history["agent_return"].append(agent_ret)
         history["expert_return"].append(expert_ret)
-        history["rank_corr"].append(rank_corr)
-        history["policy_nll"].append(policy_nll)
+        history["rank_corr"].append(rank_corr_val)
+        history["policy_nll"].append(policy_nll_val)
         history["raw_hypgrad_norm"].append(raw_hypgrad_norm)
         history["clipped_hypgrad_norm"].append(clipped_hypgrad_norm)
         history["lr_outer"].append(lr_outer_current)
@@ -393,7 +388,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         row = (
             f"{outer_step:>5} | {l_outer:>10.3f} | {l_inner:>10.3f} | "
             f"{agent_len:>10.1f} | {expert_len:>10.1f} | {agent_ret:>10.1f} | "
-            f"{expert_ret:>10.1f} | {rank_corr:>9.3f} | {policy_nll:>10.3f} | "
+            f"{expert_ret:>10.1f} | {rank_corr_val:>9.3f} | {policy_nll_val:>10.3f} | "
             f"{raw_hypgrad_norm:>10.3f} | {clipped_hypgrad_norm:>10.3f} | "
             f"{lr_outer_current:>12.2e}"
         )
@@ -418,8 +413,8 @@ def main():
     config = load_config(config_path)
 
     train_cfg  = config["training"]
-    log_cfg    = config.get("logging", {})
-    data_cfg   = config.get("data", {})
+    log_cfg = config.get("logging", {})
+    data_cfg = config.get("data", {})
 
     set_seed(int(train_cfg.get("seed", 42)))
 
@@ -433,14 +428,7 @@ def main():
     expert_train_path = data_cfg.get("expert_train_trajs", "data/cartpole/expert_train_trajs.pt")
     all_expert_trajs = torch.load(expert_train_path, map_location="cpu", weights_only=False)
 
-    n_expert_traj = int(train_cfg.get("n_expert_traj", 1000))
-    if len(all_expert_trajs) < n_expert_traj:
-        logger.warning(
-            f"Запрошено {n_expert_traj} экспертных траекторий, "
-            f"доступно {len(all_expert_trajs)} → используем все доступные."
-        )
-        n_expert_traj = len(all_expert_trajs)
-    expert_trajs = all_expert_trajs[:n_expert_traj]
+    expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
     logger.info("=== Fisher-NHD CartPole: начинаю двухуровневую оптимизацию ===")

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from evaluation.metrics import PolicyNLL, RankCorr, env_reward
+from evaluation.metrics import env_reward, policy_nll, rank_corr
 from src.common.checkpoint import load_checkpoint
 from src.common.config import load_config, resolve_config_path
 
@@ -27,9 +27,9 @@ from src.common.config import load_config, resolve_config_path
 _REGISTRY: dict[tuple[str, str, str], str] = {
     ("cartpole", "fisher", "reinforce"): "irl.cartpole.fisher_cartpole",
     ("cartpole", "ttsa",   "reinforce"): "irl.cartpole.ttsa_cartpole",
-    ("hopper",   "fisher", "reinforce"): "irl.hopper.fisher_reinforce_hopper",
-    ("hopper",   "fisher", "sac"):       "irl.hopper.fisher_sac_hopper",
-    ("hopper",   "ttsa",   "reinforce"): "irl.hopper.ttsa_hopper",
+    ("hopper", "fisher", "reinforce"): "irl.hopper.fisher_reinforce_hopper",
+    ("hopper", "fisher", "sac"): "irl.hopper.fisher_sac_hopper",
+    ("hopper", "ttsa", "reinforce"): "irl.hopper.ttsa_hopper",
 }
 
 
@@ -165,8 +165,6 @@ def main():
     random_test_trajs = torch.load(random_test_path, map_location="cpu", weights_only=False)
     print(f"Loaded {len(expert_test_trajs)} expert test + {len(random_test_trajs)} random test trajs.")
 
-    n_eval_traj = args.n_eval_traj or config.get("training", {}).get("n_eval_traj", 100)
-
     if args.check_only:
         print("--check-only: static check passed. Skipping rollouts and metric computation.")
         env.close()
@@ -174,30 +172,29 @@ def main():
 
     # Роллауты агента
     max_steps = env_cfg.get("max_steps", 1000)
-    agent_test_trajs = _collect_agent_trajs(env, policy, n_eval_traj, max_steps)
+    n_agent_traj = args.n_eval_traj or len(expert_test_trajs)
+    agent_test_trajs = _collect_agent_trajs(env, policy, n_agent_traj, max_steps)
 
-    # Метрики
-    expert_slice = expert_test_trajs[:n_eval_traj]
-    random_slice = random_test_trajs[:n_eval_traj]
-    rank_pool = expert_slice + agent_test_trajs + random_slice
+    # Метрики — используем все траектории из файлов
+    rank_pool = expert_test_trajs + agent_test_trajs + random_test_trajs
 
-    policy_nll_val = PolicyNLL()(policy, expert_slice)
-    rank_corr_val  = RankCorr()(reward, rank_pool)
-    agent_ret      = env_reward(agent_test_trajs)
-    expert_ret     = env_reward(expert_slice)
-    random_ret     = env_reward(random_slice)
+    policy_nll_val = policy_nll(policy, expert_test_trajs)
+    rank_corr_val = rank_corr(reward, rank_pool)
+    agent_ret = env_reward(agent_test_trajs)
+    expert_ret = env_reward(expert_test_trajs)
+    random_ret = env_reward(random_test_trajs)
 
     metrics = {
-        "env":       env_name,
-        "method":    method,
-        "agent":     agent,
+        "env": env_name,
+        "method": method,
+        "agent": agent,
         "checkpoint": str(args.checkpoint),
-        "n_eval_traj": n_eval_traj,
-        "PolicyNLL":  policy_nll_val,
-        "EnvReward":  agent_ret,
-        "ExpertRet":  expert_ret,
-        "RandomRet":  random_ret,
-        "RankCorr":   rank_corr_val,
+        "n_agent_traj": n_agent_traj,
+        "PolicyNLL": policy_nll_val,
+        "EnvReward": agent_ret,
+        "ExpertRet": expert_ret,
+        "RandomRet": random_ret,
+        "RankCorr": rank_corr_val,
     }
 
     print("\n=== Table II Metrics ===")

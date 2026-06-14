@@ -35,7 +35,6 @@ trajectory_collection:
     n: 100
     seed: 30000
 
-# Расхождение №1: в коде default hidden=64, в конфиге было 128 → исправлено до 64
 policy:
   hidden: 64
   n_hidden_layers: 2
@@ -44,16 +43,12 @@ reward:
   hidden: 64
   gamma: 0.99
 
-# Расхождение №7: в коде n_expert_traj=10000, в data/cartpole/expert_train_trajs.pt
-# хранится 1000 траекторий → ставим 1000 и ограничиваем при загрузке
 training:
-  n_outer_steps: 100
-  n_inner_steps: 100
+  n_outer_steps: 20
+  n_inner_steps: 60
   n_agent_traj: 100
-  n_expert_traj: 1000
-  n_eval_traj: 1000
-  lr_outer: 1.0e-4
-  lr_inner: 1.0e-3
+  lr_outer: 5e-3
+  lr_inner: 5e-3
   seed: 42
 
 inner_agent:
@@ -63,19 +58,19 @@ inner_agent:
   normalize_coef: false
 
 outer_optimizer:
-  fisher_reg: 1.0e-2
+  fisher_reg: 1e-2
   max_grad_norm: 100.0
   warmup_steps: 5
-  min_lr: 1.0e-6
+  min_lr: 1e-6
   gamma: 0.99
 
-# Пути к тестовым траекториям (из data/, не пересобираются)
+# Пути к тестовым траекториям (из data/, не пересобираем)
 data:
   expert_train_trajs: data/cartpole/expert_train_trajs.pt
   expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
-  expert_test_trajs:  data/cartpole/expert_test_trajs.pt
+  expert_test_trajs: data/cartpole/expert_test_trajs.pt
   random_valid_trajs: data/cartpole/random_valid_trajs.pt
-  random_test_trajs:  data/cartpole/random_test_trajs.pt
+  random_test_trajs: data/cartpole/random_test_trajs.pt
 
 checkpoint:
   dir: checkpoints/cartpole

@@ -18,7 +18,7 @@ import torch.nn as nn
 import gymnasium as gym
 from torch.distributions import Normal
 
-from evaluation.metrics import InnerLoss, OuterLoss, PolicyNLL, RankCorr
+from evaluation.metrics import inner_loss, outer_loss
 from src.common.config import load_config, resolve_config_path, set_seed
 from src.common.logging_utils import get_logger, save_history
 
@@ -35,9 +35,9 @@ class GaussianPolicyNet(nn.Module):
         self.log_std = nn.Parameter(-0.5 * torch.ones(action_dim))
 
     def forward(self, x):
-        mu      = self.action_scale * torch.tanh(self.mu_net(x))
+        mu = self.action_scale * torch.tanh(self.mu_net(x))
         log_std = torch.clamp(self.log_std, -5.0, 2.0)
-        std     = torch.exp(log_std).expand_as(mu)
+        std = torch.exp(log_std).expand_as(mu)
         return mu, std
 
     def log_prob(self, states, actions):
@@ -255,8 +255,6 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
     inner_optimizer = torch.optim.SGD(policy.parameters(),     lr=alpha_inner)
     outer_optimizer = torch.optim.SGD(reward_net.parameters(), lr=beta_outer)
 
-    outer_loss_fn = OuterLoss()
-    inner_loss_fn = InnerLoss()
 
     history = {
         "l_outer": [], "l_inner": [], "env_reward": [],
@@ -292,8 +290,8 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
             outer_optimizer.step()
 
         if k % metrics_every == 0 or k == 1:
-            l_out        = outer_loss_fn(policy, expert_trajs).item()
-            l_in         = inner_loss_fn(policy, reward_net, agent_trajs).item()
+            l_out        = outer_loss(policy, expert_trajs).item()
+            l_in         = inner_loss(policy, reward_net, agent_trajs).item()
             agent_len    = float(np.mean([len(t["states"]) for t in agent_trajs]))
             env_r        = float(np.mean([sum(t["env_rewards"]) for t in agent_trajs]))
             iter_elapsed = time.time() - t_iter
@@ -343,14 +341,7 @@ def main():
 
     expert_train_path = data_cfg.get("expert_train_trajs", "data/hopper/expert_train_trajs.pt")
     all_expert_trajs = torch.load(expert_train_path, map_location="cpu", weights_only=False)
-    n_expert_traj = int(train_cfg.get("n_expert_traj", 1000))
-    if len(all_expert_trajs) < n_expert_traj:
-        logger.warning(
-            f"Запрошено {n_expert_traj} экспертных траекторий, "
-            f"доступно {len(all_expert_trajs)} → используем все."
-        )
-        n_expert_traj = len(all_expert_trajs)
-    expert_trajs = all_expert_trajs[:n_expert_traj]
+    expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
     logger.info("=== TTSA Hopper: начинаю оптимизацию ===")

@@ -1,7 +1,3 @@
-"""
-SAC-компоненты внутреннего агента: SACReplayBuffer, SoftQNetwork, SACInnerOptimizer.
-Выделены из fisher_sac_hopper.py без изменения алгоритма.
-"""
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,25 +7,25 @@ from tqdm import tqdm
 
 class SACReplayBuffer:
     def __init__(self, obs_dim: int, action_dim: int, size: int, device: torch.device):
-        self.obs_buf      = np.zeros((size, obs_dim),    dtype=np.float32)
-        self.next_obs_buf = np.zeros((size, obs_dim),    dtype=np.float32)
-        self.action_buf   = np.zeros((size, action_dim), dtype=np.float32)
-        self.reward_buf   = np.zeros((size,),            dtype=np.float32)
-        self.done_buf     = np.zeros((size,),            dtype=np.float32)
+        self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.next_obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.action_buf = np.zeros((size, action_dim), dtype=np.float32)
+        self.reward_buf = np.zeros((size,), dtype=np.float32)
+        self.done_buf = np.zeros((size,), dtype=np.float32)
         self.size = size
-        self.ptr  = 0
+        self.ptr = 0
         self.full = False
         self.device = device
 
     def add(self, obs, action, reward, next_obs, done):
-        self.obs_buf[self.ptr]      = obs
-        self.action_buf[self.ptr]   = action
-        self.reward_buf[self.ptr]   = reward
+        self.obs_buf[self.ptr] = obs
+        self.action_buf[self.ptr] = action
+        self.reward_buf[self.ptr] = reward
         self.next_obs_buf[self.ptr] = next_obs
-        self.done_buf[self.ptr]     = done
+        self.done_buf[self.ptr] = done
         self.ptr += 1
         if self.ptr == self.size:
-            self.ptr  = 0
+            self.ptr = 0
             self.full = True
 
     def __len__(self):
@@ -38,11 +34,11 @@ class SACReplayBuffer:
     def sample(self, batch_size: int):
         idxs = np.random.randint(0, len(self), size=batch_size)
         return (
-            torch.tensor(self.obs_buf[idxs],      dtype=torch.float32, device=self.device),
-            torch.tensor(self.action_buf[idxs],   dtype=torch.float32, device=self.device),
-            torch.tensor(self.reward_buf[idxs],   dtype=torch.float32, device=self.device),
+            torch.tensor(self.obs_buf[idxs], dtype=torch.float32, device=self.device),
+            torch.tensor(self.action_buf[idxs], dtype=torch.float32, device=self.device),
+            torch.tensor(self.reward_buf[idxs], dtype=torch.float32, device=self.device),
             torch.tensor(self.next_obs_buf[idxs], dtype=torch.float32, device=self.device),
-            torch.tensor(self.done_buf[idxs],     dtype=torch.float32, device=self.device),
+            torch.tensor(self.done_buf[idxs], dtype=torch.float32, device=self.device),
         )
 
 
@@ -60,8 +56,6 @@ class SoftQNetwork(nn.Module):
 
 
 class SACInnerOptimizer:
-    """SAC-оптимизатор внутренней задачи. Параметры берутся из config.inner_agent.sac."""
-
     def __init__(
         self,
         env,
@@ -84,28 +78,28 @@ class SACInnerOptimizer:
         target_network_frequency: int = 1,
         device: str = "cpu",
     ):
-        self.env    = env
+        self.env = env
         self.reward = reward
         self.policy = policy
-        self.obs    = None
+        self.obs = None
 
-        self.state_dim               = state_dim
-        self.action_dim              = action_dim
-        self.batch_size              = batch_size
-        self.learning_starts         = learning_starts
-        self.gamma                   = gamma
-        self.tau                     = tau
-        self.alpha                   = alpha
-        self.autotune                = autotune
-        self.policy_frequency        = policy_frequency
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.batch_size = batch_size
+        self.learning_starts = learning_starts
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+        self.autotune = autotune
+        self.policy_frequency = policy_frequency
         self.target_network_frequency = target_network_frequency
 
         self.device = torch.device(device)
         self.reward.to(self.device)
         self.policy.to(self.device)
 
-        self.qf1        = SoftQNetwork(state_dim, action_dim).to(self.device)
-        self.qf2        = SoftQNetwork(state_dim, action_dim).to(self.device)
+        self.qf1 = SoftQNetwork(state_dim, action_dim).to(self.device)
+        self.qf2 = SoftQNetwork(state_dim, action_dim).to(self.device)
         self.qf1_target = SoftQNetwork(state_dim, action_dim).to(self.device)
         self.qf2_target = SoftQNetwork(state_dim, action_dim).to(self.device)
         self.qf1_target.load_state_dict(self.qf1.state_dict())
@@ -117,7 +111,7 @@ class SACInnerOptimizer:
 
         if self.autotune:
             self.target_entropy = -float(action_dim)
-            self.log_alpha      = torch.zeros(1, requires_grad=True, device=self.device)
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
             self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr_q)
             self.alpha = self.log_alpha.exp().item()
 

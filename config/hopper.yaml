@@ -38,8 +38,6 @@ trajectory_collection:
     n: 100
     seed: 30000
 
-# Расхождение №2: в коде было hidden=128 (3 слоя), чекпоинт — 2 слоя hidden=64
-# → ставим 64/2 для загрузки закоммиченных чекпоинтов
 policy:
   hidden: 64
   n_hidden_layers: 2
@@ -54,10 +52,8 @@ training:
   n_outer_steps: 100
   n_inner_steps: 100000
   n_agent_traj: 1000
-  n_expert_traj: 1000
-  n_eval_traj: 1000
-  lr_outer: 1.0e-6
-  lr_inner: 1.0e-4
+  lr_outer: 1e-6
+  lr_inner: 1e-4
   seed: 42
 
 inner_agent:
@@ -65,9 +61,8 @@ inner_agent:
   max_grad_norm: 10.0
   use_baseline: false
   normalize_coef: false
-  # Расхождение №4: параметры SAC из хардкода fisher_sac_hopper.py
   sac:
-    lr_q: 1.0e-3
+    lr_q: 1e-3
     buffer_size: 300000
     batch_size: 256
     learning_starts: 500
@@ -78,14 +73,12 @@ inner_agent:
     target_network_frequency: 1
     gamma: 0.99
 
-# Расхождение №3: fisher_reg=1.0 из хардкода
 outer_optimizer:
   fisher_reg: 1.0
   max_grad_norm: null
   min_lr: 1.0e-6
   gamma: 0.99
 
-# Расхождение №6: исправлены пути (expert_eval_trajs.pt → expert_test_trajs.pt)
 data:
   expert_train_trajs: data/hopper/expert_train_trajs.pt
   expert_valid_trajs: data/hopper/expert_valid_trajs.pt

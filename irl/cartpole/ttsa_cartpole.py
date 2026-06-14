@@ -14,7 +14,7 @@ import torch.nn as nn
 import gymnasium as gym
 from torch.distributions import Categorical
 
-from evaluation.metrics import InnerLoss, OuterLoss, PolicyNLL, RankCorr
+from evaluation.metrics import inner_loss, outer_loss
 from src.common.config import load_config, resolve_config_path, set_seed
 from src.common.logging_utils import get_logger, save_history
 
@@ -63,7 +63,6 @@ class RewardNet(nn.Module):
         return self.base_reward(states)
 
 
-# Алиасы для evaluate.py dispatcher
 Policy = PolicyNet
 Reward = RewardNet
 
@@ -207,28 +206,26 @@ def collect_trajectories(env, policy: PolicyNet, n: int, max_steps: int = 500):
 def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
     """TTSA bilevel оптимизация. Алгоритм не изменён."""
     train_cfg = config["training"]
-    log_cfg   = config.get("logging", {})
+    log_cfg = config.get("logging", {})
 
-    n_iterations    = int(train_cfg.get("n_outer_steps", 2000))
+    n_iterations = int(train_cfg.get("n_outer_steps", 2000))
     n_traj_per_step = int(train_cfg.get("n_agent_traj", 20))
-    alpha_inner     = float(train_cfg.get("lr_inner", 3e-3))
-    beta_outer      = float(train_cfg.get("lr_outer", 3e-4))
-    gamma           = float(config.get("reward", {}).get("gamma", 0.99))
-    metrics_every   = int(log_cfg.get("log_every", 50))
-    early_stop_len  = 475
+    alpha_inner = float(train_cfg.get("lr_inner", 3e-3))
+    beta_outer = float(train_cfg.get("lr_outer", 3e-4))
+    gamma = float(config.get("reward", {}).get("gamma", 0.99))
+    metrics_every = int(log_cfg.get("log_every", 50))
+    early_stop_len = 475
 
-    state_dim  = env.observation_space.shape[0]
+    state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    policy     = PolicyNet(state_dim=state_dim, action_dim=action_dim)
+    policy = PolicyNet(state_dim=state_dim, action_dim=action_dim)
     reward_net = RewardNet(state_dim=state_dim, gamma=gamma)
-    ttsa       = TTSANHD(policy, reward_net, n_cg_steps=10, reg=1e-2)
+    ttsa = TTSANHD(policy, reward_net, n_cg_steps=10, reg=1e-2)
 
     inner_optimizer = torch.optim.SGD(policy.parameters(),     lr=alpha_inner)
     outer_optimizer = torch.optim.SGD(reward_net.parameters(), lr=beta_outer)
 
-    outer_loss_fn = OuterLoss()
-    inner_loss_fn = InnerLoss()
 
     history = {
         "l_outer": [], "l_inner": [], "env_reward": [],
@@ -261,8 +258,8 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
             outer_optimizer.step()
 
         if k % metrics_every == 0 or k == 1:
-            l_out     = outer_loss_fn(policy, expert_trajs).item()
-            l_in      = inner_loss_fn(policy, reward_net, agent_trajs).item()
+            l_out     = outer_loss(policy, expert_trajs).item()
+            l_in      = inner_loss(policy, reward_net, agent_trajs).item()
             agent_len = float(np.mean([len(t["states"]) for t in agent_trajs]))
             env_r     = float(np.mean([sum(t["env_rewards"]) for t in agent_trajs]))
 
@@ -311,14 +308,7 @@ def main():
     # Экспертные траектории из data/ (не собираем заново)
     expert_train_path = data_cfg.get("expert_train_trajs", "data/cartpole/expert_train_trajs.pt")
     all_expert_trajs = torch.load(expert_train_path, map_location="cpu", weights_only=False)
-    n_expert_traj = int(train_cfg.get("n_expert_traj", 1000))
-    if len(all_expert_trajs) < n_expert_traj:
-        logger.warning(
-            f"Запрошено {n_expert_traj} экспертных траекторий, "
-            f"доступно {len(all_expert_trajs)} → используем все."
-        )
-        n_expert_traj = len(all_expert_trajs)
-    expert_trajs = all_expert_trajs[:n_expert_traj]
+    expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
     logger.info("=== TTSA CartPole: начинаю оптимизацию ===")

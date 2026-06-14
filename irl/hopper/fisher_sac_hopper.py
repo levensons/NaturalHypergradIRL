@@ -15,8 +15,8 @@ import torch.nn as nn
 from gymnasium import Env
 from tqdm import tqdm
 
-from evaluation.metrics import OuterLoss, PolicyNLL, RankCorr
-from irl.hopper.sac import SACInnerOptimizer
+from evaluation.metrics import outer_loss, policy_nll, rank_corr
+from src.agents.sac import SACInnerOptimizer
 from src.common.checkpoint import load_checkpoint, save_checkpoint
 from src.common.config import load_config, resolve_config_path, set_seed
 from src.common.logging_utils import get_logger, save_history
@@ -327,9 +327,6 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
     )
 
-    outer_loss_fn = OuterLoss()
-    rank_corr_fn  = RankCorr()
-    policy_nll_fn = PolicyNLL()
 
     history = {
         "l_outer": [], "agent_len": [], "expert_len": [],
@@ -365,21 +362,21 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         raw_hypgrad_norm     = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
-        l_outer    = outer_loss_fn(policy, expert_trajs).item()
+        l_outer    = outer_loss(policy, expert_trajs).item()
         agent_len  = np.mean([len(t["states"]) for t in agent_trajs])
         expert_len = np.mean([len(t["states"]) for t in expert_trajs])
         agent_ret  = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_ret = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-        rank_corr  = rank_corr_fn(reward, expert_trajs + agent_trajs)
-        policy_nll = policy_nll_fn(policy, expert_trajs)
+        rank_corr_val  = rank_corr(reward, expert_trajs + agent_trajs)
+        policy_nll_val = policy_nll(policy, expert_trajs)
 
         history["l_outer"].append(l_outer)
         history["agent_len"].append(agent_len)
         history["expert_len"].append(expert_len)
         history["agent_return"].append(agent_ret)
         history["expert_return"].append(expert_ret)
-        history["rank_corr"].append(rank_corr)
-        history["policy_nll"].append(policy_nll)
+        history["rank_corr"].append(rank_corr_val)
+        history["policy_nll"].append(policy_nll_val)
         history["raw_hypgrad_norm"].append(raw_hypgrad_norm)
         history["clipped_hypgrad_norm"].append(clipped_hypgrad_norm)
         history["lr_outer"].append(lr_outer_current)
@@ -394,7 +391,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         row = (
             f"{outer_step:>5} | {l_outer:>10.3f} | {agent_len:>10.1f} | "
             f"{expert_len:>10.1f} | {agent_ret:>10.1f} | {expert_ret:>10.1f} | "
-            f"{rank_corr:>9.3f} | {policy_nll:>10.3f} | {raw_hypgrad_norm:>10.3f} | "
+            f"{rank_corr_val:>9.3f} | {policy_nll_val:>10.3f} | {raw_hypgrad_norm:>10.3f} | "
             f"{clipped_hypgrad_norm:>10.3f} | {lr_outer_current:>12.2e}"
         )
         if logger:
@@ -433,14 +430,7 @@ def main():
     expert_train_path = data_cfg.get("expert_train_trajs", "data/hopper/expert_train_trajs.pt")
     all_expert_trajs = torch.load(expert_train_path, map_location="cpu", weights_only=False)
 
-    n_expert_traj = int(train_cfg.get("n_expert_traj", 1000))
-    if len(all_expert_trajs) < n_expert_traj:
-        logger.warning(
-            f"Запрошено {n_expert_traj} экспертных траекторий, "
-            f"доступно {len(all_expert_trajs)} → используем все."
-        )
-        n_expert_traj = len(all_expert_trajs)
-    expert_trajs = all_expert_trajs[:n_expert_traj]
+    expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
     logger.info("=== Fisher-NHD Hopper SAC: начинаю двухуровневую оптимизацию ===")
