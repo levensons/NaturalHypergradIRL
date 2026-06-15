@@ -5,6 +5,7 @@ Fisher-NHD IRL с SAC-агентом для Hopper (непрерывная ср�
   python -m irl.hopper.fisher_sac_hopper --env hopper
   python -m irl.hopper.fisher_sac_hopper --config config/hopper.yaml
 """
+
 import argparse
 from pathlib import Path
 
@@ -26,12 +27,16 @@ from src.common.torch_utils import flat_grad, num_params, assign_flat_gradients,
 class Reward(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=64, gamma=0.99):
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(state_dim + action_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1),
         )
         self.register_buffer("gamma", torch.tensor(gamma, dtype=torch.float32))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -57,24 +62,30 @@ class Reward(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, action_low, action_high,
-                 hidden: int = 64, n_hidden_layers: int = 2,
-                 log_std_max=2, log_std_min=-5):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        action_low,
+        action_high,
+        hidden: int = 64,
+        n_hidden_layers: int = 2,
+        log_std_max=2,
+        log_std_min=-5,
+    ):
         super().__init__()
 
         layers = [nn.Linear(state_dim, hidden), nn.ReLU()]
         for _ in range(n_hidden_layers - 1):
             layers += [nn.Linear(hidden, hidden), nn.ReLU()]
         self.net = nn.Sequential(*layers)
-        self.mean_head    = nn.Linear(hidden, action_dim)
+        self.mean_head = nn.Linear(hidden, action_dim)
         self.log_std_head = nn.Linear(hidden, action_dim)
 
-        action_low  = np.asarray(action_low,  dtype=np.float32)
+        action_low = np.asarray(action_low, dtype=np.float32)
         action_high = np.asarray(action_high, dtype=np.float32)
-        self.register_buffer("action_scale",
-                             torch.tensor((action_high - action_low) / 2.0, dtype=torch.float32))
-        self.register_buffer("action_bias",
-                             torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_scale", torch.tensor((action_high - action_low) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32))
         self.log_std_max = log_std_max
         self.log_std_min = log_std_min
 
@@ -92,8 +103,8 @@ class Policy(nn.Module):
         nn.init.zeros_(self.log_std_head.bias)
 
     def forward(self, states: torch.Tensor):
-        h       = self.net(states)
-        mean    = self.mean_head(h)
+        h = self.net(states)
+        mean = self.mean_head(h)
         log_std = self.log_std_head(h)
         log_std = torch.tanh(log_std)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1.0)
@@ -101,10 +112,10 @@ class Policy(nn.Module):
 
     def get_action(self, states: torch.Tensor, eps: float = 1e-3):
         mean, log_std = self.forward(states)
-        std    = log_std.exp()
+        std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-        x_t    = normal.rsample()
-        y_t    = torch.tanh(x_t)
+        x_t = normal.rsample()
+        y_t = torch.tanh(x_t)
         action = y_t * self.action_scale + self.action_bias
         log_prob = normal.log_prob(x_t)
         log_prob = log_prob - torch.log(self.action_scale * (1.0 - y_t.pow(2)) + eps)
@@ -130,8 +141,8 @@ class Policy(nn.Module):
         mean, log_std = self.forward(states)
         std = log_std.exp()
         normalized_action = torch.clamp(self.action_to_normalized(actions), -1.0 + eps, 1.0 - eps)
-        pre_tanh_action   = self.atanh(normalized_action)
-        normal   = torch.distributions.Normal(mean, std)
+        pre_tanh_action = self.atanh(normalized_action)
+        normal = torch.distributions.Normal(mean, std)
         log_prob = normal.log_prob(pre_tanh_action)
         correction = torch.log(self.action_scale * (1.0 - normalized_action.pow(2)) + eps)
         return (log_prob - correction).sum(dim=-1)
@@ -150,8 +161,8 @@ class Policy(nn.Module):
 
 class SB3PolicyWrapper:
     def __init__(self, model, action_space):
-        self.model      = model
-        self.action_low  = action_space.low
+        self.model = model
+        self.action_low = action_space.low
         self.action_high = action_space.high
 
     def sample_action(self, state):
@@ -179,20 +190,26 @@ def collect_trajectories(env: Env, policy: Policy, n: int, max_steps=1000):
             if terminated or truncated:
                 break
 
-        trajs.append({"states": torch.stack(states), "actions": torch.stack(actions),
-                      "env_rewards": env_rewards})
+        trajs.append({"states": torch.stack(states), "actions": torch.stack(actions), "env_rewards": env_rewards})
     return trajs
 
 
 class OuterOptimizer:
-    def __init__(self, reward: Reward, policy: Policy, lr: float, max_grad_norm=None,
-                 fisher_reg: float = 1.0, gamma: float = 0.99):
-        self.reward      = reward
-        self.policy      = policy
-        self.fisher_reg  = fisher_reg
-        self.gamma       = gamma
-        self.max_grad_norm    = max_grad_norm
-        self.raw_grad_norm    = 0.0
+    def __init__(
+        self,
+        reward: Reward,
+        policy: Policy,
+        lr: float,
+        max_grad_norm=None,
+        fisher_reg: float = 1.0,
+        gamma: float = 0.99,
+    ):
+        self.reward = reward
+        self.policy = policy
+        self.fisher_reg = fisher_reg
+        self.gamma = gamma
+        self.max_grad_norm = max_grad_norm
+        self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0
 
         self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
@@ -241,7 +258,7 @@ class OuterOptimizer:
             states, actions = traj["states"], traj["actions"]
             s_theta = self.score(states, actions)
             reward_sum = self.reward.trajectory_return(states, actions)
-            grads_phi  = torch.autograd.grad(reward_sum, self.reward.parameters())
+            grads_phi = torch.autograd.grad(reward_sum, self.reward.parameters())
             g_phi = flat_grad(grads_phi)
             result += torch.dot(s_theta, v) * g_phi
 
@@ -259,10 +276,12 @@ class OuterOptimizer:
             max_eig = eigvals.max().item()
             cond_number = max_eig / min_eig
 
-            print(f"Fisher stats | min_eig={min_eig:.3e} | max_eig={max_eig:.3e} | "
-                  f"cond={cond_number:.3e} | outer_grad_norm={outer_grad.norm().item():.3e} | "
-                  f"hypergrad_norm={hypergrad.norm().item():.3e}")
-            
+            print(
+                f"Fisher stats | min_eig={min_eig:.3e} | max_eig={max_eig:.3e} | "
+                f"cond={cond_number:.3e} | outer_grad_norm={outer_grad.norm().item():.3e} | "
+                f"hypergrad_norm={hypergrad.norm().item():.3e}"
+            )
+
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
@@ -283,10 +302,10 @@ class OuterOptimizer:
 
 
 def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
-    train_cfg  = config["training"]
-    inner_cfg  = config.get("inner_agent", {})
-    sac_cfg    = inner_cfg.get("sac", {})
-    outer_cfg  = config.get("outer_optimizer", {})
+    train_cfg = config["training"]
+    inner_cfg = config.get("inner_agent", {})
+    sac_cfg = inner_cfg.get("sac", {})
+    outer_cfg = config.get("outer_optimizer", {})
     policy_cfg = config.get("policy", {})
     reward_cfg = config.get("reward", {})
     ckpt_cfg   = config.get("checkpoint", {})
@@ -294,27 +313,32 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
 
     n_outer_steps = int(train_cfg["n_outer_steps"])
     n_inner_steps = int(train_cfg["n_inner_steps"])
-    n_agent_traj  = int(train_cfg["n_agent_traj"])
+    n_agent_traj = int(train_cfg["n_agent_traj"])
 
     state_dim, action_dim = get_env_dims(env)
-    hidden   = int(policy_cfg.get("hidden", 64))
+    hidden = int(policy_cfg.get("hidden", 64))
     n_layers = int(policy_cfg.get("n_hidden_layers", 2))
 
     reward = Reward(
-        state_dim=state_dim, action_dim=action_dim,
+        state_dim=state_dim,
+        action_dim=action_dim,
         hidden=int(reward_cfg.get("hidden", 64)),
         gamma=float(reward_cfg.get("gamma", 0.99)),
     )
     policy = Policy(
-        state_dim=state_dim, action_dim=action_dim,
-        action_low=env.action_space.low, action_high=env.action_space.high,
-        hidden=hidden, n_hidden_layers=n_layers,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_low=env.action_space.low,
+        action_high=env.action_space.high,
+        hidden=hidden,
+        n_hidden_layers=n_layers,
         log_std_min=float(policy_cfg.get("log_std_min", -5)),
         log_std_max=float(policy_cfg.get("log_std_max", 2)),
     )
 
     outer_optimizer = OuterOptimizer(
-        reward=reward, policy=policy,
+        reward=reward,
+        policy=policy,
         lr=float(train_cfg["lr_outer"]),
         fisher_reg=float(outer_cfg.get("fisher_reg", 1.0)),
         max_grad_norm=outer_cfg.get("max_grad_norm"),
@@ -323,11 +347,15 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
 
     sac_env = gym.make(config["env"]["id"])
     set_env_seed(sac_env, int(train_cfg.get("seed", 42)) + 1)
-    
+
     inner_optimizer = SACInnerOptimizer(
-        env=sac_env, reward=reward, policy=policy,
-        state_dim=state_dim, action_dim=action_dim,
-        action_low=env.action_space.low, action_high=env.action_space.high,
+        env=sac_env,
+        reward=reward,
+        policy=policy,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_low=env.action_space.low,
+        action_high=env.action_space.high,
         lr_actor=float(train_cfg["lr_inner"]),
         lr_q=float(sac_cfg.get("lr_q", 1e-3)),
         buffer_size=int(sac_cfg.get("buffer_size", 300_000)),
@@ -341,11 +369,17 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
     )
 
-
     history = {
-        "l_outer": [], "agent_len": [], "expert_len": [],
-        "agent_return": [], "expert_return": [], "rank_corr": [], "policy_nll": [],
-        "raw_hypgrad_norm": [], "clipped_hypgrad_norm": [], "lr_outer": [],
+        "l_outer": [],
+        "agent_len": [],
+        "expert_len": [],
+        "agent_return": [],
+        "expert_return": [],
+        "rank_corr": [],
+        "policy_nll": [],
+        "raw_hypgrad_norm": [],
+        "clipped_hypgrad_norm": [],
+        "lr_outer": [],
     }
 
     ckpt_dir = Path(ckpt_cfg.get("dir", "checkpoints/hopper"))
@@ -354,16 +388,20 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     best_l_outer = float("inf")
 
     arch = {
-        "state_dim": state_dim, "action_dim": action_dim,
-        "policy_hidden": hidden, "policy_n_hidden_layers": n_layers,
+        "state_dim": state_dim,
+        "action_dim": action_dim,
+        "policy_hidden": hidden,
+        "policy_n_hidden_layers": n_layers,
         "reward_hidden": int(reward_cfg.get("hidden", 64)),
         "reward_gamma": float(reward_cfg.get("gamma", 0.99)),
         "log_std_min": float(policy_cfg.get("log_std_min", -5)),
-        "log_std_max": float(policy_cfg.get("log_std_max",  2)),
-        "action_low":  env.action_space.low.tolist(),
+        "log_std_max": float(policy_cfg.get("log_std_max", 2)),
+        "action_low": env.action_space.low.tolist(),
         "action_high": env.action_space.high.tolist(),
-        "method": "fisher", "agent": "sac",
-        "env_name": config["env"]["name"], "env_id": config["env"]["id"],
+        "method": "fisher",
+        "agent": "sac",
+        "env_name": config["env"]["name"],
+        "env_id": config["env"]["id"],
         "action_type": config["env"]["action_type"],
     }
 
@@ -388,16 +426,16 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
         outer_optimizer.step(expert_trajs, agent_trajs)
 
-        lr_outer_current     = outer_optimizer.optimizer.param_groups[0]["lr"]
-        raw_hypgrad_norm     = outer_optimizer.raw_grad_norm
+        lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
+        raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
-        l_outer    = outer_loss(policy, expert_trajs).item()
-        agent_len  = np.mean([len(t["states"]) for t in agent_trajs])
+        l_outer = outer_loss(policy, expert_trajs).item()
+        agent_len = np.mean([len(t["states"]) for t in agent_trajs])
         expert_len = np.mean([len(t["states"]) for t in expert_trajs])
-        agent_ret  = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
+        agent_ret = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_ret = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-        rank_corr_val  = rank_corr(reward, expert_trajs + agent_trajs)
+        rank_corr_val = rank_corr(reward, expert_trajs + agent_trajs)
         policy_nll_val = policy_nll(policy, expert_trajs)
 
         history["l_outer"].append(l_outer)
@@ -414,8 +452,12 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         if l_outer < best_l_outer:
             best_l_outer = l_outer
             save_checkpoint(
-                path=best_checkpoint_path, policy=policy, reward=reward, arch=arch,
-                outer_step=outer_step, best_l_outer=best_l_outer,
+                path=best_checkpoint_path,
+                policy=policy,
+                reward=reward,
+                arch=arch,
+                outer_step=outer_step,
+                best_l_outer=best_l_outer,
             )
 
         row = (
@@ -429,12 +471,44 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         else:
             print(row)
 
+    header = (
+        f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
+        f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
+        f"{'RankCorr':>9} | {'PolicyNLL':>10} | {'hyp_raw':>10} | "
+        f"{'hyp_clip':>10} | {'lr_outer':>12}"
+    )
+    if logger:
+        logger.info(header)
+    else:
+        print(header)
+
     inner_optimizer.optimize(n_inner_steps)
     agent_trajs = collect_trajectories(env, policy, n_agent_traj)
     log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
     for outer_step in range(1, n_outer_steps + 1):
         outer_optimizer.step(expert_trajs, agent_trajs)
+
+        inner_optimizer = SACInnerOptimizer(
+            env=sac_env,
+            reward=reward,
+            policy=policy,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            action_low=env.action_space.low,
+            action_high=env.action_space.high,
+            lr_actor=float(train_cfg["lr_inner"]),
+            lr_q=float(sac_cfg.get("lr_q", 1e-3)),
+            buffer_size=int(sac_cfg.get("buffer_size", 300_000)),
+            batch_size=int(sac_cfg.get("batch_size", 256)),
+            learning_starts=int(sac_cfg.get("learning_starts", 500)),
+            gamma=float(sac_cfg.get("gamma", 0.99)),
+            tau=float(sac_cfg.get("tau", 0.005)),
+            alpha=float(sac_cfg.get("alpha", 0.2)),
+            autotune=bool(sac_cfg.get("autotune", True)),
+            policy_frequency=int(sac_cfg.get("policy_frequency", 2)),
+            target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
+        )
 
         inner_optimizer.optimize(n_inner_steps)
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
@@ -457,13 +531,13 @@ def main():
     config = load_config(config_path)
 
     train_cfg = config["training"]
-    log_cfg   = config.get("logging", {})
-    data_cfg  = config.get("data", {})
+    log_cfg = config.get("logging", {})
+    data_cfg = config.get("data", {})
 
     set_seed(int(train_cfg.get("seed", 42)))
 
     log_dir = log_cfg.get("log_dir", "logs")
-    logger  = get_logger("fisher_sac_hopper", log_dir=log_dir)
+    logger = get_logger("fisher_sac_hopper", log_dir=log_dir)
 
     env = gym.make(config["env"]["id"])
     set_env_seed(env, int(train_cfg.get("seed", 42)))
