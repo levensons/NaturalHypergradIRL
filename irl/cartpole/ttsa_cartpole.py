@@ -311,7 +311,7 @@ def main():
     expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
-    logger.info("=== TTSA CartPole: начинаю оптимизацию ===")
+    logger.info("=== TTSA CartPole ===")
     history = train_ttsa(env, expert_trajs, config, logger=logger)
 
     report_path = (

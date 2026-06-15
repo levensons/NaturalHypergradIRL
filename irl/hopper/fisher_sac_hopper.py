@@ -353,6 +353,17 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
+    header = (
+        f"{'Step':>5} | {'L_outer':>10} | {'L_inner':>10} | {'agent_len':>10} | "
+        f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
+        f"{'RankCorr':>9} | {'PolicyNLL':>10} | {'hyp_raw':>10} | "
+        f"{'hyp_clip':>10} | {'lr_outer':>12}"
+    )
+    if logger:
+        logger.info(header)
+    else:
+        print(header)
+
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimizer.optimize(n_inner_steps)
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
@@ -433,7 +444,7 @@ def main():
     expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
-    logger.info("=== Fisher-NHD Hopper SAC: начинаю двухуровневую оптимизацию ===")
+    logger.info("=== Fisher-NHD Hopper SAC ===")
     history = train_bilevel(env, expert_trajs, config, logger=logger)
 
     report_path = (
