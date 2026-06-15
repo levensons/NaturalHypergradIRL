@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import yaml
 
+from gymnasium import Env
+
 
 def load_config(path: str) -> dict:
     p = Path(path)
@@ -26,3 +28,9 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def set_env_seed(env: Env, seed: int):
+    env.reset(seed=seed)
+    env.action_space.seed(seed)
+    env.observation_space.seed(seed)
