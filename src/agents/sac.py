@@ -5,6 +5,27 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def _collect_for_diag(env, policy, n: int, max_steps: int = 1000):
+    trajs = []
+    for _ in range(n):
+        states, actions, env_rewards = [], [], []
+        s, _ = env.reset()
+        for _ in range(max_steps):
+            a = policy.sample_action(s)
+            a = np.clip(a, env.action_space.low, env.action_space.high)
+            s2, r, term, trunc, _ = env.step(a)
+            states.append(torch.tensor(s, dtype=torch.float32))
+            actions.append(torch.tensor(a, dtype=torch.float32))
+            env_rewards.append(r)
+            s = s2
+            if term or trunc:
+                break
+        trajs.append({"states": torch.stack(states),
+                      "actions": torch.stack(actions),
+                      "env_rewards": env_rewards})
+    return trajs
+
+
 class SACReplayBuffer:
     def __init__(self, obs_dim: int, action_dim: int, size: int, device: torch.device):
         self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
@@ -123,7 +144,7 @@ class SACInnerOptimizer:
         with torch.no_grad():
             return self.reward(states, actions)
 
-    def optimize(self, n_steps: int):
+    def optimize(self, n_steps: int, inner_loss_fn=None, log_every: int = 0, n_log_traj: int = 3):
         if self.obs is None:
             self.obs, _ = self.env.reset()
 
@@ -152,6 +173,14 @@ class SACInnerOptimizer:
                 self._update()
 
             self.global_step += 1
+
+            if inner_loss_fn is not None and log_every and self.global_step % log_every == 0:
+                from_collect = _collect_for_diag(self.env, self.policy, n_log_traj)
+                with torch.no_grad():
+                    li = inner_loss_fn(self.policy, self.reward, from_collect).item()
+                    ret = np.mean([sum(t["env_rewards"]) for t in from_collect])
+                tqdm.write(f"   [inner] gstep={self.global_step} L_inner={li:.1f} ret={ret:.1f}")
+                self.obs, _ = self.env.reset()   # ресинхронизация после eval-роллаутов
 
     def _update(self):
         states, actions, _, next_states, dones = self.rb.sample(self.batch_size)

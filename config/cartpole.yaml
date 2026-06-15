@@ -36,8 +36,8 @@ trajectory_collection:
     seed: 30000
 
 policy:
-  hidden: 64
-  n_hidden_layers: 2
+  hidden: 16
+  n_hidden_layers: 1
 
 reward:
   hidden: 64
@@ -46,9 +46,9 @@ reward:
 training:
   n_outer_steps: 20
   n_inner_steps: 60
-  n_agent_traj: 100
-  lr_outer: 5e-3
-  lr_inner: 5e-3
+  n_agent_traj: 50
+  lr_outer: 2e-3
+  lr_inner: 3e-3
   seed: 42
 
 inner_agent:
@@ -58,8 +58,8 @@ inner_agent:
   normalize_coef: false
 
 outer_optimizer:
-  fisher_reg: 1e-2
-  max_grad_norm: 100.0
+  fisher_reg: 5e-2
+  max_grad_norm: 10.0
   warmup_steps: 5
   min_lr: 1e-6
   gamma: 0.99

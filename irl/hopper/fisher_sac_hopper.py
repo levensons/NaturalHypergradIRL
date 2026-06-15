@@ -15,7 +15,7 @@ import torch.nn as nn
 from gymnasium import Env
 from tqdm import tqdm
 
-from evaluation.metrics import outer_loss, policy_nll, rank_corr
+from evaluation.metrics import inner_loss, outer_loss, policy_nll, rank_corr
 from src.agents.sac import SACInnerOptimizer
 from src.common.checkpoint import load_checkpoint, save_checkpoint
 from src.common.config import load_config, resolve_config_path, set_seed
@@ -278,6 +278,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     policy_cfg = config.get("policy", {})
     reward_cfg = config.get("reward", {})
     ckpt_cfg   = config.get("checkpoint", {})
+    log_cfg    = config.get("logging", {})
 
     n_outer_steps = int(train_cfg["n_outer_steps"])
     n_inner_steps = int(train_cfg["n_inner_steps"])
@@ -353,8 +354,24 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
+    header = (
+        f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
+        f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
+        f"{'RankCorr':>9} | {'PolicyNLL':>10} | {'hyp_raw':>10} | "
+        f"{'hyp_clip':>10} | {'lr_outer':>12}"
+    )
+    if logger:
+        logger.info(header)
+    else:
+        print(header)
+
     for outer_step in range(1, n_outer_steps + 1):
-        inner_optimizer.optimize(n_inner_steps)
+        inner_optimizer.optimize(
+            n_inner_steps,
+            inner_loss_fn=inner_loss,
+            log_every=int(log_cfg.get("inner_log_every", 10000)),
+            n_log_traj=3,
+        )
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
         outer_optimizer.step(expert_trajs, agent_trajs)
 
@@ -433,7 +450,7 @@ def main():
     expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
-    logger.info("=== Fisher-NHD Hopper SAC: начинаю двухуровневую оптимизацию ===")
+    logger.info("=== Fisher-NHD Hopper SAC ===")
     history = train_bilevel(env, expert_trajs, config, logger=logger)
 
     report_path = (

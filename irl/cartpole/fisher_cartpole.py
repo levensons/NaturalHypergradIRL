@@ -96,17 +96,11 @@ class Reward(nn.Module):
     def __init__(self, state_dim, action_dim, hidden=64, gamma=0.99):
         super().__init__()
         self.action_dim = action_dim
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1),
-        )
+        self.net = nn.Linear(state_dim, 1)
         self.register_buffer("gamma", torch.tensor(gamma, dtype=torch.float32))
 
-    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        action_one_hot = F.one_hot(actions.long(), num_classes=self.action_dim).float()
-        sa = torch.cat([states, action_one_hot], dim=-1)
-        return self.net(sa).squeeze(-1)
+    def forward(self, states: torch.Tensor, actions: torch.Tensor = None) -> torch.Tensor:
+        return self.net(states).squeeze(-1)
 
     def discounted_rewards(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         rewards = self.forward(states, actions)
@@ -161,21 +155,24 @@ class InnerOptimizer:
 
     def grad(self, trajs) -> torch.Tensor:
         params = list(self.policy.parameters())
+        gamma_val = float(self.reward.gamma)
         scores, coefs = [], []
         for traj in trajs:
             states, actions = traj["states"], traj["actions"]
-            log_prob_sum = self.policy.log_prob(states, actions).sum()
+            T = states.size(0)
+            gammas = torch.pow(torch.tensor(gamma_val), torch.arange(T, dtype=torch.float32))
+            log_probs = self.policy.log_prob(states, actions)
+            log_prob_discounted = (gammas * log_probs).sum()
             with torch.no_grad():
                 reward_return = self.reward.trajectory_return(states, actions)
-                ell = log_prob_sum.detach() - reward_return
-                coef = ell + 1.0
-            score = flat_grad(torch.autograd.grad(log_prob_sum, params))
+                ell = (gammas * log_probs.detach()).sum() - reward_return
+
+            score = flat_grad(torch.autograd.grad(log_prob_discounted, params))
             scores.append(score)
-            coefs.append(coef)
+            coefs.append(ell)
         scores = torch.stack(scores)
         coefs = torch.stack(coefs).float()
-        if self.use_baseline:
-            coefs = coefs - coefs.mean()
+        coefs = coefs - coefs.mean()
         if self.normalize_coef:
             coefs = coefs / (coefs.std() + 1e-8)
         return (coefs.unsqueeze(1) * scores).mean(dim=0)
@@ -192,8 +189,8 @@ class InnerOptimizer:
             self.scheduler.step()
 
     def optimize(self, env, n_steps: int, n_traj: int):
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, n_steps, eta_min=1e-6)
+        # Константный LR на внутреннем цикле (без cosine-затухания до 1e-6)
+        self.scheduler = None
         for _ in tqdm(range(n_steps), desc="inner", leave=False):
             trajs = collect_trajectories(env, self.policy, n_traj)
             self.step(trajs)
@@ -431,7 +428,7 @@ def main():
     expert_trajs = all_expert_trajs
     logger.info(f"Загружено {len(expert_trajs)} экспертных траекторий из {expert_train_path}")
 
-    logger.info("=== Fisher-NHD CartPole: начинаю двухуровневую оптимизацию ===")
+    logger.info("=== Fisher-NHD CartPole ===")
     history = train_bilevel(env, expert_trajs, config, logger=logger)
 
     report_path = (
