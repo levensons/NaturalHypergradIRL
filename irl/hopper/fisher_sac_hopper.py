@@ -20,7 +20,7 @@ from src.agents.sac import SACInnerOptimizer
 from src.common.checkpoint import load_checkpoint, save_checkpoint
 from src.common.config import load_config, resolve_config_path, set_seed, set_env_seed
 from src.common.logging_utils import get_logger, save_history
-from common.torch_utils import flat_grad, num_params, assign_flat_gradients, get_env_dims
+from src.common.torch_utils import flat_grad, num_params, assign_flat_gradients, get_env_dims
 
 
 class Reward(nn.Module):
@@ -216,23 +216,26 @@ class OuterOptimizer:
     def fisher(self, trajs) -> torch.Tensor:
         d = num_params(self.policy)
         fisher = torch.zeros(d, d, dtype=torch.float32)
+
         for traj in trajs:
             s = self.score(traj["states"], traj["actions"])
             fisher += torch.outer(s, s) / len(trajs)
-        # fisher /= len(trajs)
+
         fisher += self.fisher_reg * torch.eye(d, dtype=torch.float32)
         return fisher
 
     def outer_grad(self, expert_trajs) -> torch.Tensor:
         d = num_params(self.policy)
-        grad = torch.zeros(d)
+        grad = torch.zeros(d, dtype=torch.float32)
+
         for traj in expert_trajs:
             grad += self.discounted_score(traj["states"], traj["actions"])
+
         return -grad / len(expert_trajs)
 
     def cross_derivative_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
         d_phi = num_params(self.reward)
-        result = torch.zeros(d_phi)
+        result = torch.zeros(d_phi, dtype=torch.float32)
 
         for traj in trajs:
             states, actions = traj["states"], traj["actions"]
@@ -245,7 +248,7 @@ class OuterOptimizer:
         return -result / len(trajs)
 
     def hypergradient(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        fisher    = self.fisher(agent_trajs)
+        fisher = self.fisher(agent_trajs)
         outer_grad = self.outer_grad(expert_trajs)
         fisher_inv_outer_grad = torch.linalg.solve(fisher, outer_grad)
         hypergrad = self.cross_derivative_vec_product(agent_trajs, fisher_inv_outer_grad)
