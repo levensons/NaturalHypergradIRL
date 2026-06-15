@@ -30,16 +30,16 @@ class Reward(nn.Module):
 
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(hidden, 1),
         )
         self.register_buffer("gamma", torch.tensor(gamma, dtype=torch.float32))
 
-        self._init_weights()
+        self.init_weights()
 
-    def _init_weights(self):
+    def init_weights(self):
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.xavier_uniform_(layer.weight)
@@ -89,9 +89,9 @@ class Policy(nn.Module):
         self.log_std_max = log_std_max
         self.log_std_min = log_std_min
 
-        self._init_weights()
+        self.init_weights()
 
-    def _init_weights(self):
+    def init_weights(self):
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
@@ -308,8 +308,8 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     outer_cfg = config.get("outer_optimizer", {})
     policy_cfg = config.get("policy", {})
     reward_cfg = config.get("reward", {})
-    ckpt_cfg   = config.get("checkpoint", {})
-    log_cfg    = config.get("logging", {})
+    ckpt_cfg = config.get("checkpoint", {})
+    log_cfg = config.get("logging", {})
 
     n_outer_steps = int(train_cfg["n_outer_steps"])
     n_inner_steps = int(train_cfg["n_inner_steps"])
@@ -348,27 +348,6 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     sac_env = gym.make(config["env"]["id"])
     set_env_seed(sac_env, int(train_cfg.get("seed", 42)) + 1)
 
-    inner_optimizer = SACInnerOptimizer(
-        env=sac_env,
-        reward=reward,
-        policy=policy,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        action_low=env.action_space.low,
-        action_high=env.action_space.high,
-        lr_actor=float(train_cfg["lr_inner"]),
-        lr_q=float(sac_cfg.get("lr_q", 1e-3)),
-        buffer_size=int(sac_cfg.get("buffer_size", 300_000)),
-        batch_size=int(sac_cfg.get("batch_size", 256)),
-        learning_starts=int(sac_cfg.get("learning_starts", 500)),
-        gamma=float(sac_cfg.get("gamma", 0.99)),
-        tau=float(sac_cfg.get("tau", 0.005)),
-        alpha=float(sac_cfg.get("alpha", 0.2)),
-        autotune=bool(sac_cfg.get("autotune", True)),
-        policy_frequency=int(sac_cfg.get("policy_frequency", 2)),
-        target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
-    )
-
     history = {
         "l_outer": [],
         "agent_len": [],
@@ -405,26 +384,8 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
-    header = (
-        f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
-        f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
-        f"{'RankCorr':>9} | {'PolicyNLL':>10} | {'hyp_raw':>10} | "
-        f"{'hyp_clip':>10} | {'lr_outer':>12}"
-    )
-    if logger:
-        logger.info(header)
-    else:
-        print(header)
-
-    for outer_step in range(1, n_outer_steps + 1):
-        inner_optimizer.optimize(
-            n_inner_steps,
-            inner_loss_fn=inner_loss,
-            log_every=int(log_cfg.get("inner_log_every", 10000)),
-            n_log_traj=3,
-        )
-        agent_trajs = collect_trajectories(env, policy, n_agent_traj)
-        outer_optimizer.step(expert_trajs, agent_trajs)
+    def log_and_checkpoint(outer_step: int, agent_trajs):
+        nonlocal best_l_outer
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
@@ -482,7 +443,33 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     else:
         print(header)
 
-    inner_optimizer.optimize(n_inner_steps)
+    inner_optimizer = SACInnerOptimizer(
+        env=sac_env,
+        reward=reward,
+        policy=policy,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_low=env.action_space.low,
+        action_high=env.action_space.high,
+        lr_actor=float(train_cfg["lr_inner"]),
+        lr_q=float(sac_cfg.get("lr_q", 1e-3)),
+        buffer_size=int(sac_cfg.get("buffer_size", 300_000)),
+        batch_size=int(sac_cfg.get("batch_size", 256)),
+        learning_starts=int(sac_cfg.get("learning_starts", 500)),
+        gamma=float(sac_cfg.get("gamma", 0.99)),
+        tau=float(sac_cfg.get("tau", 0.005)),
+        alpha=float(sac_cfg.get("alpha", 0.2)),
+        autotune=bool(sac_cfg.get("autotune", True)),
+        policy_frequency=int(sac_cfg.get("policy_frequency", 2)),
+        target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
+    )
+
+    inner_optimizer.optimize(
+        n_inner_steps,
+        inner_loss_fn=inner_loss,
+        log_every=int(log_cfg.get("inner_log_every", n_inner_steps // 10)),
+        n_log_traj=3,
+    )
     agent_trajs = collect_trajectories(env, policy, n_agent_traj)
     log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
@@ -510,7 +497,12 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
             target_network_frequency=int(sac_cfg.get("target_network_frequency", 1)),
         )
 
-        inner_optimizer.optimize(n_inner_steps)
+        inner_optimizer.optimize(
+            n_inner_steps,
+            inner_loss_fn=inner_loss,
+            log_every=int(log_cfg.get("inner_log_every", n_inner_steps // 10)),
+            n_log_traj=3,
+        )
         agent_trajs = collect_trajectories(env, policy, n_agent_traj)
         log_and_checkpoint(outer_step=outer_step, agent_trajs=agent_trajs)
 
