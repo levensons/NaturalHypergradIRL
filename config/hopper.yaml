@@ -51,9 +51,9 @@ reward:
 training:
   n_outer_steps: 100
   n_inner_steps: 100000
-  n_agent_traj: 1000
-  lr_outer: 1e-6
-  lr_inner: 1e-4
+  n_agent_traj: 100
+  lr_outer: 1e-3
+  lr_inner: 1e-5
   seed: 42
 
 inner_agent:
@@ -62,7 +62,7 @@ inner_agent:
   use_baseline: false
   normalize_coef: false
   sac:
-    lr_q: 1e-3
+    lr_q: 1e-4
     buffer_size: 300000
     batch_size: 256
     learning_starts: 500
@@ -75,8 +75,8 @@ inner_agent:
 
 outer_optimizer:
   fisher_reg: 1.0
-  max_grad_norm: null
-  min_lr: 1.0e-6
+  max_grad_norm: 1.0
+  min_lr: 1e-6
   gamma: 0.99
 
 data:

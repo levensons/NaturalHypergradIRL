@@ -4,12 +4,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from gymnasium import Env
 
-def _collect_for_diag(env, policy, n: int, max_steps: int = 1000):
+
+def _collect_for_diag(env: Env, policy, n: int, max_steps: int = 1000):
     trajs = []
     for _ in range(n):
         states, actions, env_rewards = [], [], []
         s, _ = env.reset()
+
         for _ in range(max_steps):
             a = policy.sample_action(s)
             a = np.clip(a, env.action_space.low, env.action_space.high)
@@ -20,9 +23,8 @@ def _collect_for_diag(env, policy, n: int, max_steps: int = 1000):
             s = s2
             if term or trunc:
                 break
-        trajs.append({"states": torch.stack(states),
-                      "actions": torch.stack(actions),
-                      "env_rewards": env_rewards})
+
+        trajs.append({"states": torch.stack(states), "actions": torch.stack(actions), "env_rewards": env_rewards})
     return trajs
 
 
@@ -66,11 +68,26 @@ class SACReplayBuffer:
 class SoftQNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden: int = 64):
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(state_dim + action_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+
+        self.init_weights()
+
+    def init_weights(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                nn.init.zeros_(layer.bias)
+
+        last_layer = self.net[-1]
+        nn.init.uniform_(last_layer.weight, -1e-3, 1e-3)
+        nn.init.zeros_(last_layer.bias)
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         return self.net(torch.cat([states, actions], dim=-1)).squeeze(-1)
@@ -126,8 +143,7 @@ class SACInnerOptimizer:
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
 
-        self.q_optimizer = torch.optim.Adam(
-            list(self.qf1.parameters()) + list(self.qf2.parameters()), lr=lr_q)
+        self.q_optimizer = torch.optim.Adam(list(self.qf1.parameters()) + list(self.qf2.parameters()), lr=lr_q)
         self.actor_optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr_actor)
 
         if self.autotune:
@@ -136,8 +152,7 @@ class SACInnerOptimizer:
             self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr_q)
             self.alpha = self.log_alpha.exp().item()
 
-        self.rb = SACReplayBuffer(
-            obs_dim=state_dim, action_dim=action_dim, size=buffer_size, device=self.device)
+        self.rb = SACReplayBuffer(obs_dim=state_dim, action_dim=action_dim, size=buffer_size, device=self.device)
         self.global_step = 0
 
     def learned_reward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -158,12 +173,11 @@ class SACInnerOptimizer:
             next_obs, env_reward, terminated, truncated, _ = self.env.step(action)
             done = terminated or truncated
 
-            state_t  = torch.tensor(self.obs,   dtype=torch.float32, device=self.device).unsqueeze(0)
+            state_t = torch.tensor(self.obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             action_t = torch.tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
             learned_r = self.learned_reward(state_t, action_t).item()
 
-            self.rb.add(obs=self.obs, action=action, reward=learned_r,
-                        next_obs=next_obs, done=float(done))
+            self.rb.add(obs=self.obs, action=action, reward=learned_r, next_obs=next_obs, done=float(done))
 
             self.obs = next_obs if not done else None
             if self.obs is None:
@@ -180,7 +194,7 @@ class SACInnerOptimizer:
                     li = inner_loss_fn(self.policy, self.reward, from_collect).item()
                     ret = np.mean([sum(t["env_rewards"]) for t in from_collect])
                 tqdm.write(f"   [inner] gstep={self.global_step} L_inner={li:.1f} ret={ret:.1f}")
-                self.obs, _ = self.env.reset()   # ресинхронизация после eval-роллаутов
+                self.obs, _ = self.env.reset()
 
     def _update(self):
         states, actions, _, next_states, dones = self.rb.sample(self.batch_size)
@@ -190,19 +204,20 @@ class SACInnerOptimizer:
             next_actions, next_log_pi, _ = self.policy.get_action(next_states)
             qf1_next = self.qf1_target(next_states, next_actions)
             qf2_next = self.qf2_target(next_states, next_actions)
-            min_qf_next  = torch.min(qf1_next, qf2_next) - self.alpha * next_log_pi
+            min_qf_next = torch.min(qf1_next, qf2_next) - self.alpha * next_log_pi
             next_q_value = rewards + (1.0 - dones) * self.gamma * min_qf_next
 
         qf1_loss = F.mse_loss(self.qf1(states, actions), next_q_value)
         qf2_loss = F.mse_loss(self.qf2(states, actions), next_q_value)
+        loss = qf1_loss + qf2_loss
         self.q_optimizer.zero_grad()
-        (qf1_loss + qf2_loss).backward()
+        loss.backward()
         self.q_optimizer.step()
 
         if self.global_step % self.policy_frequency == 0:
             for _ in range(self.policy_frequency):
                 pi_actions, log_pi, _ = self.policy.get_action(states)
-                min_qf_pi  = torch.min(self.qf1(states, pi_actions), self.qf2(states, pi_actions))
+                min_qf_pi = torch.min(self.qf1(states, pi_actions), self.qf2(states, pi_actions))
                 actor_loss = (self.alpha * log_pi - min_qf_pi).mean()
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
