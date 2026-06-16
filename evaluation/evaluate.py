@@ -175,8 +175,7 @@ def main():
     n_agent_traj = args.n_eval_traj or len(expert_test_trajs)
     agent_test_trajs = _collect_agent_trajs(env, policy, n_agent_traj, max_steps)
 
-    # Метрики — используем все траектории из файлов
-    rank_pool = expert_test_trajs + agent_test_trajs + random_test_trajs
+    rank_pool = expert_test_trajs + random_test_trajs
 
     policy_nll_val = policy_nll(policy, expert_test_trajs)
     rank_corr_val = rank_corr(reward, rank_pool)
