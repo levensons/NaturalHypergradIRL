@@ -50,10 +50,10 @@ reward:
 
 training:
   n_outer_steps: 100
-  n_inner_steps: 50000
+  n_inner_steps: 100000
   n_agent_traj: 100
-  lr_outer: 1e-4
-  lr_inner: 1e-4
+  lr_outer: 1e-3
+  lr_inner: 1e-5
   seed: 42
 
 inner_agent:
@@ -62,7 +62,7 @@ inner_agent:
   use_baseline: false
   normalize_coef: false
   sac:
-    lr_q: 1e-3
+    lr_q: 1e-4
     buffer_size: 300000
     batch_size: 256
     learning_starts: 500
