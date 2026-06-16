@@ -19,6 +19,7 @@ import gymnasium as gym
 from torch.distributions import Normal
 
 from evaluation.metrics import inner_loss, outer_loss
+from src.common.checkpoint import save_checkpoint
 from src.common.config import load_config, resolve_config_path, set_seed
 from src.common.logging_utils import get_logger, save_history
 
@@ -237,6 +238,7 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
     """TTSA bilevel оптимизация для Hopper. Алгоритм не изменён."""
     train_cfg = config["training"]
     log_cfg   = config.get("logging", {})
+    ckpt_cfg  = config.get("checkpoint", {})
 
     n_iterations    = int(train_cfg.get("n_outer_steps", 2000))
     n_traj_per_step = int(train_cfg.get("n_agent_traj", 70))
@@ -255,10 +257,22 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
     inner_optimizer = torch.optim.SGD(policy.parameters(),     lr=alpha_inner)
     outer_optimizer = torch.optim.SGD(reward_net.parameters(), lr=beta_outer)
 
-
     history = {
         "l_outer": [], "l_inner": [], "env_reward": [],
         "hypgrad_norm": [], "agent_len": [], "iter_time": [],
+    }
+
+    ckpt_dir = Path(ckpt_cfg.get("dir", "checkpoints/hopper"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = str(ckpt_dir / "ttsa_reinforce.pt")
+    best_env_reward = float("-inf")
+    arch = {
+        "state_dim": state_dim, "action_dim": action_dim,
+        "policy_hidden": 64, "policy_n_hidden_layers": 2,
+        "reward_gamma": gamma,
+        "method": "ttsa", "agent": "reinforce",
+        "env_name": config["env"]["name"], "env_id": config["env"]["id"],
+        "action_type": config["env"]["action_type"],
     }
 
     t_start = time.time()
@@ -302,6 +316,13 @@ def train_ttsa(env, expert_trajs, config: dict, logger=None) -> dict:
             history["agent_len"].append(agent_len)
             history["env_reward"].append((k, env_r))
             history["iter_time"].append(iter_elapsed)
+
+            if env_r > best_env_reward:
+                best_env_reward = env_r
+                save_checkpoint(
+                    path=best_checkpoint_path, policy=policy, reward=reward_net, arch=arch,
+                    iteration=k, best_env_reward=best_env_reward,
+                )
 
             row = (f"{k:>5} | {l_out:>10.3f} | {l_in:>10.3f} | "
                    f"{env_r:>8.1f} | {agent_len:>5.1f} | "

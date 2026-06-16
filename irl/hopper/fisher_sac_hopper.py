@@ -309,7 +309,17 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     policy_cfg = config.get("policy", {})
     reward_cfg = config.get("reward", {})
     ckpt_cfg = config.get("checkpoint", {})
-    log_cfg = config.get("logging", {})
+    log_cfg  = config.get("logging", {})
+    data_cfg = config.get("data", {})
+
+    expert_valid_trajs = torch.load(
+        data_cfg.get("expert_valid_trajs", "data/hopper/expert_valid_trajs.pt"),
+        map_location="cpu", weights_only=False,
+    )
+    random_valid_trajs = torch.load(
+        data_cfg.get("random_valid_trajs", "data/hopper/random_valid_trajs.pt"),
+        map_location="cpu", weights_only=False,
+    )
 
     n_outer_steps = int(train_cfg["n_outer_steps"])
     n_inner_steps = int(train_cfg["n_inner_steps"])
@@ -364,7 +374,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     ckpt_dir = Path(ckpt_cfg.get("dir", "checkpoints/hopper"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_checkpoint_path = str(ckpt_dir / "fisher_sac.pt")
-    best_l_outer = float("inf")
+    best_env_reward = float("-inf")
 
     arch = {
         "state_dim": state_dim,
@@ -385,7 +395,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     }
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
-        nonlocal best_l_outer
+        nonlocal best_env_reward
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
@@ -396,8 +406,8 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         expert_len = np.mean([len(t["states"]) for t in expert_trajs])
         agent_ret = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_ret = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-        rank_corr_val = rank_corr(reward, expert_trajs + agent_trajs)
-        policy_nll_val = policy_nll(policy, expert_trajs)
+        rank_corr_val = rank_corr(reward, expert_valid_trajs + random_valid_trajs)
+        policy_nll_val = policy_nll(policy, expert_valid_trajs)
 
         history["l_outer"].append(l_outer)
         history["agent_len"].append(agent_len)
@@ -410,15 +420,15 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         history["clipped_hypgrad_norm"].append(clipped_hypgrad_norm)
         history["lr_outer"].append(lr_outer_current)
 
-        if l_outer < best_l_outer:
-            best_l_outer = l_outer
+        if agent_ret > best_env_reward:
+            best_env_reward = agent_ret
             save_checkpoint(
                 path=best_checkpoint_path,
                 policy=policy,
                 reward=reward,
                 arch=arch,
                 outer_step=outer_step,
-                best_l_outer=best_l_outer,
+                best_env_reward=best_env_reward,
             )
 
         row = (

@@ -284,6 +284,16 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     policy_cfg = config.get("policy", {})
     reward_cfg = config.get("reward", {})
     ckpt_cfg   = config.get("checkpoint", {})
+    data_cfg   = config.get("data", {})
+
+    expert_valid_trajs = torch.load(
+        data_cfg.get("expert_valid_trajs", "data/hopper/expert_valid_trajs.pt"),
+        map_location="cpu", weights_only=False,
+    )
+    random_valid_trajs = torch.load(
+        data_cfg.get("random_valid_trajs", "data/hopper/random_valid_trajs.pt"),
+        map_location="cpu", weights_only=False,
+    )
 
     n_outer_steps      = int(train_cfg["n_outer_steps"])
     n_inner_steps      = int(train_cfg["n_inner_steps"])
@@ -369,8 +379,8 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         expert_len = np.mean([len(t["states"]) for t in expert_trajs])
         agent_ret  = np.mean([sum(t["env_rewards"]) for t in agent_trajs])
         expert_ret = np.mean([sum(t["env_rewards"]) for t in expert_trajs])
-        rank_corr_val  = rank_corr(reward, expert_trajs + agent_trajs)
-        policy_nll_val = policy_nll(policy, expert_trajs)
+        rank_corr_val  = rank_corr(reward, expert_valid_trajs + random_valid_trajs)
+        policy_nll_val = policy_nll(policy, expert_valid_trajs)
 
         history["l_outer"].append(l_outer)
         history["l_inner"].append(l_inner)
