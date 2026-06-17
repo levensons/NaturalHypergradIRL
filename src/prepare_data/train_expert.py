@@ -21,7 +21,6 @@ from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.sb3 import init_sb3_model, normalize_sb3_load_path, normalize_sb3_save_path
 
 
-
 def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
     env_cfg = config["env"]
     expert_cfg = config["expert"]
