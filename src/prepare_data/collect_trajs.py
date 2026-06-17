@@ -12,30 +12,26 @@ Before running this script, train the expert first:
 import argparse
 import json
 from pathlib import Path
-
 import gymnasium as gym
 from gymnasium import Env
-import numpy as np
 import torch
 
 from src.utils.config import load_config, resolve_config_path
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.trajectories import collect_trajectories
-from src.utils.policies import Policy, RandomPolicy, SB3PolicyWrapper
 from src.utils.sb3 import load_sb3_model, normalize_sb3_load_path
+from src.utils.trajectories import mean_trajectory_length, mean_trajectory_return
+from src.utils.policies import Policy, RandomPolicy, SB3PolicyWrapper
 
 
 def save_trajectories(path: Path, trajectories) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(trajectories, path)
 
-    lengths = [len(t["states"]) for t in trajectories]
-    returns = [float(t["env_rewards"].sum().item()) for t in trajectories]
-
     print(
         f"Saved {len(trajectories)} trajectories to {path} | "
-        f"avg_len={np.mean(lengths):.1f} | "
-        f"avg_return={np.mean(returns):.1f}"
+        f"avg_len={mean_trajectory_length(trajectories):.1f} | "
+        f"avg_return={mean_trajectory_return(trajectories):.1f}"
     )
 
 

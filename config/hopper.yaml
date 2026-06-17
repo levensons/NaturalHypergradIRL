@@ -47,36 +47,33 @@ reward:
   hidden: 64
   gamma: 0.99
 
-training:
+fisher:
+  random_seed: 42
+  env_seed: 42
   n_outer_steps: 1000
   n_inner_steps: 100000
   n_agent_traj: 100
-  lr_outer: 1e-3
-  lr_inner: 1e-5
-  seed: 42
 
-inner_agent:
-  type: sac
-  max_grad_norm: 10.0
-  use_baseline: false
-  normalize_coef: false
-  sac:
-    lr_q: 1e-4
-    buffer_size: 300000
-    batch_size: 256
-    learning_starts: 500
-    tau: 0.005
-    alpha: 0.2
-    autotune: true
-    policy_frequency: 2
-    target_network_frequency: 1
-    gamma: 0.99
-
-outer_optimizer:
-  fisher_reg: 1.0
-  max_grad_norm: 1.0
-  min_lr: 1e-6
+  lr_reward: 1e-3
+  reg: 1.0
   gamma: 0.99
+  max_grad_norm: 1.0
+
+  inner:
+    sac_env_seed: 67
+    type: sac
+    lr_actor: 1e-5
+    sac:
+      lr_q: 1e-4
+      buffer_size: 300000
+      batch_size: 256
+      learning_starts: 500
+      tau: 0.005
+      alpha: 0.2
+      autotune: true
+      policy_frequency: 2
+      target_network_frequency: 1
+      gamma: 0.99
 
 data:
   expert_train_trajs: data/hopper/expert_train_trajs.pt

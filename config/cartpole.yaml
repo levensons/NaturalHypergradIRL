@@ -62,7 +62,7 @@ outer_optimizer:
   min_lr: 1e-6
   gamma: 0.99
 
-# Пути к тестовым траекториям (из data/, не пересобираем)
+
 data:
   expert_train_trajs: data/cartpole/expert_train_trajs.pt
   expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
