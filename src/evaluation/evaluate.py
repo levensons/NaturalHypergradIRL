@@ -1,12 +1,12 @@
 """
-CLI для оценки сохранённых чекпоинтов.
+Evaluate a saved IRL checkpoint.
 
-Запуск:
-  python -m evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt
-  python -m evaluation.evaluate --env hopper   --checkpoint checkpoints/hopper/fisher_sac.pt
-  python -m evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt --check-only
+Usage:
+    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt
+    python -m src.evaluation.evaluate --env hopper   --checkpoint checkpoints/hopper/fisher_sac.pt
 
-Флаг --check-only: только загрузка моделей и данных без роллаутов (статическая проверка).
+Static check only, without rollouts or metric computation:
+    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt --check-only
 """
 
 import argparse
@@ -17,43 +17,61 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
-import torch
-from tqdm import tqdm
 
-from evaluation.metrics import env_reward, policy_nll, rank_corr
+from src.evaluation.metrics import env_reward, policy_nll, rank_corr
+from src.evaluation.bootstrap import bootstrap_metric, bootstrap_two_group_metric
 from src.utils.checkpoint import load_checkpoint
 from src.utils.config import load_config, resolve_config_path
+from src.utils.data import load_expert_test_trajectories, load_random_test_trajectories
+from src.utils.seeding import set_random_seed, set_env_seed
+from src.utils.trajectories import collect_trajectories
 
-# Диспетчер: (env, method, agent) -> путь к модулю с классами Policy и Reward
 _REGISTRY: dict[tuple[str, str, str], str] = {
-    ("cartpole", "fisher", "reinforce"): "irl.cartpole.fisher_cartpole",
-    ("cartpole", "ttsa", "reinforce"): "irl.cartpole.ttsa_cartpole",
-    ("hopper", "fisher", "reinforce"): "irl.hopper.fisher_reinforce_hopper",
-    ("hopper", "fisher", "sac"): "irl.hopper.fisher_sac_hopper",
-    ("hopper", "ttsa", "reinforce"): "irl.hopper.ttsa_hopper",
+    ("cartpole", "fisher", "reinforce"): "src.irl.cartpole.fisher_cartpole",
+    ("cartpole", "ttsa", "reinforce"): "src.irl.cartpole.ttsa_cartpole",
+    ("hopper", "fisher", "reinforce"): "src.irl.hopper.fisher_reinforce_hopper",
+    ("hopper", "fisher", "sac"): "src.irl.hopper.fisher_sac_hopper",
+    ("hopper", "ttsa", "reinforce"): "src.irl.hopper.ttsa_hopper",
 }
 
 
-def _infer_method_agent(checkpoint_path: str) -> tuple[str, str]:
-    """Парсит method и agent из имени файла, напр. 'fisher_reinforce.pt'."""
+def infer_method_agent(checkpoint_path: str | Path) -> tuple[str, str]:
     stem = Path(checkpoint_path).stem
     parts = stem.split("_")
+
     method = parts[0] if parts else "fisher"
     agent = parts[1] if len(parts) > 1 else "reinforce"
+
     return method, agent
 
 
-def _build_policy(module, arch: dict, env, env_cfg: dict, agent: str = "reinforce"):
+def build_policy(module, arch: dict, env, env_cfg: dict, method: str, agent: str):
     state_dim = arch["state_dim"]
     action_dim = arch["action_dim"]
     hidden = arch.get("policy_hidden", 64)
     n_layers = arch.get("policy_n_hidden_layers", 2)
 
+    if method == "ttsa" and env_cfg["name"] == "hopper":
+        return module.Policy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden=hidden,
+            action_scale=1.0,
+        )
+
+    if method == "ttsa" and env_cfg["name"] == "cartpole":
+        return module.Policy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden=hidden,
+        )
+
     if env_cfg.get("action_type") == "continuous" and agent == "sac":
-        log_std_min = arch.get("log_std_min", -5)
-        log_std_max = arch.get("log_std_max", 2)
-        action_low = np.array(arch["action_low"]) if "action_low" in arch else env.action_space.low
-        action_high = np.array(arch["action_high"]) if "action_high" in arch else env.action_space.high
+        action_low = np.array(arch["action_low"], dtype=np.float32) if "action_low" in arch else env.action_space.low
+        action_high = (
+            np.array(arch["action_high"], dtype=np.float32) if "action_high" in arch else env.action_space.high
+        )
+
         return module.Policy(
             state_dim=state_dim,
             action_dim=action_dim,
@@ -61,13 +79,25 @@ def _build_policy(module, arch: dict, env, env_cfg: dict, agent: str = "reinforc
             action_high=action_high,
             hidden=hidden,
             n_hidden_layers=n_layers,
-            log_std_min=log_std_min,
-            log_std_max=log_std_max,
+            log_std_min=arch.get("log_std_min", -5),
+            log_std_max=arch.get("log_std_max", 2),
         )
-    return module.Policy(state_dim=state_dim, action_dim=action_dim, hidden=hidden, n_hidden_layers=n_layers)
+
+    return module.Policy(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        hidden=hidden,
+        n_hidden_layers=n_layers,
+    )
 
 
-def _build_reward(module, arch: dict):
+def build_reward(module, arch: dict, method: str):
+    if method == "ttsa":
+        return module.Reward(
+            state_dim=arch["state_dim"],
+            gamma=arch.get("reward_gamma", 0.99),
+        )
+
     return module.Reward(
         state_dim=arch["state_dim"],
         action_dim=arch["action_dim"],
@@ -76,50 +106,104 @@ def _build_reward(module, arch: dict):
     )
 
 
-def _collect_agent_trajs(env, policy, n: int, max_steps: int):
-    trajs = []
-    for _ in tqdm(range(n), desc="agent rollout", leave=False):
-        states, actions, rewards = [], [], []
-        s, _ = env.reset()
-        for _ in range(max_steps):
-            a = policy.sample_action(s)
-            s_next, r, terminated, truncated, _ = env.step(a)
-            states.append(torch.tensor(s, dtype=torch.float32))
-            if np.isscalar(a) or np.asarray(a).shape == ():
-                actions.append(torch.tensor(int(a), dtype=torch.long))
-            else:
-                actions.append(torch.tensor(np.asarray(a, dtype=np.float32)))
-            rewards.append(float(r))
-            s = s_next
-            if terminated or truncated:
-                break
-        trajs.append({"states": torch.stack(states), "actions": torch.stack(actions), "env_rewards": rewards})
-    return trajs
+def compute_bootstrap_metrics(
+    policy,
+    reward,
+    agent_test_trajs: list,
+    expert_test_trajs: list,
+    random_test_trajs: list,
+    bootstrap_cfg: dict,
+) -> dict[str, dict[str, float]] | None:
+    if not bool(bootstrap_cfg.get("enabled", False)):
+        return None
+
+    n_samples = int(bootstrap_cfg.get("n_samples", 1000))
+    seed = int(bootstrap_cfg.get("seed", 42))
+
+    return {
+        "PolicyNLL": bootstrap_metric(
+            metric_fn=lambda trajs: policy_nll(policy, trajs),
+            trajectories=expert_test_trajs,
+            n_samples=n_samples,
+            seed=seed + 1,
+            desc="Bootstrap PolicyNLL",
+        ),
+        "EnvReward": bootstrap_metric(
+            metric_fn=env_reward,
+            trajectories=agent_test_trajs,
+            n_samples=n_samples,
+            seed=seed + 2,
+            desc="Bootstrap EnvReward",
+        ),
+        "ExpertRet": bootstrap_metric(
+            metric_fn=env_reward,
+            trajectories=expert_test_trajs,
+            n_samples=n_samples,
+            seed=seed + 3,
+            desc="Bootstrap ExpertRet",
+        ),
+        "RandomRet": bootstrap_metric(
+            metric_fn=env_reward,
+            trajectories=random_test_trajs,
+            n_samples=n_samples,
+            seed=seed + 4,
+            desc="Bootstrap RandomRet",
+        ),
+        "RankCorr": bootstrap_two_group_metric(
+            metric_fn=lambda expert, random: rank_corr(reward, expert + random),
+            first=expert_test_trajs,
+            second=random_test_trajs,
+            n_samples=n_samples,
+            seed=seed + 5,
+            desc="Bootstrap RankCorr",
+        ),
+    }
 
 
-def parse() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate a saved IRL checkpoint.")
-    p.add_argument("--env", choices=["cartpole", "hopper"], default=None)
-    p.add_argument("--config", default=None, help="Explicit path to config YAML.")
-    p.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint file.")
-    p.add_argument("--method", choices=["fisher", "ttsa"], default=None)
-    p.add_argument("--agent", choices=["reinforce", "sac"], default=None)
-    p.add_argument("--n-eval-traj", type=int, default=None)
-    p.add_argument(
-        "--check-only", action="store_true", help="Static check only: build models and load data without rollouts."
+def format_metric(
+    name: str,
+    value: float,
+    bootstrap_metrics: dict[str, dict[str, float]] | None,
+    digits: int = 4,
+) -> str:
+    if bootstrap_metrics is None or name not in bootstrap_metrics:
+        return f"{name:<10} = {value:.{digits}f}"
+
+    stats = bootstrap_metrics[name]
+
+    return f"{name:<10} = {value:.{digits}f} " f"± {stats['std']:.{digits}f}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a saved IRL checkpoint.")
+
+    parser.add_argument("--env", choices=["cartpole", "hopper"], default=None)
+    parser.add_argument("--config", default=None, help="Explicit path to config YAML.")
+    parser.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint file.")
+    parser.add_argument("--method", choices=["fisher", "ttsa"], default=None)
+    parser.add_argument("--agent", choices=["reinforce", "sac"], default=None)
+    parser.add_argument("--n-agent-traj", type=int, default=None)
+
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Only load models and data, without rollouts or metric computation.",
     )
-    return p.parse_args()
+
+    return parser.parse_args()
 
 
-def main():
-    args = parse()
+def main() -> None:
+    args = parse_args()
 
     config_path = resolve_config_path(args.env, args.config)
     config = load_config(config_path)
-    env_cfg = config["env"]
 
-    # Инференс method/agent из имени файла (если не задан явно)
-    method_inferred, agent_inferred = _infer_method_agent(args.checkpoint)
+    env_cfg = config["env"]
+    eval_cfg = config["evaluation"]
+    bootstrap_cfg = eval_cfg.get("bootstrap", {})
+
+    method_inferred, agent_inferred = infer_method_agent(args.checkpoint)
     method = args.method or method_inferred
     agent = args.agent or agent_inferred
     env_name = env_cfg["name"]
@@ -129,103 +213,125 @@ def main():
         raise ValueError(
             f"Unknown combination (env={env_name}, method={method}, agent={agent}). " f"Available: {list(_REGISTRY)}"
         )
+
     module_path = _REGISTRY[key]
 
     print(f"env={env_name} | method={method} | agent={agent}")
     print(f"checkpoint: {args.checkpoint}")
     print(f"module: {module_path}")
 
-    ckpt = load_checkpoint(args.checkpoint)
-    arch = ckpt["arch"]
+    random_seed = int(eval_cfg["random_seed"])
+    env_seed = int(eval_cfg["env_seed"])
 
-    # Создаём среду (нужна для action bounds и роллаутов)
+    set_random_seed(random_seed)
+
     env = gym.make(env_cfg["id"])
+    set_env_seed(env, env_seed)
 
-    # Импортируем модуль и строим модели
-    module = importlib.import_module(module_path)
+    try:
+        ckpt = load_checkpoint(args.checkpoint)
+        arch = ckpt["arch"]
 
-    if env_name == "hopper" and method == "ttsa":
-        policy = module.Policy(
-            state_dim=arch["state_dim"],
-            action_dim=arch["action_dim"],
-            hidden=arch.get("policy_hidden", 64),
-            action_scale=1.0,
+        module = importlib.import_module(module_path)
+
+        policy = build_policy(
+            module=module,
+            arch=arch,
+            env=env,
+            env_cfg=env_cfg,
+            method=method,
+            agent=agent,
         )
-        reward = module.Reward(
-            state_dim=arch["state_dim"],
-            gamma=arch.get("reward_gamma", 0.99),
-        )
-    else:
-        policy = _build_policy(module, arch, env, env_cfg, agent=agent)
-        reward = _build_reward(module, arch)
-
-    policy.load_state_dict(ckpt["policy_state_dict"])
-    reward.load_state_dict(ckpt["reward_state_dict"])
-    policy.eval()
-    reward.eval()
-    print("Models loaded OK.")
-
-    # Загружаем тестовые траектории из data/
-    data_cfg = config.get("data", {})
-    expert_test_path = data_cfg.get("expert_test_trajs")
-    random_test_path = data_cfg.get("random_test_trajs")
-
-    if not expert_test_path or not Path(expert_test_path).exists():
-        raise FileNotFoundError(
-            f"expert_test_trajs not found: {expert_test_path}. " "Check config.data.expert_test_trajs."
-        )
-    if not random_test_path or not Path(random_test_path).exists():
-        raise FileNotFoundError(
-            f"random_test_trajs not found: {random_test_path}. " "Check config.data.random_test_trajs."
+        reward = build_reward(
+            module=module,
+            arch=arch,
+            method=method,
         )
 
-    expert_test_trajs = torch.load(expert_test_path, map_location="cpu", weights_only=False)
-    random_test_trajs = torch.load(random_test_path, map_location="cpu", weights_only=False)
-    print(f"Loaded {len(expert_test_trajs)} expert test + {len(random_test_trajs)} random test trajs.")
+        policy.load_state_dict(ckpt["policy_state_dict"])
+        reward.load_state_dict(ckpt["reward_state_dict"])
+        policy.eval()
+        reward.eval()
 
-    if args.check_only:
-        print("--check-only: static check passed. Skipping rollouts and metric computation.")
+        print("Models loaded OK.")
+
+        expert_test_trajs, expert_test_path = load_expert_test_trajectories(config)
+        random_test_trajs, random_test_path = load_random_test_trajectories(config)
+
+        print(f"Loaded {len(expert_test_trajs)} expert test trajs from {expert_test_path}")
+        print(f"Loaded {len(random_test_trajs)} random test trajs from {random_test_path}")
+
+        if args.check_only:
+            print("--check-only: static check passed. Skipping rollouts and metric computation.")
+            return
+
+        max_steps = int(env_cfg["max_steps"])
+        n_agent_traj = args.n_agent_traj or int(eval_cfg["n_agent_traj"])
+
+        agent_test_trajs = collect_trajectories(
+            env=env,
+            policy=policy,
+            n=n_agent_traj,
+            max_steps=max_steps,
+            desc="agent rollout",
+        )
+
+        policy_nll_val = policy_nll(policy, expert_test_trajs)
+        rank_corr_val = rank_corr(reward, expert_test_trajs + random_test_trajs)
+
+        agent_ret = env_reward(agent_test_trajs)
+        expert_ret = env_reward(expert_test_trajs)
+        random_ret = env_reward(random_test_trajs)
+
+        bootstrap_metrics = compute_bootstrap_metrics(
+            policy=policy,
+            reward=reward,
+            agent_test_trajs=agent_test_trajs,
+            expert_test_trajs=expert_test_trajs,
+            random_test_trajs=random_test_trajs,
+            bootstrap_cfg=bootstrap_cfg,
+        )
+
+        metrics = {
+            "env": env_name,
+            "method": method,
+            "agent": agent,
+            "checkpoint": str(args.checkpoint),
+            "config": str(config_path),
+            "evaluation": {
+                "random_seed": random_seed,
+                "env_seed": env_seed,
+                "n_agent_traj": n_agent_traj,
+                "bootstrap": bootstrap_cfg,
+            },
+            "PolicyNLL": policy_nll_val,
+            "EnvReward": agent_ret,
+            "ExpertRet": expert_ret,
+            "RandomRet": random_ret,
+            "RankCorr": rank_corr_val,
+            "bootstrap": bootstrap_metrics,
+        }
+
+        print("\n=== Table II Metrics ===")
+        print(format_metric("PolicyNLL", policy_nll_val, bootstrap_metrics))
+        print(format_metric("EnvReward", agent_ret, bootstrap_metrics))
+        print(format_metric("ExpertRet", expert_ret, bootstrap_metrics))
+        print(format_metric("RandomRet", random_ret, bootstrap_metrics))
+        print(format_metric("RankCorr", rank_corr_val, bootstrap_metrics))
+
+        report_dir = Path(config.get("logging", {}).get("report_dir", "reports"))
+        report_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = report_dir / f"{env_name}_{method}_{agent}_{ts}.json"
+
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, default=float)
+
+        print(f"\nSaved report: {report_path}")
+
+    finally:
         env.close()
-        return
-
-    # Роллауты агента
-    max_steps = env_cfg.get("max_steps", 1000)
-    n_agent_traj = args.n_eval_traj or len(expert_test_trajs)
-    agent_test_trajs = _collect_agent_trajs(env, policy, n_agent_traj, max_steps)
-
-    policy_nll_val = policy_nll(policy, expert_test_trajs)
-    rank_corr_val = rank_corr(reward, expert_test_trajs + random_test_trajs)
-    agent_ret = env_reward(agent_test_trajs)
-    expert_ret = env_reward(expert_test_trajs)
-    random_ret = env_reward(random_test_trajs)
-
-    metrics = {
-        "env": env_name,
-        "method": method,
-        "agent": agent,
-        "checkpoint": str(args.checkpoint),
-        "n_agent_traj": n_agent_traj,
-        "PolicyNLL": policy_nll_val,
-        "EnvReward": agent_ret,
-        "ExpertRet": expert_ret,
-        "RandomRet": random_ret,
-        "RankCorr": rank_corr_val,
-    }
-
-    print("\n=== Table II Metrics ===")
-    print(f"PolicyNLL  = {policy_nll_val:.4f}")
-    print(f"EnvReward  = {agent_ret:.1f}  (expert={expert_ret:.1f}, random={random_ret:.1f})")
-    print(f"RankCorr   = {rank_corr_val:.4f}")
-
-    report_dir = Path(config.get("logging", {}).get("report_dir", "reports"))
-    report_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = report_dir / f"{env_name}_{method}_{agent}_{ts}.json"
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, default=float)
-    print(f"\nSaved report: {report_path}")
-
-    env.close()
 
 
 if __name__ == "__main__":

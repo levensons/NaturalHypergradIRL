@@ -12,9 +12,11 @@ def _rankdata(x: torch.Tensor) -> torch.Tensor:
         j = i
         while j + 1 < n and sorted_x[j + 1] == sorted_x[i]:
             j += 1
+
         avg_rank = 0.5 * (i + j)
         ranks[order[i : j + 1]] = avg_rank
         i = j + 1
+
     return ranks
 
 
@@ -23,22 +25,25 @@ def _pearson_corr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.
     y = y.float()
     x = x - x.mean()
     y = y - y.mean()
-    denom = torch.sqrt(torch.sum(x**2) * torch.sum(y**2))
+    denom = torch.sqrt(torch.sum(torch.pow(x, 2)) * torch.sum(torch.pow(y, 2)))
+
     if denom < eps:
         return torch.tensor(torch.nan)
+
     return torch.sum(x * y) / denom
 
 
 @torch.no_grad()
 def rank_corr(reward, trajs) -> float:
-    """Ранговая корреляция Пирсона между истинными и предсказанными returns."""
     reward.eval()
     env_returns, learned_returns = [], []
+
     for traj in trajs:
         env_return = torch.as_tensor(traj["env_rewards"], dtype=torch.float32).sum()
         env_returns.append(env_return)
         learned_return = reward.trajectory_return(traj["states"], traj["actions"])
         learned_returns.append(learned_return)
+
     env_returns = torch.stack(env_returns)
     learned_returns = torch.stack(learned_returns)
     env_ranks = _rankdata(env_returns)
@@ -48,7 +53,6 @@ def rank_corr(reward, trajs) -> float:
 
 @torch.no_grad()
 def policy_nll(policy, expert_trajs) -> float:
-    """Средний отрицательный log-likelihood политики на экспертных траекториях."""
     policy.eval()
     nll = 0.0
     for traj in expert_trajs:
@@ -77,5 +81,4 @@ def inner_loss(policy, reward, trajs) -> torch.Tensor:
 
 
 def env_reward(trajs) -> float:
-    """Средний недисконтированный возврат по списку траекторий."""
     return float(np.mean([sum(t["env_rewards"]) for t in trajs]))
