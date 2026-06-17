@@ -34,12 +34,13 @@ def collect_trajectories(
     n: int,
     max_steps: int = 1000,
     desc: str = "collect trajs",
+    verbose: bool = True,
 ):
     _check_policy(policy)
 
     trajs = []
 
-    for _ in tqdm(range(n), desc=desc, leave=False):
+    for _ in tqdm(range(n), desc=desc, leave=False, disable=not verbose):
         states = []
         actions = []
         env_rewards = []
