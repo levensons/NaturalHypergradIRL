@@ -1,31 +1,12 @@
+from tqdm import tqdm
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
-
 from gymnasium import Env
 
-
-def _collect_for_diag(env: Env, policy, n: int, max_steps: int = 1000):
-    trajs = []
-    for _ in range(n):
-        states, actions, env_rewards = [], [], []
-        s, _ = env.reset()
-
-        for _ in range(max_steps):
-            a = policy.sample_action(s)
-            a = np.clip(a, env.action_space.low, env.action_space.high)
-            s2, r, term, trunc, _ = env.step(a)
-            states.append(torch.tensor(s, dtype=torch.float32))
-            actions.append(torch.tensor(a, dtype=torch.float32))
-            env_rewards.append(r)
-            s = s2
-            if term or trunc:
-                break
-
-        trajs.append({"states": torch.stack(states), "actions": torch.stack(actions), "env_rewards": env_rewards})
-    return trajs
+from src.utils.trajectories import collect_trajectories
 
 
 class SACReplayBuffer:
@@ -96,7 +77,7 @@ class SoftQNetwork(nn.Module):
 class SACInnerOptimizer:
     def __init__(
         self,
-        env,
+        env: Env,
         reward,
         policy,
         state_dim: int,
@@ -189,12 +170,19 @@ class SACInnerOptimizer:
             self.global_step += 1
 
             if inner_loss_fn is not None and log_every and self.global_step % log_every == 0:
-                from_collect = _collect_for_diag(self.env, self.policy, n_log_traj)
+                from_collect = collect_trajectories(
+                    env=self.env,
+                    policy=self.policy,
+                    n=n_log_traj,
+                    max_steps=1000,
+                    desc="diag trajs",
+                )
+
                 with torch.no_grad():
                     li = inner_loss_fn(self.policy, self.reward, from_collect).item()
-                    ret = np.mean([sum(t["env_rewards"]) for t in from_collect])
-                tqdm.write(f"   [inner] gstep={self.global_step} L_inner={li:.1f} ret={ret:.1f}")
-                self.obs, _ = self.env.reset()
+                    ret = np.mean([t["env_rewards"].sum().item() for t in from_collect])
+                    tqdm.write(f"   [inner] gstep={self.global_step} L_inner={li:.1f} ret={ret:.1f}")
+                    self.obs, _ = self.env.reset()
 
     def _update(self):
         states, actions, _, next_states, dones = self.rb.sample(self.batch_size)

@@ -7,6 +7,7 @@ env:
 expert:
   algo: sac
   save_path: models/hopper/expert
+  random_seed: 42
   env_seed: 42
   total_timesteps: 1000000
 
@@ -24,19 +25,17 @@ expert:
 
 trajectory_collection:
   output_dir: data/hopper
-  random_trajs_seed: 1000000
+  random_seed: 42
+  env_seed: 42
 
   train:
     n: 1000
-    seed: 100
 
   valid:
     n: 100
-    seed: 2000
 
   test:
     n: 100
-    seed: 30000
 
 policy:
   hidden: 64
@@ -49,7 +48,7 @@ reward:
   gamma: 0.99
 
 training:
-  n_outer_steps: 100
+  n_outer_steps: 1000
   n_inner_steps: 100000
   n_agent_traj: 100
   lr_outer: 1e-3

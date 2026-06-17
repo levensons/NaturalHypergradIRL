@@ -21,19 +21,17 @@ expert:
 
 trajectory_collection:
   output_dir: data/cartpole
-  random_trajs_seed: 1000000
+  random_seed: 42
+  env_seed: 42
 
   train:
     n: 1000
-    seed: 100
 
   valid:
     n: 100
-    seed: 2000
 
   test:
     n: 100
-    seed: 30000
 
 policy:
   hidden: 16

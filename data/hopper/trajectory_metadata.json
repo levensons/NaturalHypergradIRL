@@ -6,13 +6,14 @@
   "expert_path": "models/hopper/expert.zip",
   "output_dir": "data/hopper",
   "splits": {
+    "train": {
+      "n": 1000
+    },
     "valid": {
-      "n": 100,
-      "seed": 2000
+      "n": 100
     },
     "test": {
-      "n": 100,
-      "seed": 30000
+      "n": 100
     }
   },
   "files": {
@@ -25,8 +26,6 @@
   "trajectory_format": {
     "states": "[T, state_dim], torch.float32",
     "actions": "[T] for discrete or [T, action_dim] for continuous",
-    "env_rewards": "[T], torch.float32",
-    "dones": "[T], torch.float32",
-    "seed": "int"
+    "env_rewards": "[T], torch.float32"
   }
 }
