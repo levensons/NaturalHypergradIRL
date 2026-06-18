@@ -20,6 +20,7 @@ from src.evaluation.metrics import inner_loss, outer_loss
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
+from src.utils.env import get_env_dims
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.torch import flat_grad, assign_flat_gradients, safe_clip_grad
@@ -295,8 +296,7 @@ def train_ttsa(env, config: dict, logger) -> dict:
         )
     )
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    state_dim, action_dim = get_env_dims(env)
 
     hidden = int(policy_cfg["hidden"])
     n_hidden_layers = int(policy_cfg["n_hidden_layers"])
