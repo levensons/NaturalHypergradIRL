@@ -2,7 +2,7 @@
 Fisher-NHD IRL with SAC inner agent for Hopper.
 
 Usage:
-    python -m src.irl.hopper.fisher --env hopper
+    python -m src.irl.hopper.fisher
     python -m src.irl.hopper.fisher --config configs/hopper.yaml
 """
 
@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 
 import gymnasium as gym
+from gymnasium import Env
 import numpy as np
 import torch
 import torch.nn as nn
@@ -318,10 +319,10 @@ class OuterOptimizer:
 
 
 def make_sac_inner_optimizer(
-    sac_env,
-    env,
-    reward,
-    policy,
+    sac_env: Env,
+    env: Env,
+    reward: Reward,
+    policy: Policy,
     state_dim: int,
     action_dim: int,
     fisher_cfg: dict,
@@ -351,7 +352,7 @@ def make_sac_inner_optimizer(
     )
 
 
-def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
+def train_bilevel(env, config: dict, logger) -> dict:
     fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
 
@@ -362,7 +363,19 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     if inner_cfg["type"] != "sac":
         raise ValueError(f"Expected fisher.inner.type = sac, got {inner_cfg['type']}")
 
-    expert_valid_trajs, random_valid_trajs = load_validation_trajectories(config)
+    data_cfg = config["data"]
+
+    expert_train_path = Path(data_cfg["expert_train_trajs"])
+    expert_valid_path = Path(data_cfg["expert_valid_trajs"])
+    random_valid_path = Path(data_cfg["random_valid_trajs"])
+
+    expert_train_trajs = load_trajectories(expert_train_path, map_location="cpu")
+    expert_valid_trajs = load_trajectories(expert_valid_path, map_location="cpu")
+    random_valid_trajs = load_trajectories(random_valid_path, map_location="cpu")
+
+    logger.info(f"Loaded {len(expert_train_trajs)} expert train trajectories from {expert_train_path}")
+    logger.info(f"Loaded {len(expert_valid_trajs)} expert valid trajectories from {expert_valid_path}")
+    logger.info(f"Loaded {len(random_valid_trajs)} random valid trajectories from {random_valid_path}")
 
     n_outer_steps = int(fisher_cfg["n_outer_steps"])
     n_inner_steps = int(fisher_cfg["n_inner_steps"])
@@ -395,7 +408,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         reward=reward,
         policy=policy,
         lr=float(fisher_cfg["lr_reward"]),
-        fisher_reg=float(fisher_cfg["reg"]),
+        fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=float(fisher_cfg["max_grad_norm"]),
         gamma=float(fisher_cfg["gamma"]),
     )
@@ -419,7 +432,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     ckpt_dir = Path(ckpt_cfg["dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    best_checkpoint_path = str(ckpt_dir / "fisher_sac.pt")
+    best_checkpoint_path = str(ckpt_dir / "fisher.pt")
     best_env_reward = float("-inf")
 
     arch = {
@@ -447,13 +460,13 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
-        l_outer = outer_loss(policy, expert_trajs).item()
+        l_outer = outer_loss(policy, expert_train_trajs).item()
 
         agent_len = mean_trajectory_length(agent_trajs)
-        expert_len = mean_trajectory_length(expert_trajs)
+        expert_len = mean_trajectory_length(expert_train_trajs)
 
         agent_ret = mean_trajectory_return(agent_trajs)
-        expert_ret = mean_trajectory_return(expert_trajs)
+        expert_ret = mean_trajectory_return(expert_train_trajs)
 
         rank_corr_val = rank_corr(reward, expert_valid_trajs + random_valid_trajs)
         policy_nll_val = policy_nll(policy, expert_valid_trajs)
@@ -489,7 +502,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
             f"{lr_outer_current:>12.2e}"
         )
 
-        logger.info(row) if logger else print(row)
+        logger.info(row)
 
     header = (
         f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
@@ -498,7 +511,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         f"{'hyp_clip':>10} | {'lr_outer':>12}"
     )
 
-    logger.info(header) if logger else print(header)
+    logger.info(header)
 
     try:
         inner_optimizer = make_sac_inner_optimizer(
@@ -529,7 +542,7 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
         log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
         for outer_step in range(1, n_outer_steps + 1):
-            outer_optimizer.step(expert_trajs, agent_trajs)
+            outer_optimizer.step(expert_train_trajs, agent_trajs)
 
             inner_optimizer = make_sac_inner_optimizer(
                 sac_env=sac_env,
@@ -564,48 +577,35 @@ def train_bilevel(env, expert_trajs, config: dict, logger=None) -> dict:
     return history
 
 
-def parse_args() -> argparse.Namespace:
+def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fisher-NHD IRL SAC — Hopper")
 
-    parser.add_argument("--env", choices=["hopper"], default="hopper")
     parser.add_argument("--config", default=None)
 
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
+    args = parse()
 
-    config_path = resolve_config_path(args.env, args.config)
+    config_path = resolve_config_path("hopper", args.config)
     config = load_config(config_path)
 
     fisher_cfg = config["fisher"]
     log_cfg = config["logging"]
 
-    set_random_seed(int(fisher_cfg["random_seed"]))
-
     log_dir = log_cfg["log_dir"]
     logger = get_logger("fisher_sac_hopper", log_dir=log_dir)
 
+    set_random_seed(int(fisher_cfg["random_seed"]))
     env = gym.make(config["env"]["id"])
     set_env_seed(env, int(fisher_cfg["env_seed"]))
 
     try:
-        expert_trajs, expert_train_path = load_expert_train_trajectories(config)
-        logger.info(f"Loaded {len(expert_trajs)} expert trajectories from {expert_train_path}")
-
         logger.info("=== Fisher-NHD Hopper SAC ===")
-
-        history = train_bilevel(
-            env=env,
-            expert_trajs=expert_trajs,
-            config=config,
-            logger=logger,
-        )
-
+        history = train_bilevel(env, config, logger)
         report_path = Path(log_cfg["report_dir"]) / "fisher_sac_hopper_history.json"
         save_history(history, str(report_path))
-
         logger.info(f"History saved to {report_path}")
 
     finally:

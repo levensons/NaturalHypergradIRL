@@ -9,7 +9,7 @@ Trajectories = list[Trajectory]
 
 def load_trajectories(
     path: str | Path,
-    map_location: str | torch.Device = "cpu",
+    map_location: str | torch.device = "cpu",
 ) -> Trajectories:
     path = Path(path)
 

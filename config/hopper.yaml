@@ -50,12 +50,13 @@ reward:
 fisher:
   random_seed: 42
   env_seed: 42
+  
   n_outer_steps: 1000
   n_inner_steps: 100000
   n_agent_traj: 100
 
   lr_reward: 1e-3
-  reg: 1.0
+  fisher_reg: 1.0
   gamma: 0.99
   max_grad_norm: 1.0
 
@@ -88,7 +89,7 @@ ttsa:
 
   gamma: 0.99
   n_cg_steps: 10
-  reg: 1e-2
+  fisher_reg: 1e-2
 
   inner_grad_max_norm: 5.0
   outer_grad_max_norm: 1.0

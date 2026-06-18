@@ -2,11 +2,11 @@
 Evaluate a saved IRL checkpoint.
 
 Usage:
-    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt
-    python -m src.evaluation.evaluate --env hopper   --checkpoint checkpoints/hopper/fisher_sac.pt
+    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher.pt
+    python -m src.evaluation.evaluate --env hopper   --checkpoint checkpoints/hopper/fisher.pt
 
 Static check only, without rollouts or metric computation:
-    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher_reinforce.pt --check-only
+    python -m src.evaluation.evaluate --env cartpole --checkpoint checkpoints/cartpole/fisher.pt --check-only
 """
 
 import argparse
@@ -22,16 +22,15 @@ from src.evaluation.metrics import env_reward, policy_nll, rank_corr
 from src.evaluation.bootstrap import bootstrap_metric, bootstrap_two_group_metric
 from src.utils.checkpoint import load_checkpoint
 from src.utils.config import load_config, resolve_config_path
-from src.utils.data import load_expert_test_trajectories, load_random_test_trajectories
+from src.utils.data import load_trajectories
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.trajectories import collect_trajectories
 
 _REGISTRY: dict[tuple[str, str, str], str] = {
-    ("cartpole", "fisher", "reinforce"): "src.irl.cartpole.fisher_cartpole",
-    ("cartpole", "ttsa", "reinforce"): "src.irl.cartpole.ttsa_cartpole",
-    ("hopper", "fisher", "reinforce"): "src.irl.hopper.fisher_reinforce_hopper",
-    ("hopper", "fisher", "sac"): "src.irl.hopper.fisher_sac_hopper",
-    ("hopper", "ttsa", "reinforce"): "src.irl.hopper.ttsa_hopper",
+    ("cartpole", "fisher", "reinforce"): "src.irl.cartpole.fisher",
+    ("cartpole", "ttsa", "reinforce"): "src.irl.cartpole.ttsa",
+    ("hopper", "fisher", "sac"): "src.irl.hopper.fisher",
+    ("hopper", "ttsa", "reinforce"): "src.irl.hopper.ttsa",
 }
 
 
@@ -114,11 +113,11 @@ def compute_bootstrap_metrics(
     random_test_trajs: list,
     bootstrap_cfg: dict,
 ) -> dict[str, dict[str, float]] | None:
-    if not bool(bootstrap_cfg.get("enabled", False)):
+    if not bool(bootstrap_cfg["enabled"]):
         return None
 
-    n_samples = int(bootstrap_cfg.get("n_samples", 1000))
-    seed = int(bootstrap_cfg.get("seed", 42))
+    n_samples = int(bootstrap_cfg["n_samples"])
+    seed = int(bootstrap_cfg["seed"])
 
     return {
         "PolicyNLL": bootstrap_metric(
@@ -160,6 +159,21 @@ def compute_bootstrap_metrics(
     }
 
 
+def metric_result(
+    value: float,
+    bootstrap_metrics: dict[str, dict[str, float]] | None,
+    name: str,
+) -> dict:
+    result = {
+        "value": float(value),
+    }
+
+    if bootstrap_metrics is not None and name in bootstrap_metrics:
+        result["bootstrap"] = bootstrap_metrics[name]
+
+    return result
+
+
 def format_metric(
     name: str,
     value: float,
@@ -171,10 +185,10 @@ def format_metric(
 
     stats = bootstrap_metrics[name]
 
-    return f"{name:<10} = {value:.{digits}f} " f"± {stats['std']:.{digits}f}"
+    return f"{name:<10} = {value:.{digits}f} " f"± {stats['std']:.{digits}f} " f"(boot_mean={stats['mean']:.{digits}f})"
 
 
-def parse_args() -> argparse.Namespace:
+def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a saved IRL checkpoint.")
 
     parser.add_argument("--env", choices=["cartpole", "hopper"], default=None)
@@ -194,7 +208,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = parse_args()
+    args = parse()
 
     config_path = resolve_config_path(args.env, args.config)
     config = load_config(config_path)
@@ -255,11 +269,16 @@ def main() -> None:
 
         print("Models loaded OK.")
 
-        expert_test_trajs, expert_test_path = load_expert_test_trajectories(config)
-        random_test_trajs, random_test_path = load_random_test_trajectories(config)
+        data_cfg = config["data"]
 
-        print(f"Loaded {len(expert_test_trajs)} expert test trajs from {expert_test_path}")
-        print(f"Loaded {len(random_test_trajs)} random test trajs from {random_test_path}")
+        expert_test_path = Path(data_cfg["expert_test_trajs"])
+        random_test_path = Path(data_cfg["random_test_trajs"])
+
+        expert_test_trajs = load_trajectories(expert_test_path, map_location="cpu")
+        random_test_trajs = load_trajectories(random_test_path, map_location="cpu")
+
+        print(f"Loaded {len(expert_test_trajs)} expert test trajectories from {expert_test_path}")
+        print(f"Loaded {len(random_test_trajs)} random test trajectories from {random_test_path}")
 
         if args.check_only:
             print("--check-only: static check passed. Skipping rollouts and metric computation.")
@@ -304,12 +323,33 @@ def main() -> None:
                 "n_agent_traj": n_agent_traj,
                 "bootstrap": bootstrap_cfg,
             },
-            "PolicyNLL": policy_nll_val,
-            "EnvReward": agent_ret,
-            "ExpertRet": expert_ret,
-            "RandomRet": random_ret,
-            "RankCorr": rank_corr_val,
-            "bootstrap": bootstrap_metrics,
+            "metrics": {
+                "PolicyNLL": metric_result(
+                    policy_nll_val,
+                    bootstrap_metrics,
+                    "PolicyNLL",
+                ),
+                "EnvReward": metric_result(
+                    agent_ret,
+                    bootstrap_metrics,
+                    "EnvReward",
+                ),
+                "ExpertRet": metric_result(
+                    expert_ret,
+                    bootstrap_metrics,
+                    "ExpertRet",
+                ),
+                "RandomRet": metric_result(
+                    random_ret,
+                    bootstrap_metrics,
+                    "RandomRet",
+                ),
+                "RankCorr": metric_result(
+                    rank_corr_val,
+                    bootstrap_metrics,
+                    "RankCorr",
+                ),
+            },
         }
 
         print("\n=== Table II Metrics ===")
@@ -323,7 +363,7 @@ def main() -> None:
         report_dir.mkdir(parents=True, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = report_dir / f"{env_name}_{method}_{agent}_{ts}.json"
+        report_path = report_dir / f"{env_name}_{method}_{ts}.json"
 
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2, default=float)

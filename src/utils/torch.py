@@ -44,7 +44,7 @@ def safe_clip_grad(grad: torch.Tensor, max_norm: float | None) -> Tuple[torch.Te
     return grad, True
 
 
-def to_device(obj: Any, device: torch.Device | str) -> Any:
+def to_device(obj: Any, device: torch.device | str) -> Any:
     if isinstance(obj, torch.Tensor):
         return obj.to(device)
 

@@ -12,13 +12,12 @@ def bootstrap_sample(items: List, rng: np.random.Generator) -> List:
     return [items[i] for i in indices]
 
 
-def summarize_bootstrap(point: float, samples: List[float]) -> Dict[str, float]:
+def summarize_bootstrap(samples: List[float]) -> Dict[str, float]:
     if len(samples) == 0:
         raise ValueError("Cannot summarize empty bootstrap samples.")
 
     return {
-        "mean": float(point),
-        "bootstrap_mean": float(np.mean(samples)),
+        "mean": float(np.mean(samples)),
         "std": float(np.std(samples, ddof=1)),
     }
 
@@ -34,15 +33,13 @@ def bootstrap_metric(
         raise ValueError(f"n_samples must be greater than 1, got {n_samples}")
 
     rng = np.random.default_rng(seed)
-
-    point = float(metric_fn(trajectories))
     values = []
 
     for _ in tqdm(range(n_samples), desc=desc, leave=False):
         sample = bootstrap_sample(trajectories, rng)
         values.append(float(metric_fn(sample)))
 
-    return summarize_bootstrap(point, values)
+    return summarize_bootstrap(values)
 
 
 def bootstrap_two_group_metric(
@@ -57,8 +54,6 @@ def bootstrap_two_group_metric(
         raise ValueError(f"n_samples must be greater than 1, got {n_samples}")
 
     rng = np.random.default_rng(seed)
-
-    point = float(metric_fn(first, second))
     values = []
 
     for _ in tqdm(range(n_samples), desc=desc, leave=False):
@@ -66,4 +61,4 @@ def bootstrap_two_group_metric(
         second_sample = bootstrap_sample(second, rng)
         values.append(float(metric_fn(first_sample, second_sample)))
 
-    return summarize_bootstrap(point, values)
+    return summarize_bootstrap(values)

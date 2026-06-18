@@ -1,104 +1,86 @@
 """
-TTSA baseline IRL for Hopper.
+TTSA baseline IRL for CartPole.
 
 Usage:
-    python -m src.irl.hopper.ttsa
-    python -m src.irl.hopper.ttsa --config configs/hopper.yaml
+    python -m src.irl.cartpole.ttsa
+    python -m src.irl.cartpole.ttsa --config configs/cartpole.yaml
 """
 
 import argparse
-import os
 import time
 from pathlib import Path
-
-os.environ.setdefault("MUJOCO_GL", "disabled")
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+from torch.distributions import Categorical
 
 from src.evaluation.metrics import inner_loss, outer_loss
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
-from src.utils.env import get_env_dims
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.torch import flat_grad, assign_flat_gradients, safe_clip_grad
-from src.utils.trajectories import (
-    collect_trajectories,
-    mean_trajectory_length,
-    mean_trajectory_return,
-)
+from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
 
-class GaussianPolicyNet(nn.Module):
+class Policy(nn.Module):
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        hidden: int = 64,
-        action_scale: float = 1.0,
+        hidden: int = 16,
+        n_hidden_layers: int = 1,
     ):
         super().__init__()
 
-        self.action_scale = action_scale
+        layers = [nn.Linear(state_dim, hidden), nn.ReLU()]
 
-        self.mu_net = nn.Sequential(
-            nn.Linear(state_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, action_dim),
-        )
+        for _ in range(n_hidden_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
 
-        self.log_std = nn.Parameter(-0.5 * torch.ones(action_dim))
+        layers.append(nn.Linear(hidden, action_dim))
 
-    def forward(self, states: torch.Tensor):
-        mu = self.action_scale * torch.tanh(self.mu_net(states))
-        log_std = torch.clamp(self.log_std, -5.0, 2.0)
-        std = torch.exp(log_std).expand_as(mu)
+        self.net = nn.Sequential(*layers)
 
-        return mu, std
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        return self.net(states)
 
-    def log_prob(self, states: torch.Tensor, actions: torch.Tensor):
-        mu, std = self.forward(states)
+    def distribution(self, states: torch.Tensor) -> Categorical:
+        return Categorical(logits=self.forward(states))
 
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(-1)
+    def log_prob(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.distribution(states).log_prob(actions.long())
 
-        return Normal(mu, std).log_prob(actions).sum(dim=-1)
-
-    def sample_action(self, state):
+    def sample_action(self, state) -> int:
         state_t = torch.tensor(state, dtype=torch.float32)
 
         with torch.no_grad():
-            mu, std = self.forward(state_t)
-            action = Normal(mu, std).sample()
+            action = self.distribution(state_t).sample()
 
-        return np.clip(
-            action.numpy(),
-            -self.action_scale,
-            self.action_scale,
-        )
+        return int(action.item())
 
 
-class RewardNet(nn.Module):
+class Reward(nn.Module):
     def __init__(self, state_dim: int, gamma: float = 0.99):
         super().__init__()
 
         self.net = nn.Linear(state_dim, 1, bias=True)
         self.gamma = gamma
 
-    def base_reward(self, states: torch.Tensor, actions=None) -> torch.Tensor:
+    def base_reward(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         return self.net(states).squeeze(-1)
 
     def discounted_rewards(
         self,
         states: torch.Tensor,
-        actions=None,
+        actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ts = torch.arange(
             states.size(0),
@@ -111,34 +93,30 @@ class RewardNet(nn.Module):
     def discounted_return(
         self,
         states: torch.Tensor,
-        actions=None,
+        actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.discounted_rewards(states, actions).sum()
 
     def trajectory_return(
         self,
         states: torch.Tensor,
-        actions=None,
+        actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.discounted_return(states, actions)
 
     def forward(
         self,
         states: torch.Tensor,
-        actions=None,
+        actions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.base_reward(states, actions)
-
-
-Policy = GaussianPolicyNet
-Reward = RewardNet
 
 
 class TTSANHD(nn.Module):
     def __init__(
         self,
-        policy: GaussianPolicyNet,
-        reward: RewardNet,
+        policy: Policy,
+        reward: Reward,
         n_cg_steps: int,
         fisher_reg: float,
     ):
@@ -163,11 +141,12 @@ class TTSANHD(nn.Module):
         for traj in trajs:
             states = traj["states"]
             actions = traj["actions"]
-            t = len(states)
+            T = len(states)
 
             gammas = torch.tensor(
-                [self.reward.gamma**step for step in range(t)],
+                [self.reward.gamma**t for t in range(T)],
                 dtype=torch.float32,
+                device=states.device,
             )
 
             with torch.no_grad():
@@ -179,10 +158,10 @@ class TTSANHD(nn.Module):
         grad = torch.zeros(d, dtype=torch.float32)
 
         for traj, loss in zip(trajs, losses):
-            grad += (loss - baseline) * self.score(
-                traj["states"],
-                traj["actions"],
-            )
+            states = traj["states"]
+            actions = traj["actions"]
+
+            grad += (loss - baseline) * self.score(states, actions)
 
         return grad / len(trajs)
 
@@ -265,6 +244,7 @@ class TTSANHD(nn.Module):
 
     def forward(self, expert_trajs, agent_trajs) -> torch.Tensor:
         outer_grad = self.outer_grad(expert_trajs)
+
         fisher_inv_outer_grad = self.conjugate_gradient_solve(
             agent_trajs,
             outer_grad,
@@ -308,18 +288,27 @@ def train_ttsa(env, config: dict, logger) -> dict:
     inner_grad_max_norm = float(ttsa_cfg["inner_grad_max_norm"])
     outer_grad_max_norm = float(ttsa_cfg["outer_grad_max_norm"])
 
-    state_dim, action_dim = get_env_dims(env)
+    early_stop_len = float(
+        ttsa_cfg.get(
+            "early_stop_len",
+            config["env"]["max_steps"],
+        )
+    )
+
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
 
     hidden = int(policy_cfg["hidden"])
+    n_hidden_layers = int(policy_cfg["n_hidden_layers"])
 
-    policy = GaussianPolicyNet(
+    policy = Policy(
         state_dim=state_dim,
         action_dim=action_dim,
         hidden=hidden,
-        action_scale=1.0,
+        n_hidden_layers=n_hidden_layers,
     )
 
-    reward_net = RewardNet(
+    reward_net = Reward(
         state_dim=state_dim,
         gamma=gamma,
     )
@@ -353,7 +342,7 @@ def train_ttsa(env, config: dict, logger) -> dict:
         "state_dim": state_dim,
         "action_dim": action_dim,
         "policy_hidden": hidden,
-        "policy_n_hidden_layers": 2,
+        "policy_n_hidden_layers": n_hidden_layers,
         "reward_gamma": gamma,
         "method": "ttsa",
         "agent": "reinforce",
@@ -362,7 +351,8 @@ def train_ttsa(env, config: dict, logger) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
-    t_start = time.time()
+    logger.info("Step |    L_outer |    L_inner |    len |   EnvR |    |hyp| | t/iter")
+    logger.info("-" * 78)
 
     for iteration in range(1, n_iterations + 1):
         t_iter = time.time()
@@ -372,7 +362,7 @@ def train_ttsa(env, config: dict, logger) -> dict:
             policy=policy,
             n=n_traj_per_step,
             max_steps=int(config["env"]["max_steps"]),
-            desc="ttsa agent trajs",
+            desc="ttsa cartpole agent trajs",
             verbose=False,
         )
 
@@ -436,22 +426,26 @@ def train_ttsa(env, config: dict, logger) -> dict:
 
             row = (
                 f"{iteration:>5} | {l_out:>10.3f} | {l_in:>10.3f} | "
-                f"{env_r:>8.1f} | {agent_len:>5.1f} | "
+                f"{agent_len:>6.1f} | {env_r:>6.1f} | "
                 f"{hypgrad_norm_before_clip:>8.4f} | {iter_elapsed:>6.1f}s"
             )
 
             logger.info(row)
 
-    total_time = time.time() - t_start
-    msg = f"Total time: {total_time:.1f}s ({total_time / 60:.1f} min)"
+            if agent_len >= early_stop_len:
+                msg = f"[early stop] agent_len = {agent_len:.1f} " f">= {early_stop_len:.1f}"
+                logger.info(msg)
+                break
 
+    total_time = sum(history["iter_time"])
+    msg = f"Total logged iteration time: {total_time:.1f}s ({total_time / 60:.1f} min)"
     logger.info(msg)
 
     return history
 
 
 def parse() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="TTSA IRL — Hopper")
+    parser = argparse.ArgumentParser(description="TTSA IRL — CartPole")
 
     parser.add_argument("--config", default=None)
 
@@ -461,23 +455,24 @@ def parse() -> argparse.Namespace:
 def main() -> None:
     args = parse()
 
-    config_path = resolve_config_path("hopper", args.config)
+    config_path = resolve_config_path("cartpole", args.config)
     config = load_config(config_path)
 
     ttsa_cfg = config["ttsa"]
     log_cfg = config["logging"]
 
-    log_dir = log_cfg["log_dir"]
-    logger = get_logger("ttsa_hopper", log_dir=log_dir)
-
     set_random_seed(int(ttsa_cfg["random_seed"]))
+
+    log_dir = log_cfg["log_dir"]
+    logger = get_logger("ttsa_cartpole", log_dir=log_dir)
+
     env = gym.make(config["env"]["id"])
     set_env_seed(env, int(ttsa_cfg["env_seed"]))
 
     try:
-        logger.info("=== TTSA Hopper ===")
+        logger.info("=== TTSA CartPole ===")
         history = train_ttsa(env, config, logger)
-        report_path = Path(log_cfg["report_dir"]) / "ttsa_hopper_history.json"
+        report_path = Path(log_cfg["report_dir"]) / "ttsa_cartpole_history.json"
         save_history(history, str(report_path))
         logger.info(f"History saved to {report_path}")
 
