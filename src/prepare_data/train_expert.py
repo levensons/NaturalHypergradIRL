@@ -54,7 +54,7 @@ def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
     zip_path = normalize_sb3_load_path(save_path)
 
     model = init_sb3_model(algo, env, expert_params, verbose)
-    model.learn(total_timesteps=total_timesteps)
+    model.learn(total_timesteps=total_timesteps, progress_bar=True, log_interval=50)
     model.save(str(save_path))
 
     env.close()
