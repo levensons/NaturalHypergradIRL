@@ -2,8 +2,8 @@
 Fisher-NHD IRL with SAC inner agent for Hopper.
 
 Usage:
-    python -m src.irl.hopper.fisher_sac_hopper --env hopper
-    python -m src.irl.hopper.fisher_sac_hopper --config configs/hopper.yaml
+    python -m src.irl.hopper.fisher --env hopper
+    python -m src.irl.hopper.fisher --config configs/hopper.yaml
 """
 
 import argparse
@@ -18,7 +18,7 @@ from src.evaluation.metrics import inner_loss, outer_loss, policy_nll, rank_corr
 from src.agents.sac import SACInnerOptimizer
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
-from src.utils.data import load_expert_train_trajectories, load_validation_trajectories
+from src.utils.data import load_trajectories
 from src.utils.env import get_env_dims
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed, set_env_seed

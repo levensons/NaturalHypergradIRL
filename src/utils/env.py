@@ -3,14 +3,6 @@ from typing import Tuple
 
 
 def get_env_dims(env: Env) -> Tuple[int, int]:
-    """
-    Return state and action dimensions for a Gymnasium environment.
-
-    Supports:
-        - Box observation spaces
-        - Box action spaces
-        - Discrete action spaces
-    """
     if not isinstance(env.observation_space, spaces.Box):
         raise TypeError(f"Unsupported observation space: {type(env.observation_space)}")
 

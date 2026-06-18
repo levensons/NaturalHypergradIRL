@@ -7,16 +7,13 @@
   "output_dir": "data/cartpole",
   "splits": {
     "train": {
-      "n": 1000,
-      "seed": 100
+      "n": 1000
     },
     "valid": {
-      "n": 100,
-      "seed": 2000
+      "n": 100
     },
     "test": {
-      "n": 100,
-      "seed": 30000
+      "n": 100
     }
   },
   "files": {
