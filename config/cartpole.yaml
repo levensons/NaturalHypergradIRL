@@ -7,6 +7,7 @@ env:
 expert:
   algo: ppo
   save_path: models/cartpole/expert
+  random_seed: 42
   env_seed: 42
   total_timesteps: 100000
 
@@ -21,50 +22,68 @@ expert:
 
 trajectory_collection:
   output_dir: data/cartpole
-  random_trajs_seed: 1000000
+  random_seed: 42
+  env_seed: 42
 
   train:
     n: 1000
-    seed: 100
 
   valid:
     n: 100
-    seed: 2000
 
   test:
     n: 100
-    seed: 30000
 
 policy:
   hidden: 16
   n_hidden_layers: 1
+  log_std_min: -5
+  log_std_max: 2
 
 reward:
   hidden: 64
   gamma: 0.99
 
-training:
+fisher:
+  random_seed: 42
+  env_seed: 42
+
   n_outer_steps: 20
   n_inner_steps: 60
   n_agent_traj: 50
-  lr_outer: 2e-3
-  lr_inner: 3e-3
-  seed: 42
 
-inner_agent:
-  type: reinforce
-  max_grad_norm: 10.0
-  use_baseline: false
-  normalize_coef: false
-
-outer_optimizer:
+  lr_reward: 2e-3
   fisher_reg: 5e-2
-  max_grad_norm: 10.0
-  warmup_steps: 5
-  min_lr: 1e-6
   gamma: 0.99
+  max_grad_norm: 1.0
 
-# Пути к тестовым траекториям (из data/, не пересобираем)
+  inner:
+    type: reinforce
+    lr_policy: 3e-3
+    max_grad_norm: 1.0
+    use_baseline: false
+    normalize_coef: false
+
+ttsa:
+  random_seed: 42
+  env_seed: 42
+
+  n_iterations: 2000
+  n_traj_per_step: 20
+  metrics_every: 1
+
+  lr_policy: 3e-3
+  lr_reward: 3e-4
+
+  gamma: 0.99
+  n_cg_steps: 10
+  fisher_reg: 1e-2
+
+  inner_grad_max_norm: 5.0
+  outer_grad_max_norm: 1.0
+
+  early_stop_len: 475
+
 data:
   expert_train_trajs: data/cartpole/expert_train_trajs.pt
   expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
@@ -79,3 +98,13 @@ logging:
   log_dir: logs
   report_dir: reports
   log_every: 1
+
+evaluation:
+  random_seed: 42
+  env_seed: 42
+  n_agent_traj: 100
+
+  bootstrap:
+    enabled: true
+    n_samples: 1000
+    seed: 42
