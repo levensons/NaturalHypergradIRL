@@ -490,8 +490,8 @@ def train_ttsa(env, config: dict, logger) -> dict:
         for step in range(1, n_outer_steps + 1):
             t_iter = time.time()
 
-            # Быстрая шкала времени: улучшаем политику несколькими SAC-шагами
-            # под текущей обученной наградой r(s, a; theta).
+            # Внутренний шаг: один раз улучшаем политику под текущей
+            # обученной наградой r(s, a; theta).
             inner_optimizer.optimize(n_steps=sac_steps_per_iter, log_every=0)
 
             # Семплируем две пачки траекторий для стохастической оценки

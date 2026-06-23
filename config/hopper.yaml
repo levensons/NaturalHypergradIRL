@@ -82,7 +82,7 @@ ttsa:
 
   n_outer_steps: 100
   n_expert_train_trajs: 1000
-  sac_steps_per_iter: 10000
+  sac_steps_per_iter: 1
   reward_batch_trajs: 5
   eval_trajs: 20
   metrics_every: 1
