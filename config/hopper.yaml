@@ -80,19 +80,34 @@ ttsa:
   random_seed: 42
   env_seed: 42
 
-  n_iterations: 2000
-  n_traj_per_step: 20
+  n_outer_steps: 100
+  n_expert_train_trajs: 1000
+  sac_steps_per_iter: 10000
+  reward_batch_trajs: 5
+  eval_trajs: 20
   metrics_every: 1
+  deterministic_eval: true
+  ema_beta: 0.9
 
-  lr_policy: 3e-3
-  lr_reward: 3e-4
+  reward_lr: 1e-4
+  reward_max_grad_norm: 10.0
+  reward_weight_decay: 0.0
+  normalize_reward_returns: false
+  state_only_reward: false
 
-  gamma: 0.99
-  n_cg_steps: 10
-  fisher_reg: 1e-2
-
-  inner_grad_max_norm: 5.0
-  outer_grad_max_norm: 1.0
+  sac_env_seed: 67
+  sac:
+    lr_actor: 3e-3
+    lr_q: 3e-3
+    buffer_size: 300000
+    batch_size: 256
+    learning_starts: 500
+    tau: 0.005
+    alpha: 0.2
+    autotune: true
+    policy_frequency: 2
+    target_network_frequency: 1
+    gamma: 0.99
 
 data:
   expert_train_trajs: data/hopper/expert_train_trajs.pt

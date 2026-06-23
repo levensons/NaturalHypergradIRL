@@ -31,7 +31,19 @@ _REGISTRY: dict[tuple[str, str, str], str] = {
     ("cartpole", "ttsa", "reinforce"): "src.irl.cartpole.ttsa",
     ("hopper", "fisher", "sac"): "src.irl.hopper.fisher",
     ("hopper", "ttsa", "reinforce"): "src.irl.hopper.ttsa",
+    ("hopper", "ttsa", "sac"): "src.irl.hopper.ttsa",
 }
+
+
+class DeterministicPolicyWrapper:
+    def __init__(self, policy):
+        self.policy = policy
+
+    def sample_action(self, state):
+        return self.policy.sample_action(state, deterministic=True)
+
+    def eval(self):
+        self.policy.eval()
 
 
 def infer_method_agent(checkpoint_path: str | Path) -> tuple[str, str]:
@@ -50,21 +62,6 @@ def build_policy(module, arch: dict, env, env_cfg: dict, method: str, agent: str
     hidden = arch.get("policy_hidden", 64)
     n_layers = arch.get("policy_n_hidden_layers", 2)
 
-    if method == "ttsa" and env_cfg["name"] == "hopper":
-        return module.Policy(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden=hidden,
-            action_scale=1.0,
-        )
-
-    if method == "ttsa" and env_cfg["name"] == "cartpole":
-        return module.Policy(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden=hidden,
-        )
-
     if env_cfg.get("action_type") == "continuous" and agent == "sac":
         action_low = np.array(arch["action_low"], dtype=np.float32) if "action_low" in arch else env.action_space.low
         action_high = (
@@ -82,6 +79,29 @@ def build_policy(module, arch: dict, env, env_cfg: dict, method: str, agent: str
             log_std_max=arch.get("log_std_max", 2),
         )
 
+    if method == "ttsa" and env_cfg["name"] == "hopper":
+        if agent == "reinforce" and hasattr(module, "LegacyPolicy"):
+            return module.LegacyPolicy(
+                state_dim=state_dim,
+                action_dim=action_dim,
+                hidden=hidden,
+                action_scale=1.0,
+            )
+
+        return module.Policy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden=hidden,
+            action_scale=1.0,
+        )
+
+    if method == "ttsa" and env_cfg["name"] == "cartpole":
+        return module.Policy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden=hidden,
+        )
+
     return module.Policy(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -92,6 +112,21 @@ def build_policy(module, arch: dict, env, env_cfg: dict, method: str, agent: str
 
 def build_reward(module, arch: dict, method: str):
     if method == "ttsa":
+        if "action_dim" in arch and "reward_hidden" in arch:
+            return module.Reward(
+                state_dim=arch["state_dim"],
+                action_dim=arch["action_dim"],
+                hidden=arch.get("reward_hidden", 64),
+                gamma=arch.get("reward_gamma", 0.99),
+                state_only=arch.get("reward_state_only", False),
+            )
+
+        if hasattr(module, "LegacyReward"):
+            return module.LegacyReward(
+                state_dim=arch["state_dim"],
+                gamma=arch.get("reward_gamma", 0.99),
+            )
+
         return module.Reward(
             state_dim=arch["state_dim"],
             gamma=arch.get("reward_gamma", 0.99),
@@ -197,6 +232,11 @@ def parse() -> argparse.Namespace:
     parser.add_argument("--method", choices=["fisher", "ttsa"], default=None)
     parser.add_argument("--agent", choices=["reinforce", "sac"], default=None)
     parser.add_argument("--n-agent-traj", type=int, default=None)
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Use deterministic mean actions for SAC-like policies during rollouts.",
+    )
 
     parser.add_argument(
         "--check-only",
@@ -286,10 +326,11 @@ def main() -> None:
 
         max_steps = int(env_cfg["max_steps"])
         n_agent_traj = args.n_agent_traj or int(eval_cfg["n_agent_traj"])
+        rollout_policy = DeterministicPolicyWrapper(policy) if args.deterministic else policy
 
         agent_test_trajs = collect_trajectories(
             env=env,
-            policy=policy,
+            policy=rollout_policy,
             n=n_agent_traj,
             max_steps=max_steps,
             desc="agent rollout",
@@ -321,6 +362,7 @@ def main() -> None:
                 "random_seed": random_seed,
                 "env_seed": env_seed,
                 "n_agent_traj": n_agent_traj,
+                "deterministic": bool(args.deterministic),
                 "bootstrap": bootstrap_cfg,
             },
             "metrics": {
