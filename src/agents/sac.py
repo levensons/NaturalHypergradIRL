@@ -47,7 +47,7 @@ class SACReplayBuffer:
 
 
 class SoftQNetwork(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden: int = 64):
+    def __init__(self, state_dim: int, action_dim: int, hidden: int = 64, default_init: bool = False):
         super().__init__()
 
         self.net = nn.Sequential(
@@ -58,7 +58,8 @@ class SoftQNetwork(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-        self.init_weights()
+        if not default_init:
+            self.init_weights()
 
     def init_weights(self):
         for layer in self.net:
@@ -95,6 +96,8 @@ class SACInnerOptimizer:
         autotune: bool = True,
         policy_frequency: int = 2,
         target_network_frequency: int = 1,
+        q_hidden: int = 64,
+        default_init: bool = False,
         device: str = "cpu",
     ):
         self.env = env
@@ -117,10 +120,10 @@ class SACInnerOptimizer:
         self.reward.to(self.device)
         self.policy.to(self.device)
 
-        self.qf1 = SoftQNetwork(state_dim, action_dim).to(self.device)
-        self.qf2 = SoftQNetwork(state_dim, action_dim).to(self.device)
-        self.qf1_target = SoftQNetwork(state_dim, action_dim).to(self.device)
-        self.qf2_target = SoftQNetwork(state_dim, action_dim).to(self.device)
+        self.qf1 = SoftQNetwork(state_dim, action_dim, hidden=q_hidden, default_init=default_init).to(self.device)
+        self.qf2 = SoftQNetwork(state_dim, action_dim, hidden=q_hidden, default_init=default_init).to(self.device)
+        self.qf1_target = SoftQNetwork(state_dim, action_dim, hidden=q_hidden, default_init=default_init).to(self.device)
+        self.qf2_target = SoftQNetwork(state_dim, action_dim, hidden=q_hidden, default_init=default_init).to(self.device)
         self.qf1_target.load_state_dict(self.qf1.state_dict())
         self.qf2_target.load_state_dict(self.qf2.state_dict())
 
@@ -153,12 +156,13 @@ class SACInnerOptimizer:
 
             next_obs, env_reward, terminated, truncated, _ = self.env.step(action)
             done = terminated or truncated
+            done_for_buffer = terminated
 
             state_t = torch.tensor(self.obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             action_t = torch.tensor(action, dtype=torch.float32, device=self.device).unsqueeze(0)
             learned_r = self.learned_reward(state_t, action_t).item()
 
-            self.rb.add(obs=self.obs, action=action, reward=learned_r, next_obs=next_obs, done=float(done))
+            self.rb.add(obs=self.obs, action=action, reward=learned_r, next_obs=next_obs, done=float(done_for_buffer))
 
             self.obs = next_obs if not done else None
             if self.obs is None:

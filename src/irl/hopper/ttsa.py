@@ -19,7 +19,6 @@ from torch.distributions import Normal
 
 from src.agents.sac import SACInnerOptimizer
 from src.evaluation.metrics import policy_nll, rank_corr
-from src.irl.hopper.fisher import Policy as SACPolicy
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
@@ -29,7 +28,102 @@ from src.utils.seeding import set_env_seed, set_random_seed
 from src.utils.trajectories import mean_trajectory_length, mean_trajectory_return
 
 
-Policy = SACPolicy
+class Policy(nn.Module):
+    # Повторяет SAC actor из официального ML-IRL/SpinningUp:
+    # MLP 256x256, default init PyTorch и прямой clamp log_std.
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        action_low,
+        action_high,
+        hidden: int = 256,
+        n_hidden_layers: int = 2,
+        log_std_max=2,
+        log_std_min=-20,
+    ):
+        super().__init__()
+
+        layers = [nn.Linear(state_dim, hidden), nn.ReLU()]
+        for _ in range(n_hidden_layers - 1):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+
+        self.net = nn.Sequential(*layers)
+        self.mean_head = nn.Linear(hidden, action_dim)
+        self.log_std_head = nn.Linear(hidden, action_dim)
+
+        action_low = np.asarray(action_low, dtype=np.float32)
+        action_high = np.asarray(action_high, dtype=np.float32)
+        self.register_buffer("action_scale", torch.tensor((action_high - action_low) / 2.0, dtype=torch.float32))
+        self.register_buffer("action_bias", torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32))
+
+        self.log_std_max = log_std_max
+        self.log_std_min = log_std_min
+
+    # Возвращает mean и log_std гауссовой политики до tanh-преобразования.
+    def forward(self, states: torch.Tensor):
+        h = self.net(states)
+        mean = self.mean_head(h)
+        log_std = torch.clamp(self.log_std_head(h), self.log_std_min, self.log_std_max)
+        return mean, log_std
+
+    # Семплирует действие через reparameterization trick и считает log_prob с tanh-correction.
+    def get_action(self, states: torch.Tensor):
+        mean, log_std = self.forward(states)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        pre_tanh = normal.rsample()
+        squashed = torch.tanh(pre_tanh)
+        action = squashed * self.action_scale + self.action_bias
+
+        log_prob = normal.log_prob(pre_tanh).sum(dim=-1)
+        correction = 2.0 * (np.log(2.0) - pre_tanh - torch.nn.functional.softplus(-2.0 * pre_tanh))
+        log_prob = log_prob - correction.sum(dim=-1)
+
+        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
+        return action, log_prob, mean_action
+
+    # Обратное tanh-преобразование для подсчета log_prob заданного действия.
+    @staticmethod
+    def atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        x = torch.clamp(x, -1.0 + eps, 1.0 - eps)
+        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+
+    # Переводит действие из диапазона среды в [-1, 1].
+    def action_to_normalized(self, actions: torch.Tensor) -> torch.Tensor:
+        return (actions - self.action_bias) / self.action_scale
+
+    # Считает log_prob действия под текущей squashed Gaussian политикой.
+    def log_prob(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        if states.dim() == 1:
+            states = states.unsqueeze(0)
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        mean, log_std = self.forward(states)
+        std = log_std.exp()
+        normalized_action = self.action_to_normalized(actions)
+        pre_tanh = self.atanh(normalized_action)
+        normal = torch.distributions.Normal(mean, std)
+
+        log_prob = normal.log_prob(pre_tanh).sum(dim=-1)
+        correction = 2.0 * (np.log(2.0) - pre_tanh - torch.nn.functional.softplus(-2.0 * pre_tanh))
+        return log_prob - correction.sum(dim=-1)
+
+    # Возвращает numpy-действие для среды.
+    def sample_action(self, state, deterministic: bool = False):
+        state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
+        device = next(self.parameters()).device
+        state_tensor = state_tensor.to(device)
+
+        with torch.no_grad():
+            if deterministic:
+                mean, _ = self.forward(state_tensor)
+                action = torch.tanh(mean) * self.action_scale + self.action_bias
+            else:
+                action, _, _ = self.get_action(state_tensor)
+
+        return action.squeeze(0).cpu().numpy()
 
 
 class LegacyGaussianPolicyNet(nn.Module):
@@ -112,33 +206,30 @@ class Reward(nn.Module):
         hidden: int = 64,
         gamma: float = 0.99,
         state_only: bool = False,
+        clamp_magnitude: float = 10.0,
+        hidden_sizes: tuple[int, ...] | None = None,
     ):
         super().__init__()
 
         self.state_only = state_only
         input_dim = state_dim if state_only else state_dim + action_dim
+        hidden_sizes = hidden_sizes or (hidden, hidden)
+        self.clamp_magnitude = clamp_magnitude
 
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
+        # Архитектура повторяет MLPReward из официального ML-IRL:
+        # первый линейный слой, затем блоки линейный слой + ReLU
+        # и ограничение выхода в диапазоне [-10, 10].
+        self.first_fc = nn.Linear(input_dim, hidden_sizes[0])
+        self.blocks_list = nn.ModuleList()
+        for i in range(len(hidden_sizes) - 1):
+            self.blocks_list.append(
+                nn.Sequential(
+                    nn.Linear(hidden_sizes[i], hidden_sizes[i + 1]),
+                    nn.ReLU(),
+                )
+            )
+        self.last_fc = nn.Linear(hidden_sizes[-1], 1)
         self.register_buffer("gamma", torch.tensor(gamma, dtype=torch.float32))
-
-        self.init_weights()
-
-    # Инициализирует веса сети награды устойчивыми начальными значениями.
-    def init_weights(self):
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-        last_layer = self.net[-1]
-        nn.init.uniform_(last_layer.weight, -1e-3, 1e-3)
-        nn.init.zeros_(last_layer.bias)
 
     # Считает обученную награду r(s, a) или r(s), если включен режим "только состояния".
     def forward(self, states: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -149,7 +240,12 @@ class Reward(nn.Module):
                 raise ValueError("State-action reward requires actions.")
             inputs = torch.cat([states, actions], dim=-1)
 
-        return self.net(inputs).squeeze(-1)
+        x = self.first_fc(inputs)
+        for block in self.blocks_list:
+            x = block(x)
+        rewards = self.last_fc(x)
+        rewards = torch.clamp(rewards, min=-self.clamp_magnitude, max=self.clamp_magnitude)
+        return rewards.squeeze(-1)
 
     # Возвращает последовательность обученных наград, умноженных на gamma^t.
     def discounted_rewards(self, states: torch.Tensor, actions: torch.Tensor | None = None) -> torch.Tensor:
@@ -176,6 +272,8 @@ def collect_policy_trajectories(
     n: int,
     max_steps: int,
     deterministic: bool,
+    fixed_horizon: bool = False,
+    shift_states: bool = False,
 ):
     trajs = []
 
@@ -193,13 +291,14 @@ def collect_policy_trajectories(
 
             next_state, reward, terminated, truncated, _ = env.step(action)
 
-            states.append(torch.as_tensor(state, dtype=torch.float32))
+            stored_state = next_state if shift_states else state
+            states.append(torch.as_tensor(stored_state, dtype=torch.float32))
             actions.append(torch.as_tensor(action, dtype=torch.float32))
             env_rewards.append(float(reward))
 
             state = next_state
 
-            if terminated or truncated:
+            if (terminated or truncated) and not fixed_horizon:
                 break
 
         trajs.append(
@@ -236,6 +335,17 @@ def mean_learned_return(reward: Reward, trajs, normalize: bool) -> torch.Tensor:
     return torch.stack(values).mean()
 
 
+# Считает среднее значение сети награды по всем точкам траекторий,
+# как в официальном ML-IRL.
+def mean_point_reward(reward: Reward, trajs) -> torch.Tensor:
+    values = []
+
+    for traj in trajs:
+        values.append(reward(traj["states"], traj["actions"]).reshape(-1))
+
+    return torch.cat(values).mean()
+
+
 # Считает L_outer: средний NLL экспертных действий под текущей политикой.
 def normalized_outer_loss(policy: Policy, expert_trajs) -> torch.Tensor:
     losses = []
@@ -267,30 +377,37 @@ class RewardOptimizer:
         max_grad_norm: float,
         weight_decay: float,
         normalize_returns: bool,
+        momentum: float,
+        horizon: int,
+        loss_type: str,
     ):
         self.reward = reward
         self.max_grad_norm = max_grad_norm
-        self.weight_decay = weight_decay
         self.normalize_returns = normalize_returns
-        self.optimizer = torch.optim.Adam(self.reward.parameters(), lr=lr)
+        self.horizon = horizon
+        self.loss_type = loss_type
+        self.optimizer = torch.optim.Adam(
+            self.reward.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+            betas=(momentum, 0.999),
+        )
         self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0
 
     # Делает одно обновление сети награды по разности обученных возвратов эксперта и агента.
     def step(self, expert_trajs, agent_trajs) -> dict:
-        # Обновление сети награды из Алгоритма 2:
-        # максимизируем h(expert) - h(agent), чтобы экспертные траектории
-        # получали больше обученной награды, чем траектории текущей политики.
-        expert_value = mean_learned_return(self.reward, expert_trajs, self.normalize_returns)
-        agent_value = mean_learned_return(self.reward, agent_trajs, self.normalize_returns)
-        l2 = torch.zeros((), dtype=torch.float32)
-
-        for param in self.reward.parameters():
-            l2 = l2 + param.pow(2).mean()
-
-        # Adam минимизирует функцию потерь, поэтому этот знак соответствует подъему по
-        # h(expert) - h(agent), то есть оценке градиента сети награды из ML-IRL.
-        loss = agent_value - expert_value + self.weight_decay * l2
+        if self.loss_type == "official_ml_irl":
+            # Официальный ML-IRL использует T * (E_agent[r] - E_expert[r]).
+            # Минимизация этого выражения поднимает награду эксперта относительно агента.
+            expert_value = mean_point_reward(self.reward, expert_trajs)
+            agent_value = mean_point_reward(self.reward, agent_trajs)
+            loss = self.horizon * (agent_value - expert_value)
+        else:
+            # Старый режим оставлен как запасной вариант для экспериментов с дисконтированным h(tau).
+            expert_value = mean_learned_return(self.reward, expert_trajs, self.normalize_returns)
+            agent_value = mean_learned_return(self.reward, agent_trajs, self.normalize_returns)
+            loss = agent_value - expert_value
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -298,7 +415,8 @@ class RewardOptimizer:
         params = [p for p in self.reward.parameters() if p.grad is not None]
         if params:
             self.raw_grad_norm = float(torch.norm(torch.stack([p.grad.detach().norm() for p in params])).item())
-            torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
+            if self.max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(params, self.max_grad_norm)
             self.clipped_grad_norm = float(torch.norm(torch.stack([p.grad.detach().norm() for p in params])).item())
         else:
             self.raw_grad_norm = 0.0
@@ -346,6 +464,8 @@ def make_sac_inner_optimizer(
         autotune=bool(sac_cfg["autotune"]),
         policy_frequency=int(sac_cfg["policy_frequency"]),
         target_network_frequency=int(sac_cfg["target_network_frequency"]),
+        q_hidden=int(sac_cfg.get("q_hidden", 64)),
+        default_init=bool(sac_cfg.get("default_init", False)),
     )
 
 
@@ -391,7 +511,8 @@ def train_ttsa(env, config: dict, logger) -> dict:
 
     n_outer_steps = int(ttsa_cfg["n_outer_steps"])
     sac_steps_per_iter = int(ttsa_cfg["sac_steps_per_iter"])
-    reward_batch_trajs = int(ttsa_cfg["reward_batch_trajs"])
+    agent_train_trajs = int(ttsa_cfg.get("agent_train_trajs", ttsa_cfg["reward_batch_trajs"]))
+    expert_resample_trajs = int(ttsa_cfg.get("expert_resample_trajs", ttsa_cfg["reward_batch_trajs"]))
     eval_trajs = int(ttsa_cfg["eval_trajs"])
     metrics_every = int(ttsa_cfg["metrics_every"])
     deterministic_eval = bool(ttsa_cfg["deterministic_eval"])
@@ -403,6 +524,7 @@ def train_ttsa(env, config: dict, logger) -> dict:
         hidden=int(reward_cfg["hidden"]),
         gamma=gamma,
         state_only=bool(ttsa_cfg["state_only_reward"]),
+        clamp_magnitude=float(ttsa_cfg["reward_clamp_magnitude"]),
     )
     policy = Policy(
         state_dim=state_dim,
@@ -421,6 +543,9 @@ def train_ttsa(env, config: dict, logger) -> dict:
         max_grad_norm=float(ttsa_cfg["reward_max_grad_norm"]),
         weight_decay=float(ttsa_cfg["reward_weight_decay"]),
         normalize_returns=bool(ttsa_cfg["normalize_reward_returns"]),
+        momentum=float(ttsa_cfg["reward_momentum"]),
+        horizon=max_steps,
+        loss_type=str(ttsa_cfg["reward_loss"]),
     )
 
     sac_env = gym.make(config["env"]["id"])
@@ -466,12 +591,14 @@ def train_ttsa(env, config: dict, logger) -> dict:
         "reward_hidden": int(reward_cfg["hidden"]),
         "reward_gamma": gamma,
         "reward_state_only": bool(ttsa_cfg["state_only_reward"]),
+        "reward_clamp_magnitude": float(ttsa_cfg["reward_clamp_magnitude"]),
         "log_std_min": float(policy_cfg["log_std_min"]),
         "log_std_max": float(policy_cfg["log_std_max"]),
         "action_low": env.action_space.low.tolist(),
         "action_high": env.action_space.high.tolist(),
         "method": "ttsa",
         "agent": "sac",
+        "source_algorithm": "official_ml_irl_maxentirl_sa",
         "env_name": config["env"]["name"],
         "env_id": config["env"]["id"],
         "action_type": config["env"]["action_type"],
@@ -490,8 +617,8 @@ def train_ttsa(env, config: dict, logger) -> dict:
         for step in range(1, n_outer_steps + 1):
             t_iter = time.time()
 
-            # Внутренний шаг: один раз улучшаем политику под текущей
-            # обученной наградой r(s, a; theta).
+            # Быстрая шкала времени: улучшаем политику несколькими SAC-шагами
+            # под текущей обученной наградой r(s, a; theta).
             inner_optimizer.optimize(n_steps=sac_steps_per_iter, log_every=0)
 
             # Семплируем две пачки траекторий для стохастической оценки
@@ -499,11 +626,13 @@ def train_ttsa(env, config: dict, logger) -> dict:
             reward_agent_trajs = collect_policy_trajectories(
                 env=env,
                 policy=policy,
-                n=reward_batch_trajs,
+                n=agent_train_trajs,
                 max_steps=max_steps,
                 deterministic=False,
+                fixed_horizon=True,
+                shift_states=True,
             )
-            reward_expert_trajs = sample_trajectories(expert_train_trajs, reward_batch_trajs)
+            reward_expert_trajs = sample_trajectories(expert_train_trajs, expert_resample_trajs)
 
             # Медленная шкала времени: одно обновление сети награды.
             reward_stats = reward_optimizer.step(reward_expert_trajs, reward_agent_trajs)
