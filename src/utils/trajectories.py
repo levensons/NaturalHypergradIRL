@@ -95,3 +95,8 @@ def trajectory_summary(trajs) -> dict:
         "len": mean_trajectory_length(trajs),
         "return": mean_trajectory_return(trajs),
     }
+
+
+def discount_weights(T: int, gamma: float, device: str | torch.device = "cpu", dtype=torch.float32) -> torch.Tensor:
+    ts = torch.arange(T, dtype=dtype, device=device)
+    return torch.pow(torch.tensor(gamma, dtype=dtype, device=device), ts)
