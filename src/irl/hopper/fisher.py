@@ -444,6 +444,11 @@ def train_bilevel(env, config: dict, logger) -> dict:
         log_std_max=float(policy_cfg["log_std_max"]),
     ).to(device)
 
+    initial_policy_state = {
+        k: v.detach().clone()
+        for k, v in policy.state_dict().items()
+    }
+
     outer_optimizer = OuterOptimizer(
         reward=reward,
         policy=policy,
@@ -502,7 +507,7 @@ def train_bilevel(env, config: dict, logger) -> dict:
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
 
-        l_outer = outer_loss(policy, expert_train_trajs)
+        l_outer = outer_loss(policy, expert_train_trajs, outer_optimizer.discount)
 
         agent_len = mean_trajectory_length(agent_trajs)
         expert_len = mean_trajectory_length(expert_train_trajs)
@@ -587,6 +592,9 @@ def train_bilevel(env, config: dict, logger) -> dict:
         del inner_optimizer
 
         outer_optimizer.step(expert_train_trajs, agent_trajs)
+
+        policy.load_state_dict(initial_policy_state)
+        policy.zero_grad()
 
         inner_optimizer = make_sac_inner_optimizer(
             sac_env=sac_env,

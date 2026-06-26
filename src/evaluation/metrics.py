@@ -81,7 +81,7 @@ def policy_nll(policy, expert_trajs) -> float:
 
 
 @torch.no_grad()
-def outer_loss(policy, expert_trajs) -> float:
+def outer_loss(policy, expert_trajs, discount: float) -> float:
     device = next(policy.parameters()).device
 
     loss = 0.0
@@ -90,7 +90,8 @@ def outer_loss(policy, expert_trajs) -> float:
         actions = to_device(traj["actions"], device)
 
         log_probs = policy.log_prob(states, actions)
-        loss += log_probs.sum().item()
+        weights = discount_weights(log_probs.size(0), discount, device)
+        loss += (weights * log_probs).sum().item()
 
     return -loss / len(expert_trajs)
 

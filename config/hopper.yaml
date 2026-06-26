@@ -53,13 +53,13 @@ fisher:
   env_seed: 42
   
   n_outer_steps: 10
-  n_inner_steps: 100000
+  n_inner_steps: 300000
   n_agent_traj: 100
 
-  discount: 1.0
+  discount: 0.99
   fisher_reg: 1.0
 
-  lr_reward: 1e-8
+  lr_reward: 1e0
   scheduler_gamma: 0.99
   max_grad_norm: 1.0
 
@@ -69,13 +69,13 @@ fisher:
     sac:
       q_hidden: 64
       q_n_hidden_layers: 2
-      lr: 1e-3
+      lr: 1e-4
       buffer_size: 1000000
       batch_size: 256
       learning_starts: 10000
       polyak: 0.995
-      alpha: 0.2
-      autotune: true
+      alpha: 0.1
+      autotune: false
       update_every: 50
       update_num: 50
       gamma: 0.99
