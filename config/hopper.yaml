@@ -59,7 +59,7 @@ fisher:
   discount: 0.99
   fisher_reg: 1.0
 
-  lr_reward: 1e0
+  lr_reward: 1e-3
   scheduler_gamma: 0.99
   max_grad_norm: 1.0
 
