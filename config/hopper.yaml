@@ -53,32 +53,32 @@ fisher:
   env_seed: 42
   
   n_outer_steps: 10
-  n_inner_steps: 300000
+  n_inner_steps: 100000
   n_agent_traj: 100
 
   discount: 0.99
-  fisher_reg: 1.0
+  fisher_reg: 0.001
 
-  lr_reward: 1e-3
-  scheduler_gamma: 0.99
+  lr_reward: 1e-4
+  scheduler_gamma: 1.0
   max_grad_norm: 1.0
 
   inner:
-    sac_env_seed: 67
     type: sac
+    train_env_seed: 100
+    eval_env_seed: 101
     sac:
       q_hidden: 64
       q_n_hidden_layers: 2
-      lr: 1e-4
+      lr: 1e-3
       buffer_size: 1000000
       batch_size: 256
       learning_starts: 10000
       polyak: 0.995
-      alpha: 0.1
-      autotune: false
+      alpha: 0.2
       update_every: 50
       update_num: 50
-      gamma: 0.99
+      scheduler_gamma: 0.9999
 
 ttsa:
   random_seed: 42

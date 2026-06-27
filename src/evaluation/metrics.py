@@ -82,6 +82,9 @@ def policy_nll(policy, expert_trajs) -> float:
 
 @torch.no_grad()
 def outer_loss(policy, expert_trajs, discount: float) -> float:
+    if not (0.0 < discount <= 1.0):
+        raise ValueError(f"`discount` must satisfy 0 < discount <= 1, got {discount}.")
+    
     device = next(policy.parameters()).device
 
     loss = 0.0
@@ -97,7 +100,13 @@ def outer_loss(policy, expert_trajs, discount: float) -> float:
 
 
 @torch.no_grad()
-def inner_loss(policy, reward, trajs, discount: float) -> float:
+def inner_loss(policy, reward, trajs, discount: float, alpha: float = 1.0) -> float:
+    if not (0.0 < discount <= 1.0):
+        raise ValueError(f"`discount` must satisfy 0 < discount <= 1, got {discount}.")
+    
+    if not (0.0 < alpha):
+        raise ValueError(f"`alpha` must satisfy alpha > 0, got {alpha}.")
+    
     device = next(policy.parameters()).device
 
     loss = 0.0
@@ -108,7 +117,7 @@ def inner_loss(policy, reward, trajs, discount: float) -> float:
         log_probs = policy.log_prob(states, actions)
         rewards = reward.rewards(states, actions)
         weights = discount_weights(log_probs.size(0), discount, device)
-        loss += (weights * (log_probs - rewards)).sum().item()
+        loss += (weights * (alpha * log_probs - rewards)).sum().item()
 
     return loss / len(trajs)
 
@@ -119,3 +128,38 @@ def env_reward(trajs) -> float:
     for traj in trajs:
         total += torch.as_tensor(traj["env_rewards"]).sum().item()
     return total / len(trajs)
+
+
+@torch.no_grad()
+def learned_reward_stats(reward, trajs, discount: float = 1.0) -> dict[str, float]:
+    device = next(reward.parameters()).device
+
+    returns = []
+    means = []
+    lengths = []
+
+    for traj in trajs:
+        states = to_device(traj["states"], device)
+        actions = to_device(traj["actions"], device)
+        T = states.size(0)
+
+        rewards = reward(states, actions)  # (T,)
+        weights = discount_weights(T, discount, device).to(dtype=rewards.dtype)
+        traj_return = (weights * rewards).sum()
+
+        returns.append(traj_return.item())
+        means.append(rewards.mean().item())
+        lengths.append(float(T))
+
+    returns = np.asarray(returns, dtype=np.float64)
+    means = np.asarray(means, dtype=np.float64)
+    lengths = np.asarray(lengths, dtype=np.float64)
+
+    return {
+        "return_mean": float(returns.mean()),
+        "return_std": float(returns.std()),
+        "return_min": float(returns.min()),
+        "return_max": float(returns.max()),
+        "step_mean": float(means.mean()),
+        "len_mean": float(lengths.mean()),
+    }

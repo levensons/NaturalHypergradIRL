@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.evaluation.metrics import inner_loss, outer_loss, policy_nll, rank_corr
+from src.evaluation.metrics import outer_loss, policy_nll, rank_corr, learned_reward_stats
 from src.agents.sac import SACInnerOptimizer
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
@@ -24,7 +24,7 @@ from src.utils.data import load_trajectories
 from src.utils.env import get_env_dims
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed, set_env_seed
-from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device, suffix_sum
+from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import (
     collect_trajectories,
     mean_trajectory_length,
@@ -103,6 +103,12 @@ class Policy(nn.Module):
 
         self.log_std_max = log_std_max
         self.log_std_min = log_std_min
+
+        self.initial_policy_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
+
+    def reset(self):
+        self.load_state_dict(self.initial_policy_state)
+        self.zero_grad()
 
     def forward(self, states: torch.Tensor):
         h = self.net(states)
@@ -219,7 +225,7 @@ class OuterOptimizer:
         )
 
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, reward_dim)
-        suffix_sums = suffix_sum(grads, dim=0)  # (T, reward_dim)
+        suffix_sums = torch.flip(torch.cumsum(torch.flip(grads, dims=[0]), dim=0), dims=[0]) # (T, reward_dim)
         return suffix_sums
 
     def _grad_log_pi_a_s(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -278,7 +284,10 @@ class OuterOptimizer:
             sum_weighted_log_pi_a_s = (weights * log_pi_a_s).sum()  # (1,)
 
             grad = torch.autograd.grad(
-                sum_weighted_log_pi_a_s, self.policy.parameters(), retain_graph=False, create_graph=False
+                sum_weighted_log_pi_a_s,
+                self.policy.parameters(),
+                retain_graph=False,
+                create_graph=False,
             )
 
             grad = flat_grad(grad).detach()  # (policy_dim,)
@@ -317,19 +326,20 @@ class OuterOptimizer:
 
         hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
 
-        # with torch.no_grad():
-        #     eigvals = torch.linalg.eigvalsh(fisher)
-        #     min_eig = eigvals.min()
-        #     max_eig = eigvals.max()
-        #     cond_number = max_eig / min_eig
-        #     print(
-        #         f"Fisher stats | "
-        #         f"min_eig={min_eig.item():.3e} | "
-        #         f"max_eig={max_eig.item():.3e} | "
-        #         f"cond={cond_number.item():.3e} | "
-        #         f"outer_grad_norm={grad_outer.norm().item():.3e} | "
-        #         f"hypergrad_norm={hypergrad.norm().item():.3e}"
-        #     )
+        with torch.no_grad():
+            eigvals = torch.linalg.eigvalsh(fisher)
+            min_eig = eigvals.min()
+            max_eig = eigvals.max()
+            cond_number = max_eig / min_eig
+
+            tqdm.write(
+                f"Fisher stats | "
+                f"min_eig={min_eig.item():.3e} | "
+                f"max_eig={max_eig.item():.3e} | "
+                f"cond={cond_number.item():.3e} | "
+                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
+                f"hypergrad_norm={hypergrad.norm().item():.3e}"
+            )
 
         return hypergrad
 
@@ -352,43 +362,42 @@ class OuterOptimizer:
 
 
 def make_sac_inner_optimizer(
-    sac_env: Env,
-    env: Env,
     reward: Reward,
     policy: Policy,
     state_dim: int,
     action_dim: int,
-    fisher_cfg: dict,
+    config: dict,
     device: str | torch.device = "cpu",
 ):
+    fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
     sac_cfg = inner_cfg["sac"]
 
     return SACInnerOptimizer(
-        env=sac_env,
+        env_id=config["env"]["id"],
+        train_env_seed=int(inner_cfg["train_env_seed"]),
+        eval_env_seed=int(inner_cfg["eval_env_seed"]),
         reward=reward,
         policy=policy,
         state_dim=state_dim,
         action_dim=action_dim,
-        action_low=env.action_space.low,
-        action_high=env.action_space.high,
         lr=float(sac_cfg["lr"]),
         buffer_size=int(sac_cfg["buffer_size"]),
         batch_size=int(sac_cfg["batch_size"]),
         learning_starts=int(sac_cfg["learning_starts"]),
-        gamma=float(sac_cfg["gamma"]),
+        gamma=float(fisher_cfg["discount"]),
         polyak=float(sac_cfg["polyak"]),
         alpha=float(sac_cfg["alpha"]),
-        autotune=bool(sac_cfg["autotune"]),
         update_every=int(sac_cfg["update_every"]),
         update_num=int(sac_cfg["update_num"]),
+        scheduler_gamma=float(sac_cfg["scheduler_gamma"]),
         q_hidden=int(sac_cfg["q_hidden"]),
         q_n_hidden_layers=int(sac_cfg["q_n_hidden_layers"]),
         device=device,
     )
 
 
-def train_bilevel(env, config: dict, logger) -> dict:
+def train_bilevel(env: Env, config: dict, logger) -> dict:
     fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
 
@@ -444,11 +453,6 @@ def train_bilevel(env, config: dict, logger) -> dict:
         log_std_max=float(policy_cfg["log_std_max"]),
     ).to(device)
 
-    initial_policy_state = {
-        k: v.detach().clone()
-        for k, v in policy.state_dict().items()
-    }
-
     outer_optimizer = OuterOptimizer(
         reward=reward,
         policy=policy,
@@ -458,9 +462,6 @@ def train_bilevel(env, config: dict, logger) -> dict:
         max_grad_norm=float(fisher_cfg["max_grad_norm"]),
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
     )
-
-    sac_env = gym.make(config["env"]["id"])
-    set_env_seed(sac_env, int(inner_cfg["sac_env_seed"]))
 
     history = {
         "l_outer": [],
@@ -499,6 +500,26 @@ def train_bilevel(env, config: dict, logger) -> dict:
         "env_id": config["env"]["id"],
         "action_type": config["env"]["action_type"],
     }
+
+    def eval_reward_stats():
+        expert_reward_stats = learned_reward_stats(reward, expert_valid_trajs, outer_optimizer.discount)
+        random_reward_stats = learned_reward_stats(reward, random_valid_trajs, outer_optimizer.discount)
+
+        expert_learned_return = expert_reward_stats["return_mean"]
+        random_learned_return = random_reward_stats["return_mean"]
+        expert_random_learned_diff = expert_learned_return - random_learned_return
+
+        expert_learned_step_mean = expert_reward_stats["step_mean"]
+        random_learned_step_mean = random_reward_stats["step_mean"]
+
+        tqdm.write(
+            f"   [outer] "
+            f"expert_ret={expert_learned_return:.3f} "
+            f"random_ret={random_learned_return:.3f} "
+            f"diff={expert_random_learned_diff:.3f} "
+            f"expert_step={expert_learned_step_mean:.4f} "
+            f"random_step={random_learned_step_mean:.4f}"
+        )
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
         nonlocal best_env_reward
@@ -560,23 +581,10 @@ def train_bilevel(env, config: dict, logger) -> dict:
 
     logger.info(header)
 
-    inner_optimizer = make_sac_inner_optimizer(
-        sac_env=sac_env,
-        env=env,
-        reward=reward,
-        policy=policy,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        fisher_cfg=fisher_cfg,
-        device=device,
-    )
+    eval_reward_stats()
 
-    inner_optimizer.optimize(
-        n_inner_steps,
-        inner_loss_fn=lambda x, y, z: inner_loss(x, y, z, outer_optimizer.discount),
-        log_every=n_inner_steps // 10,
-        n_log_traj=10,
-    )
+    with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
+        inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 10, n_eval_traj=10)
 
     agent_trajs = collect_trajectories(
         env=env,
@@ -589,30 +597,12 @@ def train_bilevel(env, config: dict, logger) -> dict:
     log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
     for outer_step in range(1, n_outer_steps + 1):
-        del inner_optimizer
-
         outer_optimizer.step(expert_train_trajs, agent_trajs)
+        eval_reward_stats()
 
-        policy.load_state_dict(initial_policy_state)
-        policy.zero_grad()
-
-        inner_optimizer = make_sac_inner_optimizer(
-            sac_env=sac_env,
-            env=env,
-            reward=reward,
-            policy=policy,
-            state_dim=state_dim,
-            action_dim=action_dim,
-            fisher_cfg=fisher_cfg,
-            device=device,
-        )
-
-        inner_optimizer.optimize(
-            n_inner_steps,
-            inner_loss_fn=lambda x, y, z: inner_loss(x, y, z, outer_optimizer.discount),
-            log_every=n_inner_steps // 10,
-            n_log_traj=10,
-        )
+        policy.reset()
+        with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
+            inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 10, n_eval_traj=10)
 
         agent_trajs = collect_trajectories(
             env=env,
@@ -624,16 +614,12 @@ def train_bilevel(env, config: dict, logger) -> dict:
 
         log_and_checkpoint(outer_step=outer_step, agent_trajs=agent_trajs)
 
-    sac_env.close()
-
     return history
 
 
 def parse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fisher-NHD IRL SAC — Hopper")
-
     parser.add_argument("--config", default=None)
-
     return parser.parse_args()
 
 
@@ -661,7 +647,6 @@ def main() -> None:
         logger.info(f"History saved to {report_path}")
 
     finally:
-        print("Terminated")
         env.close()
 
 

@@ -19,14 +19,16 @@ def num_params(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
 
 
-def assign_flat_gradients(module, flat_grad: torch.Tensor) -> None:
+def assign_flat_gradients(module: nn.Module, flat_grad: torch.Tensor) -> None:
     i = 0
 
     for p in module.parameters():
         n = p.numel()
         grad_chunk = flat_grad[i : i + n]
+        
         if grad_chunk.numel() != n:
             raise ValueError("Flat gradient has incorrect size: not enough elements.")
+        
         p.grad = grad_chunk.reshape(p.shape).clone()
         i += n
 
@@ -69,7 +71,3 @@ def to_device(obj: Any, device: torch.device | str) -> Any:
         return tuple(to_device(value, device) for value in obj)
 
     return obj
-
-
-def suffix_sum(input: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    return torch.flip(torch.cumsum(torch.flip(input, dims=[dim]), dim=dim), dims=[dim])
