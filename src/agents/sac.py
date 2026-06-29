@@ -1,11 +1,13 @@
 from tqdm import tqdm
+import mlflow
+
+from gymnasium import Env
+import gymnasium as gym
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from gymnasium import Env
-import gymnasium as gym
 
 from src.utils.seeding import set_env_seed
 from src.utils.trajectories import collect_trajectories
@@ -273,6 +275,19 @@ class SACInnerOptimizer:
             f"r_max={r_max:.3f}"
         )
 
+        mlflow.log_metrics(
+            {
+                "inner_loss": l_inner,
+                "inner_env_return": env_ret,
+                "inner_learned_return": learned_ret,
+                "reward_mean": r_mean,
+                "reward_std": r_std,
+                "reward_min": r_min,
+                "reward_max": r_max,
+            },
+            step=self.global_step,
+        )
+
     def optimize(self, n_steps: int, eval_every: int = 0, n_eval_traj: int = 10):
         set_env_seed(self.train_env, self.train_env_seed)
 
@@ -287,7 +302,6 @@ class SACInnerOptimizer:
                 action = self.train_env.action_space.sample()
             else:
                 action = self.policy.sample_action(self.state)
-                action = np.clip(action, self.train_env.action_space.low, self.train_env.action_space.high)
 
             next_state, _, terminated, truncated, _ = self.train_env.step(action)
 
@@ -372,6 +386,7 @@ class SACInnerOptimizer:
             for p, tp in zip(self.qf2.parameters(), self.qf2_target.parameters()):
                 tp.data.mul_(self.polyak)
                 tp.data.add_((1.0 - self.polyak) * p.data)
+
 
     def close(self) -> None:
         if self._closed:

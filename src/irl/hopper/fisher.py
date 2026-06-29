@@ -9,9 +9,11 @@ Usage:
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+import mlflow
 
 import gymnasium as gym
 from gymnasium import Env
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,17 +48,19 @@ class Reward(nn.Module):
 
         self.clamp_magnitude = clamp_magnitude
 
-        self.first_fc = nn.Linear(state_dim + action_dim, hidden)
-        self.blocks = nn.ModuleList(
-            [nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU()) for _ in range(n_hidden_layers - 1)]
-        )
-        self.last_fc = nn.Linear(hidden, 1)
+        layers = []
+        in_dim = state_dim + action_dim
+        for _ in range(n_hidden_layers):
+            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.ReLU())
+            in_dim = hidden
+        layers.append(nn.Linear(in_dim, 1))
+
+        self.net = nn.Sequential(*layers)
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        out = self.first_fc(torch.cat([states, actions], dim=-1))
-        for block in self.blocks:
-            out = block(out)
-        out = self.last_fc(out).squeeze(-1)
+        out = self.net(torch.cat([states, actions], dim=-1))
+        out = out.squeeze(-1)
         out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
         return out
 
@@ -117,7 +121,7 @@ class Policy(nn.Module):
         log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
         return mean, log_std
 
-    def get_action(self, states: torch.Tensor, eps: float = 1e-6):
+    def get_action(self, states: torch.Tensor, eps: float = 1e-12):
         mean, log_std = self.forward(states)
         std = log_std.exp()
 
@@ -341,6 +345,16 @@ class OuterOptimizer:
                 f"hypergrad_norm={hypergrad.norm().item():.3e}"
             )
 
+            mlflow.log_metrics(
+                {
+                    "fisher_min_eig": min_eig.item(),
+                    "fisher_max_eig": max_eig.item(),
+                    "fisher_cond": cond_number.item(),
+                    "outer_grad_norm": d_outer_d_policy.norm().item(),
+                    "hypergrad_norm_before_clip": hypergrad.norm().item(),
+                }
+            )
+
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
@@ -407,6 +421,19 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
     policy_cfg = config["policy"]
     reward_cfg = config["reward"]
     ckpt_cfg = config["checkpoint"]
+
+    mlflow.log_params({
+        "discount": fisher_cfg["discount"],
+        "lr_reward": fisher_cfg["lr_reward"],
+        "fisher_reg": fisher_cfg["fisher_reg"],
+        "n_outer_steps": fisher_cfg["n_outer_steps"],
+        "n_inner_steps": fisher_cfg["n_inner_steps"],
+        "n_agent_traj": fisher_cfg["n_agent_traj"],
+        "reward_hidden": config["reward"]["hidden"],
+        "policy_hidden": config["policy"]["hidden"],
+        "alpha": config["fisher"]["inner"]["sac"]["alpha"],
+        "batch_size": config["fisher"]["inner"]["sac"]["batch_size"],
+    })
 
     if inner_cfg["type"] != "sac":
         raise ValueError(f"Expected fisher.inner.type = sac, got {inner_cfg['type']}")
@@ -512,7 +539,7 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
         expert_learned_step_mean = expert_reward_stats["step_mean"]
         random_learned_step_mean = random_reward_stats["step_mean"]
 
-        tqdm.write(
+        logger.info(
             f"   [outer] "
             f"expert_ret={expert_learned_return:.3f} "
             f"random_ret={random_learned_return:.3f} "
@@ -572,6 +599,21 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
 
         logger.info(row)
 
+        mlflow.log_metrics(
+            {
+                "outer_loss": l_outer,
+                "agent_return": agent_ret,
+                "expert_return": expert_ret,
+                "agent_length": agent_len,
+                "rank_corr": rank_corr_val,
+                "policy_nll": policy_nll_val,
+                "hypergrad_norm": raw_hypgrad_norm,
+                "hypergrad_norm_clipped": clipped_hypgrad_norm,
+                "lr_reward": lr_outer_current,
+            },
+            step=outer_step,
+        )
+
     header = (
         f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
         f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
@@ -584,7 +626,7 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
     eval_reward_stats()
 
     with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
-        inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 10, n_eval_traj=10)
+        inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 50, n_eval_traj=10)
 
     agent_trajs = collect_trajectories(
         env=env,
@@ -602,7 +644,7 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
 
         policy.reset()
         with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
-            inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 10, n_eval_traj=10)
+            inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 50, n_eval_traj=10)
 
         agent_trajs = collect_trajectories(
             env=env,
@@ -641,7 +683,10 @@ def main() -> None:
 
     try:
         logger.info("=== Fisher-NHD Hopper SAC ===")
-        history = train_bilevel(env, config, logger)
+
+        with mlflow.start_run(run_name="fisher_sac"):
+            history = train_bilevel(env, config, logger)
+
         report_path = Path(log_cfg["report_dir"]) / "fisher_sac_hopper_history.json"
         save_history(history, str(report_path))
         logger.info(f"History saved to {report_path}")
