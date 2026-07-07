@@ -30,9 +30,9 @@ class ReplayBuffer:
     def push(self, state, action, reward, next_state, done):
         self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
         self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
-        self.reward_buf[self.ptr] = (torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1))
+        self.reward_buf[self.ptr] = torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1)
         self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
-        self.done_buf[self.ptr] = (torch.as_tensor(done, dtype=torch.float32).detach().reshape(1))
+        self.done_buf[self.ptr] = torch.as_tensor(done, dtype=torch.float32).detach().reshape(1)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -124,10 +124,10 @@ class SAC:
         batch_size: int = 256,
         eval_env: Environment = None,
         max_grad_norm: float = 1.0,
-        critic_update_steps: int = 1,
-        actor_update_steps: int = 1,
+        gradient_update_steps: int = 1,
+        target_update_interval: int = 1,
         critic_lr: float = 1e-3,
-        actor_lr: float = 1e-3
+        actor_lr: float = 1e-3,
     ):
         state = train_env.reset()
 
@@ -139,12 +139,15 @@ class SAC:
         q1_optimizer = torch.optim.Adam(q1_params, lr=critic_lr)
         q2_optimizer = torch.optim.Adam(q2_params, lr=critic_lr)
 
+        global_gradient_update_step = 0
+
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
+            # COLLECTING
             if ts < learning_starts:
                 action = train_env.get_random_action()
             else:
                 with torch.no_grad():
-                    action = self.policy.sample(state)
+                    action = self.policy.sample(state).detach()
 
             next_state, reward, done = train_env.step(action)
             self.replay_buffer.push(state, action, reward, next_state, done)
@@ -157,8 +160,9 @@ class SAC:
             if len(self.replay_buffer) < learning_starts:
                 continue
 
-            # CRITIC UPDATE
-            for _ in range(critic_update_steps):
+            # UPDATE
+            for _ in range(gradient_update_steps):
+                # CRITIC
                 states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
 
                 with torch.no_grad():
@@ -177,21 +181,18 @@ class SAC:
 
                 q1_optimizer.zero_grad()
                 torch.autograd.backward(q1_loss, inputs=q1_params)
-                torch.nn.utils.clip_grad_norm_(q1_params, max_grad_norm)
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(q1_params, max_grad_norm)
                 q1_optimizer.step()
 
                 q2_optimizer.zero_grad()
                 torch.autograd.backward(q2_loss, inputs=q2_params)
-                torch.nn.utils.clip_grad_norm_(q2_params, max_grad_norm)
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(q2_params, max_grad_norm)
                 q2_optimizer.step()
 
-            # ACTOR UPDATE
-            for _ in range(actor_update_steps):
-                states, _, _, _, _ = self.replay_buffer.sample(batch_size)
-
-                new_actions, log_probs = self.policy.sample(
-                    states, return_log_probs=True
-                )
+                # ACTOR
+                new_actions, log_probs = self.policy.sample(states, return_log_probs=True)
 
                 q1 = self.q1(states, new_actions)
                 q2 = self.q2(states, new_actions)
@@ -201,14 +202,39 @@ class SAC:
 
                 policy_optimizer.zero_grad()
                 torch.autograd.backward(policy_loss, inputs=policy_params)
-                torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+                if max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
                 policy_optimizer.step()
 
-            # CRITIC-TARGET UPDATE
-            self.soft_update()
+                # CRITIC-TARGET SOFT-UPDATE
+                if global_gradient_update_step % target_update_interval == 0:
+                    self.soft_update()
 
-            if ts % 1000 == 0:
-                self._validate_inner_loss(eval_env, n_eval_traj=10, max_steps=1000, step=ts)
+                # MLFLOW LOGGING
+                mlflow.log_metrics(
+                    {
+                        "sac/reward_mean": float(rewards.mean().item()),
+                        "sac/reward_std": float(rewards.std().item()),
+                        "sac/log_prob_mean": float(next_log_probs.mean().item()),
+                        "sac/entropy_bonus_mean": float((-self.alpha * next_log_probs).mean().item()),
+                        "sac/target_q_mean": float(target_q.mean().item()),
+                        "sac/target_q_std": float(target_q.std().item()),
+                        "sac/current_q1_mean": float(current_q1.mean().item()),
+                        "sac/current_q1_std": float(current_q1.std().item()),
+                        "sac/current_q2_mean": float(current_q2.mean().item()),
+                        "sac/current_q2_std": float(current_q2.std().item()),
+                        "sac/q1_loss": float(q1_loss.item()),
+                        "sac/q2_loss": float(q2_loss.item()),
+                        "sac/policy_loss": float(policy_loss.item()),
+                    },
+                    step=ts,
+                )
+
+                global_gradient_update_step += 1
+
+            # VALIDATION
+            if eval_env is not None and ts % 1000 == 0:
+                self._validate_inner_loss(eval_env, n_eval_traj=100, max_steps=1000, step=ts)
 
     @torch.no_grad()
     def _validate_inner_loss(
