@@ -1,406 +1,243 @@
 from tqdm import tqdm
 import mlflow
 
-from gymnasium import Env
-import gymnasium as gym
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.utils.seeding import set_env_seed
+from src.utils.env import Environment
+from src.utils.policies import Policy
 from src.utils.trajectories import collect_trajectories
-from src.utils.torch import to_device
 from src.evaluation.metrics import inner_loss
 
 
-class SACReplayBuffer:
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        size: int,
-        device: str | torch.device = "cpu",
-    ):
-        self.max_size = int(size)
-        self.device = torch.device(device)
+class ReplayBuffer:
+    def __init__(self, state_dim: int, action_dim: int, capacity: int = 1_000_000):
+        self.capacity = capacity
 
-        self.state_buf = torch.zeros(
-            self.max_size,
-            state_dim,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.next_state_buf = torch.zeros(
-            self.max_size,
-            state_dim,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.action_buf = torch.zeros(
-            self.max_size,
-            action_dim,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.reward_buf = torch.zeros(
-            self.max_size,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.terminal_buf = torch.zeros(
-            self.max_size,
-            dtype=torch.float32,
-            device=self.device,
-        )
+        self.state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
+        self.action_buf = torch.empty(capacity, action_dim, dtype=torch.float32)
+        self.reward_buf = torch.empty(capacity, 1, dtype=torch.float32)
+        self.next_state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
+        self.done_buf = torch.empty(capacity, 1, dtype=torch.float32)
 
         self.ptr = 0
-        self.full = False
-
-    def add(self, state, action, reward: float, next_state, terminal: bool | float):
-        self.state_buf[self.ptr] = torch.as_tensor(
-            state,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.action_buf[self.ptr] = torch.as_tensor(
-            action,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.reward_buf[self.ptr] = torch.as_tensor(
-            reward,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.next_state_buf[self.ptr] = torch.as_tensor(
-            next_state,
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self.terminal_buf[self.ptr] = torch.as_tensor(
-            terminal,
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        self.ptr += 1
-        if self.ptr == self.max_size:
-            self.ptr = 0
-            self.full = True
+        self.size = 0
 
     def __len__(self):
-        return self.max_size if self.full else self.ptr
+        return self.size
+
+    def push(self, state, action, reward, next_state, done):
+        self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
+        self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
+        self.reward_buf[self.ptr] = (torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1))
+        self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
+        self.done_buf[self.ptr] = (torch.as_tensor(done, dtype=torch.float32).detach().reshape(1))
+
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        if len(self) == 0:
-            raise ValueError("Cannot sample from an empty replay buffer.")
+        idxs = torch.randint(0, self.size, size=(batch_size,))
 
-        indices = torch.randint(0, len(self), size=(batch_size,), device=self.device)
+        states = self.state_buf[idxs]
+        actions = self.action_buf[idxs]
+        rewards = self.reward_buf[idxs].reshape(-1)
+        next_states = self.next_state_buf[idxs]
+        dones = self.done_buf[idxs].reshape(-1)
 
-        return (
-            self.state_buf[indices],
-            self.action_buf[indices],
-            self.reward_buf[indices],
-            self.next_state_buf[indices],
-            self.terminal_buf[indices],
-        )
+        return states, actions, rewards, next_states, dones
 
 
-class SoftQNetwork(nn.Module):
+class QFunction(nn.Module):
     def __init__(
         self,
         state_dim: int,
         action_dim: int,
-        hidden: int = 256,
-        n_hidden_layers: int = 2,
+        hidden_dim: int = 64,
+        n_hidden_layers: int = 1,
     ):
         super().__init__()
 
-        layers = [nn.Linear(state_dim + action_dim, hidden), nn.ReLU()]
-        for _ in range(n_hidden_layers - 1):
-            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
-        layers += [nn.Linear(hidden, 1)]
+        in_dim = state_dim + action_dim
+        layers = []
+        for _ in range(n_hidden_layers):
+            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+            in_dim = hidden_dim
+        layers += [nn.Linear(in_dim, 1)]
 
-        self.net = nn.Sequential(*layers)
+        self.backbone = nn.Sequential(*layers)
 
-    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([states, actions], dim=-1)).squeeze(-1)
+    def forward(self, states: torch.Tensor, actions: torch.Tensor):
+        # states: (B, state_dim)
+        # actions: (B, action_dim)
+        x = torch.cat([states, actions], dim=-1)
+        out = self.backbone(x).squeeze(-1)
+        return out  # (B,)
 
 
-class SACInnerOptimizer:
+class SAC:
     def __init__(
         self,
-        env_id: str,
-        train_env_seed: int,
-        eval_env_seed: int,
-        reward,
-        policy,
+        policy: Policy,
         state_dim: int,
         action_dim: int,
-        q_n_hidden_layers: int = 2,
-        q_hidden: int = 256,
-        lr: float = 1e-3,
-        lr_actor: float | None = None,
-        lr_q: float | None = None,
-        buffer_size: int = 1_000_000,
-        batch_size: int = 256,
-        learning_starts: int = 10_000,
+        hidden_dim: int = 64,
+        n_hidden_layers: int = 1,
         gamma: float = 0.99,
-        polyak: float = 0.995,
         alpha: float = 1.0,
-        update_every: int = 50,
-        update_num: int = 50,
-        scheduler_gamma: float = 1.0,
-        device: str | torch.device = "cpu",
+        tau: float = 0.005,
+        replay_buffer_capacity: int = 1_000_000,
     ):
-        self.env_id = env_id
-        self.train_env_seed = train_env_seed
-        self.eval_env_seed = eval_env_seed
-
-        self.train_env = gym.make(env_id)
-        self.eval_env = gym.make(env_id)
-
-        set_env_seed(self.train_env, train_env_seed)
-        set_env_seed(self.eval_env, eval_env_seed)
-
-        self.reward = reward
         self.policy = policy
-        self.state = None
 
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.batch_size = batch_size
-        self.learning_starts = learning_starts
+        self.q1 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
+        self.q2 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
+
+        self.q1_target = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+
+        self.q2_target = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.replay_buffer = ReplayBuffer(state_dim, action_dim, capacity=replay_buffer_capacity)
 
         self.gamma = gamma
         self.alpha = alpha
-
-        self.polyak = polyak
-        self.update_every = update_every
-        self.update_num = update_num
-        self.scheduler_gamma = scheduler_gamma
-
-        self.device = torch.device(device)
-        self.reward.to(self.device)
-        self.policy.to(self.device)
-
-        self.qf1 = SoftQNetwork(state_dim, action_dim, q_hidden, q_n_hidden_layers).to(self.device)
-        self.qf2 = SoftQNetwork(state_dim, action_dim, q_hidden, q_n_hidden_layers).to(self.device)
-
-        self.qf1_target = SoftQNetwork(state_dim, action_dim, q_hidden, q_n_hidden_layers).to(self.device)
-        self.qf2_target = SoftQNetwork(state_dim, action_dim, q_hidden, q_n_hidden_layers).to(self.device)
-
-        self.qf1_target.load_state_dict(self.qf1.state_dict())
-        self.qf2_target.load_state_dict(self.qf2.state_dict())
-
-        for p in self.qf1_target.parameters():
-            p.requires_grad = False
-        for p in self.qf2_target.parameters():
-            p.requires_grad = False
-
-        lr_q_final = lr if lr_q is None else lr_q
-        lr_actor_final = lr if lr_actor is None else lr_actor
-
-        self.q_params = list(self.qf1.parameters()) + list(self.qf2.parameters())
-        self.q_optimizer = torch.optim.Adam(self.q_params, lr=lr_q_final)
-        self.actor_optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr_actor_final)
-
-        self.q_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.q_optimizer, gamma=scheduler_gamma)
-        self.actor_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.actor_optimizer, gamma=scheduler_gamma)
-
-        self.rb = SACReplayBuffer(state_dim, action_dim, buffer_size, self.device)
-
-        self.global_step = 0
-
-        self._closed = False
+        self.tau = tau
 
     @torch.no_grad()
-    def _validate(self, n_eval_traj):
+    def soft_update(self):
+        for tp, p in zip(self.q1_target.parameters(), self.q1.parameters()):
+            tp.mul_(1.0 - self.tau)
+            tp.add_(self.tau * p)
+
+        for tp, p in zip(self.q2_target.parameters(), self.q2.parameters()):
+            tp.mul_(1.0 - self.tau)
+            tp.add_(self.tau * p)
+
+    def optimize(
+        self,
+        train_env: Environment,
+        total_steps: int = 1_000_000,
+        learning_starts: int = 10_000,
+        batch_size: int = 256,
+        eval_env: Environment = None,
+        max_grad_norm: float = 1.0,
+        critic_update_steps: int = 1,
+        actor_update_steps: int = 1,
+        critic_lr: float = 1e-3,
+        actor_lr: float = 1e-3
+    ):
+        state = train_env.reset()
+
+        policy_params = list(self.policy.parameters())
+        q1_params = list(self.q1.parameters())
+        q2_params = list(self.q2.parameters())
+
+        policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
+        q1_optimizer = torch.optim.Adam(q1_params, lr=critic_lr)
+        q2_optimizer = torch.optim.Adam(q2_params, lr=critic_lr)
+
+        for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
+            if ts < learning_starts:
+                action = train_env.get_random_action()
+            else:
+                with torch.no_grad():
+                    action = self.policy.sample(state)
+
+            next_state, reward, done = train_env.step(action)
+            self.replay_buffer.push(state, action, reward, next_state, done)
+
+            if done:
+                state = train_env.reset()
+            else:
+                state = next_state
+
+            if len(self.replay_buffer) < learning_starts:
+                continue
+
+            # CRITIC UPDATE
+            for _ in range(critic_update_steps):
+                states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
+
+                with torch.no_grad():
+                    next_actions, next_log_probs = self.policy.sample(next_states, return_log_probs=True)
+
+                    next_q1 = self.q1_target(next_states, next_actions)
+                    next_q2 = self.q2_target(next_states, next_actions)
+                    next_q = torch.min(next_q1, next_q2)
+                    target_q = rewards + self.gamma * (1.0 - dones) * (next_q - self.alpha * next_log_probs)
+
+                current_q1 = self.q1(states, actions)
+                current_q2 = self.q2(states, actions)
+
+                q1_loss = F.mse_loss(current_q1, target_q)
+                q2_loss = F.mse_loss(current_q2, target_q)
+
+                q1_optimizer.zero_grad()
+                torch.autograd.backward(q1_loss, inputs=q1_params)
+                torch.nn.utils.clip_grad_norm_(q1_params, max_grad_norm)
+                q1_optimizer.step()
+
+                q2_optimizer.zero_grad()
+                torch.autograd.backward(q2_loss, inputs=q2_params)
+                torch.nn.utils.clip_grad_norm_(q2_params, max_grad_norm)
+                q2_optimizer.step()
+
+            # ACTOR UPDATE
+            for _ in range(actor_update_steps):
+                states, _, _, _, _ = self.replay_buffer.sample(batch_size)
+
+                new_actions, log_probs = self.policy.sample(
+                    states, return_log_probs=True
+                )
+
+                q1 = self.q1(states, new_actions)
+                q2 = self.q2(states, new_actions)
+                q = torch.min(q1, q2)
+
+                policy_loss = torch.mean(self.alpha * log_probs - q)
+
+                policy_optimizer.zero_grad()
+                torch.autograd.backward(policy_loss, inputs=policy_params)
+                torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
+                policy_optimizer.step()
+
+            # CRITIC-TARGET UPDATE
+            self.soft_update()
+
+            if ts % 1000 == 0:
+                self._validate_inner_loss(eval_env, n_eval_traj=10, max_steps=1000, step=ts)
+
+    @torch.no_grad()
+    def _validate_inner_loss(
+        self,
+        eval_env: Environment,
+        n_eval_traj: int = 10,
+        max_steps: int = 1000,
+        step: int = 0,
+    ):
         self.policy.eval()
-        self.reward.eval()
 
-        set_env_seed(self.eval_env, self.eval_env_seed)
-        eval_trajs = collect_trajectories(self.eval_env, self.policy, n_eval_traj, max_steps=1000, verbose=False)
-
-        l_inner = inner_loss(self.policy, self.reward, eval_trajs, self.gamma, self.alpha)
-
-        env_returns = []
-        learned_returns = []
-        logp_sums = []
-        reward_means = []
-        reward_stds = []
-        reward_mins = []
-        reward_maxs = []
-
-        for traj in eval_trajs:
-            states = to_device(traj["states"], self.device)
-            actions = to_device(traj["actions"], self.device)
-            T = states.size(0)
-
-            rewards = self.reward(states, actions)
-            log_probs = self.policy.log_prob(states, actions)
-
-            ts = torch.arange(T, dtype=torch.float32, device=self.device)
-            discounts = torch.pow(torch.tensor(self.gamma, dtype=torch.float32, device=self.device), ts)
-
-            learned_return = (discounts * rewards).sum()
-
-            env_returns.append(float(sum(traj["env_rewards"])))
-            learned_returns.append(learned_return.item())
-            logp_sums.append(log_probs.sum().item())
-            reward_means.append(rewards.mean().item())
-            reward_stds.append(rewards.std().item())
-            reward_mins.append(rewards.min().item())
-            reward_maxs.append(rewards.max().item())
-
-        env_ret = float(np.mean(env_returns))
-        learned_ret = float(np.mean(learned_returns))
-        logp_sum = float(np.mean(logp_sums))
-        r_mean = float(np.mean(reward_means))
-        r_std = float(np.mean(reward_stds))
-        r_min = float(np.mean(reward_mins))
-        r_max = float(np.mean(reward_maxs))
-
-        tqdm.write(
-            f"   [inner] gstep={self.global_step} "
-            f"L_inner={l_inner:.1f} "
-            f"env_ret={env_ret:.1f} "
-            f"learned_ret={learned_ret:.1f} "
-            f"logp_sum={logp_sum:.1f} "
-            f"r_mean={r_mean:.3f} "
-            f"r_std={r_std:.3f} "
-            f"r_min={r_min:.3f} "
-            f"r_max={r_max:.3f}"
+        eval_trajs = collect_trajectories(
+            env=eval_env,
+            policy=self.policy,
+            n=n_eval_traj,
+            max_steps=max_steps,
+            verbose=False,
         )
 
-        mlflow.log_metrics(
-            {
-                "inner_loss": l_inner,
-                "inner_env_return": env_ret,
-                "inner_learned_return": learned_ret,
-                "reward_mean": r_mean,
-                "reward_std": r_std,
-                "reward_min": r_min,
-                "reward_max": r_max,
-            },
-            step=self.global_step,
+        l_inner = inner_loss(
+            policy=self.policy,
+            reward=eval_env.custom_reward,
+            trajs=eval_trajs,
+            discount=self.gamma,
+            alpha=self.alpha,
         )
 
-    def optimize(self, n_steps: int, eval_every: int = 0, n_eval_traj: int = 10):
-        set_env_seed(self.train_env, self.train_env_seed)
+        mlflow.log_metric("sac/l_inner", float(l_inner), step=step)
 
-        if self.state is None:
-            self.state, _ = self.train_env.reset()
+        self.policy.train()
 
-        for _ in tqdm(range(n_steps), desc="SAC inner", leave=False):
-            self.policy.train()
-            self.reward.train()
-
-            if self.global_step < self.learning_starts:
-                action = self.train_env.action_space.sample()
-            else:
-                action = self.policy.sample_action(self.state)
-
-            next_state, _, terminated, truncated, _ = self.train_env.step(action)
-
-            self.rb.add(
-                state=self.state,
-                action=action,
-                reward=0.0,
-                next_state=next_state,
-                terminal=terminated,
-            )
-
-            if not (terminated or truncated):
-                self.state = next_state
-            else:
-                self.state, _ = self.train_env.reset()
-
-            if (
-                self.global_step >= self.learning_starts
-                and len(self.rb) >= self.batch_size
-                and self.global_step % self.update_every == 0
-            ):
-                for _ in range(self.update_num):
-                    self._update()
-
-                self.q_scheduler.step()
-                self.actor_scheduler.step()
-
-            self.global_step += 1
-
-            # VALIDATION
-            if eval_every and self.global_step % eval_every == 0:
-                self._validate(n_eval_traj)
-
-    def _update(self):
-        states, actions, _, next_states, terminals = self.rb.sample(self.batch_size)
-
-        with torch.no_grad():
-            rewards = self.reward(states, actions)
-            next_actions, next_log_pi, _ = self.policy.get_action(next_states)
-
-            qf1_next = self.qf1_target(next_states, next_actions)
-            qf2_next = self.qf2_target(next_states, next_actions)
-
-            soft_next_value = torch.min(qf1_next, qf2_next) - self.alpha * next_log_pi
-            next_q_value = rewards + (1.0 - terminals) * self.gamma * soft_next_value
-
-        qf1_pred = self.qf1(states, actions)
-        qf2_pred = self.qf2(states, actions)
-
-        qf1_loss = F.mse_loss(qf1_pred, next_q_value)
-        qf2_loss = F.mse_loss(qf2_pred, next_q_value)
-        q_loss = qf1_loss + qf2_loss
-
-        self.q_optimizer.zero_grad()
-        q_loss.backward()
-        self.q_optimizer.step()
-
-        # ── Actor update ───────────────────────────────────────────────────────
-        for p in self.q_params:
-            p.requires_grad = False
-
-        pi_actions, log_pi, _ = self.policy.get_action(states)
-        qf1_pi = self.qf1(states, pi_actions)
-        qf2_pi = self.qf2(states, pi_actions)
-        min_qf_pi = torch.min(qf1_pi, qf2_pi)
-
-        actor_loss = (self.alpha * log_pi - min_qf_pi).mean()
-
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        for p in self.q_params:
-            p.requires_grad = True
-
-        # ── Target network update ──────────────────────────────────────────────
-        with torch.no_grad():
-            for p, tp in zip(self.qf1.parameters(), self.qf1_target.parameters()):
-                tp.data.mul_(self.polyak)
-                tp.data.add_((1.0 - self.polyak) * p.data)
-
-            for p, tp in zip(self.qf2.parameters(), self.qf2_target.parameters()):
-                tp.data.mul_(self.polyak)
-                tp.data.add_((1.0 - self.polyak) * p.data)
-
-
-    def close(self) -> None:
-        if self._closed:
-            return
-
-        self.train_env.close()
-        self.eval_env.close()
-        self._closed = True
-
-
-    def __enter__(self):
-        return self
-
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
-        return False
+        return float(l_inner)

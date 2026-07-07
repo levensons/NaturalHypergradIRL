@@ -1,35 +1,20 @@
 from typing import Any
 import numpy as np
 import torch
-from gymnasium import Env, spaces
+from gymnasium import spaces
 from tqdm import tqdm
 
 from src.utils.policies import Policy
+from src.utils.env import Environment
 
 
 def _check_policy(policy: Policy) -> None:
-    if not hasattr(policy, "sample_action") or not callable(policy.sample_action):
-        raise TypeError("policy must have a callable method `sample_action(state)`")
-
-
-def _prepare_action(env: Env, action: Any):
-    if isinstance(env.action_space, spaces.Box):
-        action = np.asarray(action, dtype=np.float32)
-        action = np.clip(action, env.action_space.low, env.action_space.high)
-        action = action.astype(np.float32, copy=False)
-        action_tensor = torch.as_tensor(action, dtype=torch.float32)
-        return action, action_tensor
-
-    if isinstance(env.action_space, spaces.Discrete):
-        action = int(action)
-        action_tensor = torch.tensor(action, dtype=torch.long)
-        return action, action_tensor
-
-    raise TypeError(f"Unsupported action space: {type(env.action_space)}")
+    if not hasattr(policy, "sample") or not callable(policy.sample):
+        raise TypeError("policy must have a callable method `sample(state)`")
 
 
 def collect_trajectories(
-    env: Env,
+    env: Environment,
     policy: Policy,
     n: int,
     max_steps: int = 1000,
@@ -45,28 +30,28 @@ def collect_trajectories(
         actions = []
         env_rewards = []
 
-        state, _ = env.reset()
+        state = env.reset()
 
         for _ in range(max_steps):
-            action = policy.sample_action(state)
-            action, action_tensor = _prepare_action(env, action)
+            with torch.no_grad():
+                action = policy.sample(state).detach()
 
-            next_state, reward, terminated, truncated, _ = env.step(action)
+            next_state, reward, done = env.step(action)
 
-            states.append(torch.as_tensor(state, dtype=torch.float32))
-            actions.append(action_tensor)
-            env_rewards.append(float(reward))
+            states.append(state.detach())
+            actions.append(action.detach())
+            env_rewards.append(float(reward.item()))
 
             state = next_state
 
-            if terminated or truncated:
+            if done.item():
                 break
 
         trajs.append(
             {
                 "states": torch.stack(states),
                 "actions": torch.stack(actions),
-                "env_rewards": torch.tensor(env_rewards, dtype=torch.float32),
+                "env_rewards": env_rewards,
             }
         )
 

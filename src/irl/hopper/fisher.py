@@ -19,11 +19,11 @@ import torch
 import torch.nn as nn
 
 from src.evaluation.metrics import outer_loss, policy_nll, rank_corr, learned_reward_stats
-from src.agents.sac import SACInnerOptimizer
+from src.agents.sac import SAC
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
-from src.utils.env import get_env_dims
+from src.utils.env import Environment
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
@@ -40,9 +40,9 @@ class Reward(nn.Module):
         self,
         state_dim,
         action_dim,
-        n_hidden_layers=2,
-        hidden=64,
-        clamp_magnitude=10.0,
+        n_hidden_layers: int = 2,
+        hidden_dim: int = 64,
+        clamp_magnitude: float = 10.0,
     ):
         super().__init__()
 
@@ -51,9 +51,9 @@ class Reward(nn.Module):
         layers = []
         in_dim = state_dim + action_dim
         for _ in range(n_hidden_layers):
-            layers.append(nn.Linear(in_dim, hidden))
+            layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.ReLU())
-            in_dim = hidden
+            in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, 1))
 
         self.net = nn.Sequential(*layers)
@@ -61,7 +61,7 @@ class Reward(nn.Module):
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         out = self.net(torch.cat([states, actions], dim=-1))
         out = out.squeeze(-1)
-        out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
+        # out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
         return out
 
     def rewards(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
@@ -76,113 +76,93 @@ class Policy(nn.Module):
         self,
         state_dim: int,
         action_dim: int,
-        action_low,
-        action_high,
-        hidden: int = 64,
-        n_hidden_layers: int = 2,
-        log_std_max=2,
-        log_std_min=-5,
+        action_low: float,
+        action_high: float,
+        hidden_dim: int = 64,
+        n_hidden_layers: int = 1,
+        log_std_min: float = -20,
+        log_std_max: float = 2,
     ):
         super().__init__()
 
-        layers = [nn.Linear(state_dim, hidden), nn.ReLU()]
-        for _ in range(n_hidden_layers - 1):
-            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+        in_dim = state_dim
+        layers = []
+        for _ in range(n_hidden_layers):
+            layers += [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+            in_dim = hidden_dim
 
-        self.net = nn.Sequential(*layers)
-        self.mean_head = nn.Linear(hidden, action_dim)
-        self.log_std_head = nn.Linear(hidden, action_dim)
+        self.backbone = nn.Sequential(*layers)
 
-        action_low = np.asarray(action_low, dtype=np.float32)
-        action_high = np.asarray(action_high, dtype=np.float32)
+        self.mean_head = nn.Linear(in_dim, action_dim)
+        self.log_std_head = nn.Linear(in_dim, action_dim)
 
         self.register_buffer(
-            "action_scale",
-            torch.tensor((action_high - action_low) / 2.0, dtype=torch.float32),
+            "action_low", torch.as_tensor(action_low, dtype=torch.float32)
         )
         self.register_buffer(
-            "action_bias",
-            torch.tensor((action_high + action_low) / 2.0, dtype=torch.float32),
+            "action_high", torch.as_tensor(action_high, dtype=torch.float32)
         )
+        self.register_buffer("action_scale", (self.action_high - self.action_low) / 2)
+        self.register_buffer("action_bias", (self.action_high + self.action_low) / 2)
 
-        self.log_std_max = log_std_max
         self.log_std_min = log_std_min
-
-        self.initial_policy_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
-
-    def reset(self):
-        self.load_state_dict(self.initial_policy_state)
-        self.zero_grad()
+        self.log_std_max = log_std_max
 
     def forward(self, states: torch.Tensor):
-        h = self.net(states)
-        mean = self.mean_head(h)
-        log_std = self.log_std_head(h)
-        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        x = self.backbone(states)
+        mean = self.mean_head(x)  # (B, action_dim)
+        log_std = self.log_std_head(x)  # (B, action_dim)
+        log_std = torch.clamp(log_std, min=self.log_std_min, max=self.log_std_max)
         return mean, log_std
 
-    def get_action(self, states: torch.Tensor, eps: float = 1e-12):
-        mean, log_std = self.forward(states)
-        std = log_std.exp()
+    def action_distribution(self, states: torch.Tensor):
+        # states: (B, state_dim)
+        # actions: (B, action_dim)
+        mean, log_std = self.forward(states)  # (B, action_dim) x 2
+        dist = torch.distributions.Normal(mean, torch.exp(log_std))
+        return dist
 
-        normal = torch.distributions.Normal(mean, std)
+    def log_prob(self, states: torch.Tensor, actions: torch.Tensor):
+        # states: (B, state_dim)
+        # actions: (B, action_dim)
+        dist = self.action_distribution(states)
 
-        x_t = normal.rsample()
-        y_t = torch.tanh(x_t)
-
-        action = y_t * self.action_scale + self.action_bias
-
-        log_prob = normal.log_prob(x_t)
-        log_prob = log_prob - torch.log(self.action_scale * (1.0 - y_t.pow(2)) + eps)
-        log_prob = log_prob.sum(dim=-1)
-
-        mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
-
-        return action, log_prob, mean_action
-
-    @staticmethod
-    def atanh(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-        x = torch.clamp(x, -1.0 + eps, 1.0 - eps)
-        return 0.5 * (torch.log1p(x) - torch.log1p(-x))
-
-    def action_to_normalized(self, actions: torch.Tensor) -> torch.Tensor:
-        return (actions - self.action_bias) / self.action_scale
-
-    def log_prob(self, states: torch.Tensor, actions: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-        if states.dim() == 1:
-            states = states.unsqueeze(0)
-
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(0)
-
-        mean, log_std = self.forward(states)
-        std = log_std.exp()
-
-        normalized_action = torch.clamp(
-            self.action_to_normalized(actions),
-            -1.0 + eps,
-            1.0 - eps,
+        squashed_actions = (actions - self.action_bias) / self.action_scale
+        squashed_actions = torch.clamp(
+            squashed_actions, min=self.action_low, max=self.action_high
         )
-        pre_tanh_action = self.atanh(normalized_action)
+        raw_actions = 0.5 * (
+            torch.log1p(squashed_actions) - torch.log1p(-squashed_actions)
+        )
 
-        normal = torch.distributions.Normal(mean, std)
+        log_probs = dist.log_prob(raw_actions)
+        correction = torch.log(self.action_scale * (1.0 - torch.pow(squashed_actions, 2)))
+        log_probs = log_probs - correction
+        return log_probs.sum(dim=-1)  # (B,)
 
-        log_prob = normal.log_prob(pre_tanh_action)
-        correction = torch.log(self.action_scale * (1.0 - normalized_action.pow(2)) + eps)
+    def sample(
+        self,
+        states: torch.Tensor,
+        deterministic: bool = False,
+        return_log_probs: bool = False,
+    ):
+        # states: (B, state_dim)
+        dist = self.action_distribution(states)
 
-        return (log_prob - correction).sum(dim=-1)
+        raw_actions = dist.mean if deterministic else dist.rsample()
+        squashed_actions = torch.tanh(raw_actions)  # (-1; 1)
+        actions = self.action_bias + self.action_scale * squashed_actions
+        actions = torch.clamp(actions, min=self.action_low, max=self.action_high)
 
-    def sample_action(self, state, deterministic: bool = False):
-        device = next(self.parameters()).device
-        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+        if not return_log_probs:
+            return actions
 
-        with torch.no_grad():
-            if deterministic:
-                _, _, action = self.get_action(state_tensor)
-            else:
-                action, _, _ = self.get_action(state_tensor)
+        log_probs = dist.log_prob(raw_actions)  # (B, action_dim)
+        correction = torch.log(self.action_scale * (1.0 - squashed_actions.pow(2)) + 1e-6)  # (B, action_dim)
+        log_probs = log_probs - correction
+        log_probs = log_probs.sum(dim=-1)  # (B,)
 
-        return action.squeeze(0).cpu().numpy()
+        return actions, log_probs
 
 
 class OuterOptimizer:
@@ -208,6 +188,8 @@ class OuterOptimizer:
 
         self.optimizer = torch.optim.Adam(self.reward.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
+
+        self.outer_step = 0
 
     def _grad_R_tail_with_discount(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         device = next(self.reward.parameters()).device
@@ -250,6 +232,117 @@ class OuterOptimizer:
 
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, policy_dim)
         return grads
+    
+    def _compute_agent_score_cache(self, trajs):
+        device = next(self.policy.parameters()).device
+
+        cache = []
+
+        for traj in tqdm(trajs, desc="Cache agent scores", leave=False):
+            states = to_device(traj["states"], device)
+            actions = to_device(traj["actions"], device)
+            T = states.size(0)
+
+            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
+
+            cache.append(
+                {
+                    "states": states,
+                    "actions": actions,
+                    "T": T,
+                    "grad_log_pi_a_s": grad_log_pi_a_s.detach(),
+                }
+            )
+
+        return cache
+    
+    def fisher_from_cache(self, score_cache) -> torch.Tensor:
+        policy_dim = num_params(self.policy)
+        device = next(self.policy.parameters()).device
+
+        F = torch.zeros(policy_dim, policy_dim, dtype=torch.float64, device=device)
+
+        for item in tqdm(score_cache, desc="Fisher cached", leave=False):
+            T = item["T"]
+            grad_log_pi_a_s = item["grad_log_pi_a_s"].to(dtype=torch.float64)
+            weights = discount_weights(T, self.discount, device, dtype=torch.float64)
+            F += torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s)
+
+        F /= len(score_cache)
+        F = 0.5 * (F + F.T)
+        F += self.fisher_reg * torch.eye(policy_dim, dtype=torch.float64, device=device)
+        F = 0.5 * (F + F.T)
+        return F
+    
+    def d_cross_vec_product_from_cache(self, score_cache, v: torch.Tensor) -> torch.Tensor:
+        reward_dim = num_params(self.reward)
+        policy_dim = num_params(self.policy)
+        device = next(self.policy.parameters()).device
+
+        v = v.to(dtype=torch.float32, device=device)
+
+        if v.numel() != policy_dim:
+            raise ValueError(f"`v` must have shape ({policy_dim},), got {tuple(v.shape)}.")
+
+        out = torch.zeros(reward_dim, dtype=torch.float32, device=device)
+
+        for item in tqdm(score_cache, desc="Cross vec product cached", leave=False):
+            states = item["states"]
+            actions = item["actions"]
+
+            grad_R_tail_with_discount = self._grad_R_tail_with_discount(states, actions)  # (T, reward_dim)
+            grad_log_pi_a_s = item["grad_log_pi_a_s"].to(dtype=torch.float32)
+
+            out += torch.einsum("tr,tp,p->r", grad_R_tail_with_discount, grad_log_pi_a_s, v)
+
+        return -(out / len(score_cache))
+    
+    def hypergradient_with_cache(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        score_cache = self._compute_agent_score_cache(agent_trajs)
+
+        fisher = self.fisher_from_cache(score_cache)  # (policy_dim, policy_dim)
+        d_outer_d_policy = self.d_outer_d_policy(expert_trajs).to(dtype=torch.float64)
+
+        fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (policy_dim,)
+        fisher_inv_d_outer_d_policy = fisher_inv_d_outer_d_policy.to(dtype=torch.float32)
+
+        hypergrad = -self.d_cross_vec_product_from_cache(score_cache, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+
+        # with torch.no_grad():
+        #     eigvals = torch.linalg.eigvalsh(fisher)
+        #     min_eig = eigvals.min()
+        #     max_eig = eigvals.max()
+        #     cond_number = max_eig / min_eig
+
+        #     outer_grad_norm = d_outer_d_policy.norm().item()
+        #     solve_norm = fisher_inv_d_outer_d_policy.norm().item()
+        #     hypergrad_norm = hypergrad.norm().item()
+        #     cross_amp = hypergrad_norm / (solve_norm + 1e-8)
+
+        #     tqdm.write(
+        #         f"Fisher stats | "
+        #         f"min_eig={min_eig.item():.3e} | "
+        #         f"max_eig={max_eig.item():.3e} | "
+        #         f"cond={cond_number.item():.3e} | "
+        #         f"outer_grad_norm={outer_grad_norm:.3e} | "
+        #         f"solve_norm={solve_norm:.3e} | "
+        #         f"cross_amp={cross_amp:.3e} | "
+        #         f"hypergrad_norm={hypergrad_norm:.3e}"
+        #     )
+
+        #     mlflow.log_metrics(
+        #         {
+        #             "fisher_min_eig": min_eig.item(),
+        #             "fisher_max_eig": max_eig.item(),
+        #             "fisher_cond": cond_number.item(),
+        #             "outer_grad_norm": outer_grad_norm,
+        #             "fisher_solve_norm": solve_norm,
+        #             "cross_amplification": cross_amp,
+        #             "hypergrad_norm_before_clip": hypergrad_norm,
+        #         }
+        #     )
+
+        return hypergrad
 
     def fisher(self, trajs) -> torch.Tensor:
         policy_dim = num_params(self.policy)
@@ -343,6 +436,8 @@ class OuterOptimizer:
                 f"cond={cond_number.item():.3e} | "
                 f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
                 f"hypergrad_norm={hypergrad.norm().item():.3e}"
+                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
+                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
             )
 
             mlflow.log_metrics(
@@ -351,8 +446,15 @@ class OuterOptimizer:
                     "fisher_max_eig": max_eig.item(),
                     "fisher_cond": cond_number.item(),
                     "outer_grad_norm": d_outer_d_policy.norm().item(),
+
+                    "fisher_inv_d_outer_d_policy_norm": fisher_inv_d_outer_d_policy.norm().item(),
+                    "fisher_inv_d_outer_d_policy_abs_max": fisher_inv_d_outer_d_policy.abs().max().item(),
+                    "fisher_inv_d_outer_d_policy_mean": fisher_inv_d_outer_d_policy.mean().item(),
+                    "fisher_inv_d_outer_d_policy_std": fisher_inv_d_outer_d_policy.std().item(),
+
                     "hypergrad_norm_before_clip": hypergrad.norm().item(),
-                }
+                },
+                step=self.outer_step
             )
 
         return hypergrad
@@ -371,56 +473,26 @@ class OuterOptimizer:
 
         if self.scheduler:
             self.scheduler.step()
+        
+        self.outer_step += 1
 
         return hypergradient
 
 
-def make_sac_inner_optimizer(
-    reward: Reward,
-    policy: Policy,
-    state_dim: int,
-    action_dim: int,
-    config: dict,
-    device: str | torch.device = "cpu",
-):
+def train_bilevel(config: dict, logger) -> dict:
     fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
     sac_cfg = inner_cfg["sac"]
+    policy_cfg = config["policy"]
+    reward_cfg = config["reward"]
+    env_cfg = config["env"]
+    ckpt_cfg = config["checkpoint"]
 
-    return SACInnerOptimizer(
-        env_id=config["env"]["id"],
-        train_env_seed=int(inner_cfg["train_env_seed"]),
-        eval_env_seed=int(inner_cfg["eval_env_seed"]),
-        reward=reward,
-        policy=policy,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        lr=float(sac_cfg["lr"]),
-        buffer_size=int(sac_cfg["buffer_size"]),
-        batch_size=int(sac_cfg["batch_size"]),
-        learning_starts=int(sac_cfg["learning_starts"]),
-        gamma=float(fisher_cfg["discount"]),
-        polyak=float(sac_cfg["polyak"]),
-        alpha=float(sac_cfg["alpha"]),
-        update_every=int(sac_cfg["update_every"]),
-        update_num=int(sac_cfg["update_num"]),
-        scheduler_gamma=float(sac_cfg["scheduler_gamma"]),
-        q_hidden=int(sac_cfg["q_hidden"]),
-        q_n_hidden_layers=int(sac_cfg["q_n_hidden_layers"]),
-        device=device,
-    )
-
-
-def train_bilevel(env: Env, config: dict, logger) -> dict:
-    fisher_cfg = config["fisher"]
-    inner_cfg = fisher_cfg["inner"]
+    set_random_seed(int(fisher_cfg["random_seed"]))
+    env = Environment(env_cfg["id"], int(fisher_cfg["env_seed"]))
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-
-    policy_cfg = config["policy"]
-    reward_cfg = config["reward"]
-    ckpt_cfg = config["checkpoint"]
 
     mlflow.log_params({
         "discount": fisher_cfg["discount"],
@@ -429,10 +501,10 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
         "n_outer_steps": fisher_cfg["n_outer_steps"],
         "n_inner_steps": fisher_cfg["n_inner_steps"],
         "n_agent_traj": fisher_cfg["n_agent_traj"],
-        "reward_hidden": config["reward"]["hidden"],
-        "policy_hidden": config["policy"]["hidden"],
-        "alpha": config["fisher"]["inner"]["sac"]["alpha"],
-        "batch_size": config["fisher"]["inner"]["sac"]["batch_size"],
+        "reward_hidden": config["reward"]["hidden_dim"],
+        "policy_hidden": config["policy"]["hidden_dim"],
+        "alpha": fisher_cfg["alpha"],
+        "batch_size": sac_cfg["batch_size"],
     })
 
     if inner_cfg["type"] != "sac":
@@ -456,25 +528,23 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
     n_inner_steps = int(fisher_cfg["n_inner_steps"])
     n_agent_traj = int(fisher_cfg["n_agent_traj"])
 
-    state_dim, action_dim = get_env_dims(env)
-
-    hidden = int(policy_cfg["hidden"])
+    hidden_dim = int(policy_cfg["hidden_dim"])
     n_layers = int(policy_cfg["n_hidden_layers"])
 
     reward = Reward(
-        state_dim=state_dim,
-        action_dim=action_dim,
+        state_dim=env.state_dim,
+        action_dim=env.action_dim,
         n_hidden_layers=int(reward_cfg["n_hidden_layers"]),
-        hidden=int(reward_cfg["hidden"]),
+        hidden_dim=int(reward_cfg["hidden_dim"]),
         clamp_magnitude=float(reward_cfg["clamp_magnitude"]),
     ).to(device)
 
     policy = Policy(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        action_low=env.action_space.low,
-        action_high=env.action_space.high,
-        hidden=hidden,
+        state_dim=env.state_dim,
+        action_dim=env.action_dim,
+        action_low=env.action_low,
+        action_high=env.action_high,
+        hidden_dim=hidden_dim,
         n_hidden_layers=n_layers,
         log_std_min=float(policy_cfg["log_std_min"]),
         log_std_max=float(policy_cfg["log_std_max"]),
@@ -510,17 +580,17 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
     best_env_reward = float("-inf")
 
     arch = {
-        "state_dim": state_dim,
-        "action_dim": action_dim,
-        "policy_hidden": hidden,
+        "state_dim": env.state_dim,
+        "action_dim": env.action_dim,
+        "policy_hidden": hidden_dim,
         "policy_n_hidden_layers": n_layers,
         "reward_n_hidden_layers": int(reward_cfg["n_hidden_layers"]),
-        "reward_hidden": int(reward_cfg["hidden"]),
+        "reward_hidden": int(reward_cfg["hidden_dim"]),
         "reward_clamp_magnitude": float(reward_cfg["clamp_magnitude"]),
         "log_std_min": float(policy_cfg["log_std_min"]),
         "log_std_max": float(policy_cfg["log_std_max"]),
-        "action_low": env.action_space.low.tolist(),
-        "action_high": env.action_space.high.tolist(),
+        "action_low": env.action_low.tolist(),
+        "action_high": env.action_high.tolist(),
         "method": "fisher",
         "agent": "sac",
         "env_name": config["env"]["name"],
@@ -625,8 +695,39 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
 
     eval_reward_stats()
 
-    with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
-        inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 50, n_eval_traj=10)
+    def inner_optimize():
+        sac = SAC(
+            policy=policy,
+            state_dim=env.state_dim,
+            action_dim=env.action_dim,
+            hidden_dim=sac_cfg["q_hidden_dim"],
+            n_hidden_layers=sac_cfg["q_n_hidden_layers"],
+            gamma=fisher_cfg["discount"],
+            alpha=fisher_cfg["alpha"],
+            tau=sac_cfg["tau"],
+            replay_buffer_capacity=sac_cfg["replay_buffer_capacity"],
+        )
+
+        sac_train_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["eval_env_seed"]), custom_reward=reward)
+        sac_eval_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["train_env_seed"]), custom_reward=reward)
+
+        sac.optimize(
+            train_env=sac_train_env,
+            eval_env=sac_eval_env,
+            total_steps=n_inner_steps,
+            learning_starts=int(sac_cfg["learning_starts"]),
+            batch_size=int(sac_cfg["batch_size"]),
+            max_grad_norm=float(sac_cfg["max_grad_norm"]),
+            critic_update_steps=int(sac_cfg["critic_update_steps"]),
+            actor_update_steps=int(sac_cfg["actor_update_steps"]),
+            critic_lr=float(sac_cfg["critic_lr"]),
+            actor_lr=float(sac_cfg["actor_lr"]),
+        )
+
+        sac_train_env.close()
+        sac_eval_env.close()
+
+    inner_optimize()
 
     agent_trajs = collect_trajectories(
         env=env,
@@ -639,12 +740,10 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
     log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
     for outer_step in range(1, n_outer_steps + 1):
-        outer_optimizer.step(expert_train_trajs, agent_trajs)
+        outer_optimizer.step(expert_train_trajs, agent_trajs, )
         eval_reward_stats()
 
-        policy.reset()
-        with make_sac_inner_optimizer(reward, policy, state_dim, action_dim, config, device) as inner_optimizer:
-            inner_optimizer.optimize(n_inner_steps, eval_every=n_inner_steps // 50, n_eval_traj=10)
+        inner_optimize()
 
         agent_trajs = collect_trajectories(
             env=env,
@@ -656,6 +755,7 @@ def train_bilevel(env: Env, config: dict, logger) -> dict:
 
         log_and_checkpoint(outer_step=outer_step, agent_trajs=agent_trajs)
 
+    env.close()
     return history
 
 
@@ -671,28 +771,20 @@ def main() -> None:
     config_path = resolve_config_path("hopper", args.config)
     config = load_config(config_path)
 
-    fisher_cfg = config["fisher"]
     log_cfg = config["logging"]
 
     log_dir = log_cfg["log_dir"]
     logger = get_logger("fisher_hopper", log_dir=log_dir)
 
-    set_random_seed(int(fisher_cfg["random_seed"]))
-    env = gym.make(config["env"]["id"])
-    set_env_seed(env, int(fisher_cfg["env_seed"]))
+    logger.info("=== Fisher-NHD Hopper SAC ===")
 
-    try:
-        logger.info("=== Fisher-NHD Hopper SAC ===")
+    mlflow.set_experiment("fisher")
+    with mlflow.start_run(run_name="hopper"):
+        history = train_bilevel(config, logger)
 
-        with mlflow.start_run(run_name="fisher_sac"):
-            history = train_bilevel(env, config, logger)
-
-        report_path = Path(log_cfg["report_dir"]) / "fisher_sac_hopper_history.json"
-        save_history(history, str(report_path))
-        logger.info(f"History saved to {report_path}")
-
-    finally:
-        env.close()
+    report_path = Path(log_cfg["report_dir"]) / "fisher_sac_hopper_history.json"
+    save_history(history, str(report_path))
+    logger.info(f"History saved to {report_path}")
 
 
 if __name__ == "__main__":
