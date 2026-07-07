@@ -60,7 +60,7 @@ fisher:
   alpha: 1.0
   fisher_reg: 1.0
 
-  lr_reward: 1e-5
+  lr_reward: 1e-4
   scheduler_gamma: 1.0
   max_grad_norm: 1.0
 
@@ -70,15 +70,15 @@ fisher:
     eval_env_seed: 101
 
     sac:
-      max_grad_norm: 1.0
-      critic_update_steps: 5
-      actor_update_steps: 1
-      q_hidden_dim: 64
+      max_grad_norm: null
+      gradient_update_steps: 1
+      target_update_interval: 1
+      q_hidden_dim: 256
       q_n_hidden_layers: 2
       critic_lr: 3e-4
       actor_lr: 3e-4
       batch_size: 256
-      learning_starts: 10000
+      learning_starts: 100
       tau: 0.005
       replay_buffer_capacity: 1000000
 
