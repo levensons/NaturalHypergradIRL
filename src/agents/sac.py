@@ -1,5 +1,4 @@
 from tqdm import tqdm
-import mlflow
 
 import torch
 import torch.nn as nn
@@ -7,8 +6,6 @@ import torch.nn.functional as F
 
 from src.utils.env import Environment
 from src.utils.policies import Policy
-from src.utils.trajectories import collect_trajectories
-from src.evaluation.metrics import inner_loss
 
 
 class ReplayBuffer:
@@ -47,6 +44,19 @@ class ReplayBuffer:
         dones = self.done_buf[idxs].reshape(-1)
 
         return states, actions, rewards, next_states, dones
+    
+    def recalc_rewards(self, reward_fn, batch_size: int = 4096):
+        if self.size == 0:
+            return
+        
+        for start in range(0, self.size, batch_size):
+            end = min(start + batch_size, self.size)
+
+            states = self.state_buf[start:end]
+            actions = self.action_buf[start:end]
+
+            rewards = reward_fn(states, actions)
+            self.reward_buf[start:end, :] = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1, 1)
 
 
 class QFunction(nn.Module):
@@ -122,22 +132,24 @@ class SAC:
         total_steps: int = 1_000_000,
         learning_starts: int = 10_000,
         batch_size: int = 256,
-        eval_env: Environment = None,
         max_grad_norm: float = 1.0,
         gradient_update_steps: int = 1,
         target_update_interval: int = 1,
         critic_lr: float = 1e-3,
         actor_lr: float = 1e-3,
+        validate_fn = None,
+        validate_every: int = 1000,
     ):
         state = train_env.reset()
 
         policy_params = list(self.policy.parameters())
-        q1_params = list(self.q1.parameters())
-        q2_params = list(self.q2.parameters())
+        critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
 
         policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
-        q1_optimizer = torch.optim.Adam(q1_params, lr=critic_lr)
-        q2_optimizer = torch.optim.Adam(q2_params, lr=critic_lr)
+        critic_optimizer = torch.optim.Adam(critic_params, lr=critic_lr)
+
+        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(policy_optimizer, gamma=1.0)
+        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(critic_optimizer, gamma=1.0)
 
         global_gradient_update_step = 0
 
@@ -147,7 +159,7 @@ class SAC:
                 action = train_env.get_random_action()
             else:
                 with torch.no_grad():
-                    action = self.policy.sample(state).detach()
+                    action = self.policy.sample(state)
 
             next_state, reward, done = train_env.step(action)
             self.replay_buffer.push(state, action, reward, next_state, done)
@@ -179,17 +191,14 @@ class SAC:
                 q1_loss = F.mse_loss(current_q1, target_q)
                 q2_loss = F.mse_loss(current_q2, target_q)
 
-                q1_optimizer.zero_grad()
-                torch.autograd.backward(q1_loss, inputs=q1_params)
-                if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(q1_params, max_grad_norm)
-                q1_optimizer.step()
+                critic_loss = 0.5 * (q1_loss + q2_loss)
 
-                q2_optimizer.zero_grad()
-                torch.autograd.backward(q2_loss, inputs=q2_params)
+                critic_optimizer.zero_grad()
+                torch.autograd.backward(critic_loss, inputs=critic_params)
                 if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(q2_params, max_grad_norm)
-                q2_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(critic_params, max_grad_norm)
+                critic_optimizer.step()
+                critic_scheduler.step()
 
                 # ACTOR
                 new_actions, log_probs = self.policy.sample(states, return_log_probs=True)
@@ -205,65 +214,13 @@ class SAC:
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
                 policy_optimizer.step()
+                policy_scheduler.step()
 
                 # CRITIC-TARGET SOFT-UPDATE
+                global_gradient_update_step += 1
                 if global_gradient_update_step % target_update_interval == 0:
                     self.soft_update()
 
-                # MLFLOW LOGGING
-                mlflow.log_metrics(
-                    {
-                        "sac/reward_mean": float(rewards.mean().item()),
-                        "sac/reward_std": float(rewards.std().item()),
-                        "sac/log_prob_mean": float(next_log_probs.mean().item()),
-                        "sac/entropy_bonus_mean": float((-self.alpha * next_log_probs).mean().item()),
-                        "sac/target_q_mean": float(target_q.mean().item()),
-                        "sac/target_q_std": float(target_q.std().item()),
-                        "sac/current_q1_mean": float(current_q1.mean().item()),
-                        "sac/current_q1_std": float(current_q1.std().item()),
-                        "sac/current_q2_mean": float(current_q2.mean().item()),
-                        "sac/current_q2_std": float(current_q2.std().item()),
-                        "sac/q1_loss": float(q1_loss.item()),
-                        "sac/q2_loss": float(q2_loss.item()),
-                        "sac/policy_loss": float(policy_loss.item()),
-                    },
-                    step=ts,
-                )
-
-                global_gradient_update_step += 1
-
             # VALIDATION
-            if eval_env is not None and ts % 1000 == 0:
-                self._validate_inner_loss(eval_env, n_eval_traj=100, max_steps=1000, step=ts)
-
-    @torch.no_grad()
-    def _validate_inner_loss(
-        self,
-        eval_env: Environment,
-        n_eval_traj: int = 10,
-        max_steps: int = 1000,
-        step: int = 0,
-    ):
-        self.policy.eval()
-
-        eval_trajs = collect_trajectories(
-            env=eval_env,
-            policy=self.policy,
-            n=n_eval_traj,
-            max_steps=max_steps,
-            verbose=False,
-        )
-
-        l_inner = inner_loss(
-            policy=self.policy,
-            reward=eval_env.custom_reward,
-            trajs=eval_trajs,
-            discount=self.gamma,
-            alpha=self.alpha,
-        )
-
-        mlflow.log_metric("sac/l_inner", float(l_inner), step=step)
-
-        self.policy.train()
-
-        return float(l_inner)
+            if validate_fn is not None and ts % validate_every == 0:
+                validate_fn(ts=ts)

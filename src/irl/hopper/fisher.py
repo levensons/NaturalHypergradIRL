@@ -18,14 +18,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.evaluation.metrics import outer_loss, policy_nll, rank_corr, learned_reward_stats
+from src.evaluation.metrics import outer_loss, policy_nll, rank_corr, learned_reward_stats, inner_loss
 from src.agents.sac import SAC
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
 from src.utils.env import Environment
 from src.utils.logging import get_logger, save_history
-from src.utils.seeding import set_random_seed, set_env_seed
+from src.utils.seeding import set_random_seed
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import (
     collect_trajectories,
@@ -61,14 +61,30 @@ class Reward(nn.Module):
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         out = self.net(torch.cat([states, actions], dim=-1))
         out = out.squeeze(-1)
-        # out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
-        return out
+        out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
+        return out # (B,)
 
     def rewards(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.forward(states, actions)
+        return self.forward(states, actions) # (B,)
 
     def trajectory_return(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         return self.forward(states, actions).sum()
+    
+    def as_fn(self):
+        def reward_fn(states: torch.Tensor, actions: torch.Tensor):
+            was_training = self.training
+            if was_training:
+                self.eval()
+
+            with torch.no_grad():
+                out = self.rewards(states, actions)
+
+            if was_training:
+                self.train()
+
+            return out # (B,)
+        
+        return reward_fn
 
 
 class Policy(nn.Module):
@@ -127,13 +143,10 @@ class Policy(nn.Module):
         # actions: (B, action_dim)
         dist = self.action_distribution(states)
 
-        squashed_actions = (actions - self.action_bias) / self.action_scale
-        squashed_actions = torch.clamp(
-            squashed_actions, min=self.action_low, max=self.action_high
-        )
-        raw_actions = 0.5 * (
-            torch.log1p(squashed_actions) - torch.log1p(-squashed_actions)
-        )
+        squashed_actions = (actions - self.action_bias) / self.action_scale # (-1, 1)
+        squashed_actions = torch.clamp(squashed_actions, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+
+        raw_actions = 0.5 * (torch.log1p(squashed_actions) - torch.log1p(-squashed_actions))
 
         log_probs = dist.log_prob(raw_actions)
         correction = torch.log(self.action_scale * (1.0 - torch.pow(squashed_actions, 2)))
@@ -149,9 +162,9 @@ class Policy(nn.Module):
         # states: (B, state_dim)
         dist = self.action_distribution(states)
 
-        raw_actions = dist.mean if deterministic else dist.rsample()
+        raw_actions = dist.mean if deterministic else dist.rsample() # (-inf, +inf)
         squashed_actions = torch.tanh(raw_actions)  # (-1; 1)
-        actions = self.action_bias + self.action_scale * squashed_actions
+        actions = self.action_bias + self.action_scale * squashed_actions # (low, high)
         actions = torch.clamp(actions, min=self.action_low, max=self.action_high)
 
         if not return_log_probs:
@@ -173,6 +186,7 @@ class OuterOptimizer:
         lr: float,
         fisher_reg: float,
         discount: float,
+        alpha: float,
         max_grad_norm=None,
         scheduler_gamma: float = 1.0,
     ):
@@ -180,6 +194,7 @@ class OuterOptimizer:
         self.policy = policy
         self.fisher_reg = fisher_reg
         self.discount = discount
+        self.alpha = alpha
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
 
@@ -233,117 +248,6 @@ class OuterOptimizer:
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, policy_dim)
         return grads
     
-    def _compute_agent_score_cache(self, trajs):
-        device = next(self.policy.parameters()).device
-
-        cache = []
-
-        for traj in tqdm(trajs, desc="Cache agent scores", leave=False):
-            states = to_device(traj["states"], device)
-            actions = to_device(traj["actions"], device)
-            T = states.size(0)
-
-            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
-
-            cache.append(
-                {
-                    "states": states,
-                    "actions": actions,
-                    "T": T,
-                    "grad_log_pi_a_s": grad_log_pi_a_s.detach(),
-                }
-            )
-
-        return cache
-    
-    def fisher_from_cache(self, score_cache) -> torch.Tensor:
-        policy_dim = num_params(self.policy)
-        device = next(self.policy.parameters()).device
-
-        F = torch.zeros(policy_dim, policy_dim, dtype=torch.float64, device=device)
-
-        for item in tqdm(score_cache, desc="Fisher cached", leave=False):
-            T = item["T"]
-            grad_log_pi_a_s = item["grad_log_pi_a_s"].to(dtype=torch.float64)
-            weights = discount_weights(T, self.discount, device, dtype=torch.float64)
-            F += torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s)
-
-        F /= len(score_cache)
-        F = 0.5 * (F + F.T)
-        F += self.fisher_reg * torch.eye(policy_dim, dtype=torch.float64, device=device)
-        F = 0.5 * (F + F.T)
-        return F
-    
-    def d_cross_vec_product_from_cache(self, score_cache, v: torch.Tensor) -> torch.Tensor:
-        reward_dim = num_params(self.reward)
-        policy_dim = num_params(self.policy)
-        device = next(self.policy.parameters()).device
-
-        v = v.to(dtype=torch.float32, device=device)
-
-        if v.numel() != policy_dim:
-            raise ValueError(f"`v` must have shape ({policy_dim},), got {tuple(v.shape)}.")
-
-        out = torch.zeros(reward_dim, dtype=torch.float32, device=device)
-
-        for item in tqdm(score_cache, desc="Cross vec product cached", leave=False):
-            states = item["states"]
-            actions = item["actions"]
-
-            grad_R_tail_with_discount = self._grad_R_tail_with_discount(states, actions)  # (T, reward_dim)
-            grad_log_pi_a_s = item["grad_log_pi_a_s"].to(dtype=torch.float32)
-
-            out += torch.einsum("tr,tp,p->r", grad_R_tail_with_discount, grad_log_pi_a_s, v)
-
-        return -(out / len(score_cache))
-    
-    def hypergradient_with_cache(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        score_cache = self._compute_agent_score_cache(agent_trajs)
-
-        fisher = self.fisher_from_cache(score_cache)  # (policy_dim, policy_dim)
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs).to(dtype=torch.float64)
-
-        fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (policy_dim,)
-        fisher_inv_d_outer_d_policy = fisher_inv_d_outer_d_policy.to(dtype=torch.float32)
-
-        hypergrad = -self.d_cross_vec_product_from_cache(score_cache, fisher_inv_d_outer_d_policy)  # (reward_dim,)
-
-        # with torch.no_grad():
-        #     eigvals = torch.linalg.eigvalsh(fisher)
-        #     min_eig = eigvals.min()
-        #     max_eig = eigvals.max()
-        #     cond_number = max_eig / min_eig
-
-        #     outer_grad_norm = d_outer_d_policy.norm().item()
-        #     solve_norm = fisher_inv_d_outer_d_policy.norm().item()
-        #     hypergrad_norm = hypergrad.norm().item()
-        #     cross_amp = hypergrad_norm / (solve_norm + 1e-8)
-
-        #     tqdm.write(
-        #         f"Fisher stats | "
-        #         f"min_eig={min_eig.item():.3e} | "
-        #         f"max_eig={max_eig.item():.3e} | "
-        #         f"cond={cond_number.item():.3e} | "
-        #         f"outer_grad_norm={outer_grad_norm:.3e} | "
-        #         f"solve_norm={solve_norm:.3e} | "
-        #         f"cross_amp={cross_amp:.3e} | "
-        #         f"hypergrad_norm={hypergrad_norm:.3e}"
-        #     )
-
-        #     mlflow.log_metrics(
-        #         {
-        #             "fisher_min_eig": min_eig.item(),
-        #             "fisher_max_eig": max_eig.item(),
-        #             "fisher_cond": cond_number.item(),
-        #             "outer_grad_norm": outer_grad_norm,
-        #             "fisher_solve_norm": solve_norm,
-        #             "cross_amplification": cross_amp,
-        #             "hypergrad_norm_before_clip": hypergrad_norm,
-        #         }
-        #     )
-
-        return hypergrad
-
     def fisher(self, trajs) -> torch.Tensor:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
@@ -361,6 +265,7 @@ class OuterOptimizer:
 
         F /= len(trajs)
         F = 0.5 * (F + F.T)
+        F = self.alpha * F
         F += self.fisher_reg * torch.eye(policy_dim, dtype=torch.float64, device=device)
         F = 0.5 * (F + F.T)
         return F
@@ -440,22 +345,22 @@ class OuterOptimizer:
                 f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
             )
 
-            mlflow.log_metrics(
-                {
-                    "fisher_min_eig": min_eig.item(),
-                    "fisher_max_eig": max_eig.item(),
-                    "fisher_cond": cond_number.item(),
-                    "outer_grad_norm": d_outer_d_policy.norm().item(),
+            # mlflow.log_metrics(
+            #     {
+            #         "fisher_min_eig": min_eig.item(),
+            #         "fisher_max_eig": max_eig.item(),
+            #         "fisher_cond": cond_number.item(),
+            #         "outer_grad_norm": d_outer_d_policy.norm().item(),
 
-                    "fisher_inv_d_outer_d_policy_norm": fisher_inv_d_outer_d_policy.norm().item(),
-                    "fisher_inv_d_outer_d_policy_abs_max": fisher_inv_d_outer_d_policy.abs().max().item(),
-                    "fisher_inv_d_outer_d_policy_mean": fisher_inv_d_outer_d_policy.mean().item(),
-                    "fisher_inv_d_outer_d_policy_std": fisher_inv_d_outer_d_policy.std().item(),
+            #         "fisher_inv_d_outer_d_policy_norm": fisher_inv_d_outer_d_policy.norm().item(),
+            #         "fisher_inv_d_outer_d_policy_abs_max": fisher_inv_d_outer_d_policy.abs().max().item(),
+            #         "fisher_inv_d_outer_d_policy_mean": fisher_inv_d_outer_d_policy.mean().item(),
+            #         "fisher_inv_d_outer_d_policy_std": fisher_inv_d_outer_d_policy.std().item(),
 
-                    "hypergrad_norm_before_clip": hypergrad.norm().item(),
-                },
-                step=self.outer_step
-            )
+            #         "hypergrad_norm_before_clip": hypergrad.norm().item(),
+            #     },
+            #     step=self.outer_step
+            # )
 
         return hypergrad
 
@@ -556,6 +461,7 @@ def train_bilevel(config: dict, logger) -> dict:
         lr=float(fisher_cfg["lr_reward"]),
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         discount=float(fisher_cfg["discount"]),
+        alpha=float(fisher_cfg["alpha"]),
         max_grad_norm=float(fisher_cfg["max_grad_norm"]),
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
     )
@@ -598,25 +504,25 @@ def train_bilevel(config: dict, logger) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
-    def eval_reward_stats():
-        expert_reward_stats = learned_reward_stats(reward, expert_valid_trajs, outer_optimizer.discount)
-        random_reward_stats = learned_reward_stats(reward, random_valid_trajs, outer_optimizer.discount)
+    # def eval_reward_stats():
+    #     expert_reward_stats = learned_reward_stats(reward, expert_valid_trajs, outer_optimizer.discount)
+    #     random_reward_stats = learned_reward_stats(reward, random_valid_trajs, outer_optimizer.discount)
 
-        expert_learned_return = expert_reward_stats["return_mean"]
-        random_learned_return = random_reward_stats["return_mean"]
-        expert_random_learned_diff = expert_learned_return - random_learned_return
+    #     expert_learned_return = expert_reward_stats["return_mean"]
+    #     random_learned_return = random_reward_stats["return_mean"]
+    #     expert_random_learned_diff = expert_learned_return - random_learned_return
 
-        expert_learned_step_mean = expert_reward_stats["step_mean"]
-        random_learned_step_mean = random_reward_stats["step_mean"]
+    #     expert_learned_step_mean = expert_reward_stats["step_mean"]
+    #     random_learned_step_mean = random_reward_stats["step_mean"]
 
-        logger.info(
-            f"   [outer] "
-            f"expert_ret={expert_learned_return:.3f} "
-            f"random_ret={random_learned_return:.3f} "
-            f"diff={expert_random_learned_diff:.3f} "
-            f"expert_step={expert_learned_step_mean:.4f} "
-            f"random_step={random_learned_step_mean:.4f}"
-        )
+    #     logger.info(
+    #         f"   [outer] "
+    #         f"expert_ret={expert_learned_return:.3f} "
+    #         f"random_ret={random_learned_return:.3f} "
+    #         f"diff={expert_random_learned_diff:.3f} "
+    #         f"expert_step={expert_learned_step_mean:.4f} "
+    #         f"random_step={random_learned_step_mean:.4f}"
+    #     )
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
         nonlocal best_env_reward
@@ -693,9 +599,9 @@ def train_bilevel(config: dict, logger) -> dict:
 
     logger.info(header)
 
-    eval_reward_stats()
+    # eval_reward_stats()
 
-    def inner_optimize():
+    def inner_optimize(outer_step: int):
         sac = SAC(
             policy=policy,
             state_dim=env.state_dim,
@@ -708,26 +614,63 @@ def train_bilevel(config: dict, logger) -> dict:
             replay_buffer_capacity=sac_cfg["replay_buffer_capacity"],
         )
 
-        sac_train_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["eval_env_seed"]), custom_reward=reward)
-        sac_eval_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["train_env_seed"]), custom_reward=reward)
+        sac_train_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["eval_env_seed"]), custom_reward_fn=reward.as_fn())
+        sac_eval_env = Environment(id=config["env"]["id"], seed=int(inner_cfg["train_env_seed"]), custom_reward_fn=None)
+
+        @torch.no_grad()
+        def validate(ts: int, n_eval_traj: int = 10):
+            sac.policy.eval()
+
+            agent_valid_trajs = collect_trajectories(
+                env=sac_eval_env,
+                policy=sac.policy,
+                n=n_eval_traj,
+                max_steps=config["env"]["max_steps"],
+                verbose=False,
+            )
+
+            l_inner = inner_loss(
+                policy=sac.policy,
+                reward=reward,
+                trajs=agent_valid_trajs,
+                discount=sac.gamma,
+                alpha=sac.alpha,
+            )
+
+            l_outer = outer_loss(
+                policy=sac.policy,
+                expert_trajs=expert_valid_trajs,
+                discount=sac.gamma,
+            )
+
+            mlflow.log_metrics(
+                {
+                    f"sac_{outer_step}/l_inner": float(l_inner),
+                    f"sac_{outer_step}/l_outer": float(l_outer),
+                },
+                step=ts,
+            )
+
+            sac.policy.train()
 
         sac.optimize(
             train_env=sac_train_env,
-            eval_env=sac_eval_env,
             total_steps=n_inner_steps,
             learning_starts=int(sac_cfg["learning_starts"]),
             batch_size=int(sac_cfg["batch_size"]),
-            max_grad_norm=float(sac_cfg["max_grad_norm"]),
-            critic_update_steps=int(sac_cfg["critic_update_steps"]),
-            actor_update_steps=int(sac_cfg["actor_update_steps"]),
+            max_grad_norm=sac_cfg["max_grad_norm"],
+            gradient_update_steps=int(sac_cfg["gradient_update_steps"]),
+            target_update_interval=int(sac_cfg["target_update_interval"]),
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
+            validate_fn=validate,
+            validate_every=1000
         )
 
         sac_train_env.close()
         sac_eval_env.close()
 
-    inner_optimize()
+    inner_optimize(outer_step=0)
 
     agent_trajs = collect_trajectories(
         env=env,
@@ -740,10 +683,10 @@ def train_bilevel(config: dict, logger) -> dict:
     log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
     for outer_step in range(1, n_outer_steps + 1):
-        outer_optimizer.step(expert_train_trajs, agent_trajs, )
-        eval_reward_stats()
+        outer_optimizer.step(expert_train_trajs, agent_trajs)
+        # eval_reward_stats()
 
-        inner_optimize()
+        inner_optimize(outer_step=outer_step)
 
         agent_trajs = collect_trajectories(
             env=env,
@@ -756,6 +699,7 @@ def train_bilevel(config: dict, logger) -> dict:
         log_and_checkpoint(outer_step=outer_step, agent_trajs=agent_trajs)
 
     env.close()
+    
     return history
 
 

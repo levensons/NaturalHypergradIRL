@@ -5,7 +5,7 @@ import numpy as np
 
 
 class Environment:
-    def __init__(self, id: str, seed: int, custom_reward = None):
+    def __init__(self, id: str, seed: int, custom_reward_fn = None):
         self.env = gym.make(id)
         self.env.reset(seed=seed)
         self.env.action_space.seed(seed)
@@ -38,7 +38,7 @@ class Environment:
                 "Only Discrete and Box action spaces are supported."
             )
         
-        self.custom_reward = custom_reward
+        self.custom_reward_fn = custom_reward_fn
 
         self.reset()
 
@@ -65,9 +65,8 @@ class Environment:
 
         next_state, reward, done, _, _ = self.env.step(action_for_env)
 
-        if self.custom_reward is not None:
-            with torch.no_grad():
-                reward = self.custom_reward(self.state, action).detach()
+        if self.custom_reward_fn is not None:
+            reward = self.custom_reward_fn(self.state, action)
         
         next_state = torch.as_tensor(next_state, dtype=torch.float32).flatten()
         reward = torch.as_tensor(reward, dtype=torch.float32).reshape(1)
