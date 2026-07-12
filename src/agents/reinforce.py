@@ -31,7 +31,7 @@ class REINFORCE:
         for traj in trajs:
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
-            rewards = to_device(traj["env_rewards"], device)
+            rewards = to_device(traj["rewards"], device)
             T = states.size(0)
 
             weights = discount_weights(T, self.gamma, device, torch.float32)

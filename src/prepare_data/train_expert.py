@@ -14,11 +14,10 @@ The trained expert is saved to config["expert"]["save_path"].
 import argparse
 from pathlib import Path
 
-import gymnasium as gym
-
 from src.utils.config import load_config, resolve_config_path
-from src.utils.seeding import set_random_seed, set_env_seed
+from src.utils.seeding import set_random_seed
 from src.utils.sb3 import init_sb3_model, normalize_sb3_load_path, normalize_sb3_save_path
+from src.utils.env import Environment
 
 
 def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
@@ -47,8 +46,7 @@ def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     set_random_seed(random_seed)
-    env = gym.make(env_id)
-    set_env_seed(env, env_seed)
+    env = Environment(env_id, env_seed)
 
     save_path = normalize_sb3_save_path(expert_cfg["save_path"])
     zip_path = normalize_sb3_load_path(save_path)

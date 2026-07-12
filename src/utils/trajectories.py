@@ -1,16 +1,9 @@
-from typing import Any
 import numpy as np
 import torch
-from gymnasium import spaces
 from tqdm import tqdm
 
 from src.utils.policies import Policy
 from src.utils.env import Environment
-
-
-def _check_policy(policy: Policy) -> None:
-    if not hasattr(policy, "sample") or not callable(policy.sample):
-        raise TypeError("policy must have a callable method `sample(state)`")
 
 
 def collect_trajectories(
@@ -18,29 +11,31 @@ def collect_trajectories(
     policy: Policy,
     n: int,
     max_steps: int = 1000,
+    deterministic: bool = False,
     desc: str = "collect trajs",
     verbose: bool = True,
 ):
-    _check_policy(policy)
+    if not hasattr(policy, "sample") or not callable(policy.sample):
+        raise TypeError("policy must have a callable method `sample(state)`")
 
     trajs = []
 
     for _ in tqdm(range(n), desc=desc, leave=False, disable=not verbose):
         states = []
         actions = []
-        env_rewards = []
+        rewards = []
 
         state = env.reset()
 
         for _ in range(max_steps):
             with torch.no_grad():
-                action = policy.sample(state).detach()
+                action = policy.sample(states=state, deterministic=deterministic)
 
             next_state, reward, done = env.step(action)
 
             states.append(state.detach())
             actions.append(action.detach())
-            env_rewards.append(float(reward.item()))
+            rewards.append(reward.detach())
 
             state = next_state
 
@@ -51,7 +46,7 @@ def collect_trajectories(
             {
                 "states": torch.stack(states),
                 "actions": torch.stack(actions),
-                "env_rewards": env_rewards,
+                "rewards": torch.stack(rewards),
             }
         )
 
@@ -59,7 +54,7 @@ def collect_trajectories(
 
 
 def trajectory_return(traj: dict) -> float:
-    rewards = traj["env_rewards"]
+    rewards = traj["rewards"]
 
     if isinstance(rewards, torch.Tensor):
         return float(rewards.sum().item())

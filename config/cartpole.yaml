@@ -35,13 +35,13 @@ trajectory_collection:
     n: 100
 
 policy:
-  hidden: 16
+  hidden_dim: 16
   n_hidden_layers: 1
   log_std_min: -5
   log_std_max: 2
 
 reward:
-  hidden: 64
+  hidden_dim: 64
   n_hidden_layers: 1
   clamp_magnitude: 10
   scale: 1.0
@@ -52,19 +52,35 @@ fisher:
   env_seed: 42
 
   n_outer_steps: 50
-  n_inner_steps: 60
-  n_agent_traj: 100
+  n_inner_steps: 100
+  n_agent_traj: 1000
 
-  lr_reward: 2e-3
-  fisher_reg: 5e-2
+  discount: 0.99
+  alpha: 1.0
+
+  lr_reward: 1e-3
+  fisher_reg: 1e-2
   max_grad_norm: 1.0
   scheduler_gamma: 1.0
 
+  use_sketch: true
+  sketch_size: 64
+
   inner:
     type: reinforce
+
+    train_env_seed: 100
+    eval_env_seed: 101
+
     lr_policy: 3e-3
+    scheduler_gamma: 1.0
     max_grad_norm: 1.0
-    use_baseline: false
+
+    n_traj_per_update: 20
+    n_eval_traj: 20
+    validate_every: 10
+
+    use_baseline: true
     normalize_coef: false
 
 ttsa:

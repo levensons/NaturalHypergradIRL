@@ -12,6 +12,9 @@ class Policy(Protocol):
     ) -> torch.Tensor:
         ...
 
+    def log_prob(self, states: Any, actions: Any) -> torch.Tensor:
+        ...
+
     def eval(self) -> None:
         ...
 
