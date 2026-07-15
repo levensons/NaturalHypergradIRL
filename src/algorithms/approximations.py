@@ -3,8 +3,6 @@ import torch
 
 class SCFD:
     def __init__(self, dim: int, m: int, alpha_0: float, eps: float = 1e-12):
-        super().__init__()
-
         if m <= 0:
             raise ValueError(f"`m` must be positive, got m={m}.")
         if m > dim:
