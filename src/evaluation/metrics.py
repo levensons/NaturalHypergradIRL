@@ -5,6 +5,11 @@ from src.utils.torch import to_device
 from src.utils.trajectories import discount_weights
 
 
+@torch.no_grad()
+def relative_error(x: torch.Tensor, reference: torch.Tensor, eps: float = 1e-12) -> float:
+    return float((x - reference).norm() / (reference.norm() + eps))
+
+
 def _rankdata(x: torch.Tensor) -> torch.Tensor:
     x = x.detach().float()
     sorted_x, order = torch.sort(x)
@@ -47,9 +52,9 @@ def rank_corr(reward, trajs) -> float:
     for traj in trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
-        env_rewards = to_device(traj["env_rewards"], device)
+        rewards = to_device(traj["rewards"], device)
 
-        env_return = env_rewards.sum()
+        env_return = rewards.sum()
         learned_return = reward.trajectory_return(states, actions)
 
         env_returns.append(env_return)
@@ -126,7 +131,7 @@ def inner_loss(policy, reward, trajs, discount: float, alpha: float = 1.0) -> fl
 def env_reward(trajs) -> float:
     total = 0.0
     for traj in trajs:
-        total += torch.as_tensor(traj["env_rewards"]).sum().item()
+        total += torch.as_tensor(traj["rewards"]).sum().item()
     return total / len(trajs)
 
 

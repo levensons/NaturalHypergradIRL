@@ -2,7 +2,9 @@ import torch
 
 
 class SCFD:
-    def __init__(self, dim: int, m: int, alpha_0: float, eps: float = 1e-12):
+    def __init__(self, dim: int, m: int, alpha_0: float, eps: float = 1e-6):
+        if dim <= 0:
+            raise ValueError(f"`dim` must be positive, got dim={dim}.")
         if m <= 0:
             raise ValueError(f"`m` must be positive, got m={m}.")
         if m > dim:
@@ -15,69 +17,63 @@ class SCFD:
         self.eps = eps
 
         self.alpha = torch.tensor(alpha_0, dtype=torch.float32)
-        self.Z = torch.empty((0, self.dim), dtype=torch.float32)  # (r, d)
-        self.H = torch.empty((0, 0), dtype=torch.float32)  # (r, r) = (Z Z^T + alpha I)^{-1}
+        self.Z = torch.zeros(2 * m, dim, dtype=torch.float32)
+        self.rank = 0
+
+    @property
+    def active_Z(self) -> torch.Tensor:
+        return self.Z[: self.rank]
 
     @torch.no_grad()
-    def extend(self, x: torch.Tensor):
-        x = x.detach().to(device=self.Z.device, dtype=self.Z.dtype)
+    def extend(self, rows: torch.Tensor) -> None:
+        rows = rows.detach().to(device=self.Z.device, dtype=self.Z.dtype)
 
-        if x.ndim != 1:
-            raise ValueError(f"`x` must be a vector, got shape {tuple(x.shape)}.")
-        if x.shape[0] != self.dim:
-            raise ValueError(f"`x` must have shape ({self.dim},), got {tuple(x.shape)}.")
+        if rows.ndim == 1:
+            rows = rows.unsqueeze(0)
+        if rows.ndim != 2:
+            raise ValueError(f"`rows` must have shape ({self.dim},) " f"or (n, {self.dim}), got {tuple(rows.shape)}.")
+        if rows.shape[1] != self.dim:
+            raise ValueError(f"`rows` must have last dimension {self.dim}, " f"got {tuple(rows.shape)}.")
 
-        will_shrink = (self.Z.shape[0] + 1) >= 2 * self.m
+        start = 0
 
-        if not will_shrink:
-            self.border_update_H(x)
+        while start < rows.shape[0]:
+            free = 2 * self.m - self.rank
+            take = min(free, rows.shape[0] - start)
 
-        self.Z = torch.cat([self.Z, x.reshape(1, -1)], dim=0)  # (r + 1, dim)
+            self.Z[self.rank : self.rank + take].copy_(rows[start : start + take])
 
-        if will_shrink:
-            self.update()
+            self.rank += take
+            start += take
+
+            if self.rank == 2 * self.m:
+                self.update()
 
     @torch.no_grad()
-    def border_update_H(self, z: torch.Tensor):
-        r = self.Z.shape[0]
-
-        if r == 0:
-            c = self.alpha + z @ z
-            self.H = (1.0 / c).reshape(1, 1)
+    def update(self) -> None:
+        if self.rank < 2 * self.m:
             return
 
-        b = torch.matmul(self.Z, z)
-        u = torch.matmul(self.H, b)
-        c = self.alpha + torch.dot(z, z)
-        s = c - torch.dot(b, u)
+        Z = self.active_Z
 
-        r = self.H.shape[0]
-        H_new = torch.empty(r + 1, r + 1, dtype=self.H.dtype, device=self.H.device)
+        _, S, Vh = torch.linalg.svd(Z, full_matrices=False)
+        delta = S[self.m - 1].square()
+        self.alpha.add_(delta)
 
-        H_new[:r, :r] = self.H + torch.outer(u, u) / s
-        H_new[:r, r] = -u / s
-        H_new[r, :r] = -u / s
-        H_new[r, r] = 1.0 / s
-
-        self.H = H_new
-
-    @torch.no_grad()
-    def update(self):
-        if self.Z.shape[0] < 2 * self.m:
-            return
-
-        _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
-        delta = S[self.m - 1].pow(2)
-        self.alpha = self.alpha + delta
-
-        S_new = torch.sqrt(torch.clamp(S.pow(2) - delta, min=0.0))
-        self.Z = S_new.reshape(-1, 1) * Vh
+        S_new = torch.sqrt(torch.clamp(S.square() - delta, min=0.0))
 
         mask = S_new > self.eps
-        self.Z = self.Z[mask]
         S_new = S_new[mask]
+        Vh = Vh[mask]
 
-        self.H = torch.diag(1.0 / (S_new.pow(2) + self.alpha))
+        new_rank = S_new.numel()
+
+        self.Z.zero_()
+
+        if new_rank > 0:
+            self.Z[:new_rank].copy_(S_new.unsqueeze(1) * Vh)
+
+        self.rank = new_rank
 
     @torch.no_grad()
     def solve(self, g: torch.Tensor) -> torch.Tensor:
@@ -86,22 +82,191 @@ class SCFD:
         if g.ndim != 1:
             raise ValueError(f"`g` must be a vector, got shape {tuple(g.shape)}.")
         if g.shape[0] != self.dim:
-            raise ValueError(f"`g` must have shape ({self.dim},), got {tuple(g.shape)}.")
-
-        if self.Z.shape[0] == 0:
+            raise ValueError(f"`g` must have shape ({self.dim},), " f"got {tuple(g.shape)}.")
+        if self.rank == 0:
             return g / self.alpha
 
-        Zg = torch.matmul(self.Z, g)  # (r,)
-        HZg = torch.matmul(self.H, Zg)  # (r,)
-        return (g - torch.matmul(self.Z.T, HZg)) / self.alpha
+        Z = self.active_Z
+        small = torch.matmul(Z, Z.T)
+        small.diagonal().add_(self.alpha)
+        q = torch.matmul(Z, g)
+        u = torch.linalg.solve(small, q)
+        return (g - torch.matmul(Z.T, u)) / self.alpha
 
     @torch.no_grad()
     def inv(self) -> torch.Tensor:
-        """DEBUG ONLY"""
-        d = self.dim
-        I_d = torch.eye(d, device=self.Z.device, dtype=self.Z.dtype)
+        "DEBUG ONLY"
+        I = torch.eye(self.dim, device=self.Z.device, dtype=self.Z.dtype)
 
-        if self.Z.shape[0] == 0:
-            return I_d / self.alpha
+        if self.rank == 0:
+            return I / self.alpha
 
-        return (I_d - torch.einsum("rd,rs,se->de", self.Z, self.H, self.Z)) / self.alpha
+        Z = self.active_Z
+        small = torch.matmul(Z, Z.T)
+        small.diagonal().add_(self.alpha)
+        solved = torch.linalg.solve(small, Z)
+        return (I - torch.matmul(Z.T, solved)) / self.alpha
+
+
+class CBSCFD:
+    def __init__(self, dim: int, m: int, alpha_0: float, eps: float = 1e-6):
+        if m <= 0:
+            raise ValueError(f"`m` must be positive, got m={m}.")
+        if m > dim:
+            raise ValueError(f"`m` must be <= dim, got m={m}, dim={dim}.")
+        if alpha_0 <= 0:
+            raise ValueError(f"`alpha_0` must be positive, got alpha_0={alpha_0}.")
+
+        self.dim = dim
+        self.m = m
+        self.eps = eps
+
+        self.alpha = torch.tensor(alpha_0, dtype=torch.float32)
+        self.Z = torch.zeros(2 * m, dim, dtype=torch.float32)
+        self.H = torch.empty(0, 0, dtype=torch.float32)
+        self.rank = 0
+
+    @property
+    def active_Z(self) -> torch.Tensor:
+        return self.Z[: self.rank]
+
+    @torch.no_grad()
+    def extend(self, rows: torch.Tensor) -> None:
+        rows = rows.detach().to(device=self.Z.device, dtype=self.Z.dtype)
+
+        if rows.ndim == 1:
+            rows = rows.unsqueeze(0)
+        if rows.ndim != 2:
+            raise ValueError(f"`rows` must have shape ({self.dim},) or (n, {self.dim}), " f"got {tuple(rows.shape)}.")
+        if rows.shape[1] != self.dim:
+            raise ValueError(f"`rows` must have last dimension {self.dim}, " f"got {tuple(rows.shape)}.")
+
+        start = 0
+
+        while start < rows.shape[0]:
+            free = 2 * self.m - self.rank
+            take = min(free, rows.shape[0] - start)
+
+            block = rows[start : start + take]
+
+            will_shrink = self.rank + take == 2 * self.m
+
+            if not will_shrink:
+                self.append_block(block)
+            else:
+                self.Z[self.rank : self.rank + take].copy_(block)
+                self.rank += take
+
+            start += take
+
+            if self.rank == 2 * self.m:
+                self.update()
+
+    @torch.no_grad()
+    def append_block(self, rows: torch.Tensor) -> None:
+        k = self.rank
+        r = rows.shape[0]
+
+        if r == 0:
+            return
+
+        if k + r > 2 * self.m:
+            raise ValueError(f"Not enough space in sketch: rank={k}, " f"new_rows={r}, capacity={2 * self.m}.")
+
+        if k == 0:
+            D = torch.matmul(rows, rows.T)
+            D.diagonal().add_(self.alpha)
+            H_new = self.safe_inverse(D)
+
+        else:
+            Z = self.active_Z
+            B = torch.matmul(Z, rows.T)  # (k, r)
+            D = torch.matmul(rows, rows.T)  # (r, r)
+            D.diagonal().add_(self.alpha)
+            P = torch.matmul(self.H, B)  # (k, r)
+            S = D - torch.matmul(B.T, P)
+            S = 0.5 * (S + S.T)
+            S_inv = self.safe_inverse(S)
+
+            H_new = torch.empty(k + r, k + r, dtype=self.Z.dtype, device=self.Z.device)
+
+            H_new[:k, :k] = self.H + torch.matmul(P, torch.matmul(S_inv, P.T))
+            H_new[:k, k:] = -torch.matmul(P, S_inv)
+            H_new[k:, :k] = H_new[:k, k:].T
+            H_new[k:, k:] = S_inv
+
+        self.Z[k : k + r].copy_(rows)
+        self.rank = k + r
+        self.H = H_new
+
+    @torch.no_grad()
+    def update(self) -> None:
+        if self.rank < 2 * self.m:
+            return
+
+        Z = self.active_Z
+
+        _, singular_values, Vh = torch.linalg.svd(Z, full_matrices=False)
+        delta = singular_values[self.m - 1].square()
+        self.alpha.add_(delta)
+
+        shrunk_squared = torch.clamp(singular_values.square() - delta, min=0.0)
+
+        singular_values_new = torch.sqrt(shrunk_squared)
+
+        mask = singular_values_new > self.eps
+        singular_values_new = singular_values_new[mask]
+        Vh = Vh[mask]
+
+        new_rank = singular_values_new.numel()
+
+        self.Z.zero_()
+
+        if new_rank > 0:
+            self.Z[:new_rank].copy_(singular_values_new.unsqueeze(1) * Vh)
+            Z_new = self.Z[:new_rank]
+            G = torch.matmul(Z_new, Z_new.T)
+            G.diagonal().add_(self.alpha)
+            self.H = self.safe_inverse(G)
+
+        else:
+            self.H = torch.empty(0, 0, dtype=self.Z.dtype, device=self.Z.device)
+
+        self.rank = new_rank
+
+    @torch.no_grad()
+    def solve(self, g: torch.Tensor) -> torch.Tensor:
+        g = g.detach().to(device=self.Z.device, dtype=self.Z.dtype)
+
+        if g.ndim != 1:
+            raise ValueError(f"`g` must be a vector, got shape {tuple(g.shape)}.")
+        if g.shape[0] != self.dim:
+            raise ValueError(f"`g` must have shape ({self.dim},), " f"got {tuple(g.shape)}.")
+        if self.rank == 0:
+            return g / self.alpha
+
+        Z = self.active_Z
+        Zg = torch.matmul(Z, g)
+        HZg = torch.matmul(self.H, Zg)
+        return (g - torch.matmul(Z.T, HZg)) / self.alpha
+
+    @torch.no_grad()
+    def inv(self) -> torch.Tensor:
+        "DEBUG ONLY"
+        identity = torch.eye(self.dim, device=self.Z.device, dtype=self.Z.dtype)
+
+        if self.rank == 0:
+            return identity / self.alpha
+
+        Z = self.active_Z
+        return (identity - torch.matmul(Z.T, torch.matmul(self.H, Z))) / self.alpha
+
+    @torch.no_grad()
+    def safe_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        x = 0.5 * (x + x.T)
+        try:
+            return torch.linalg.inv(x)
+        except RuntimeError:
+            x = x.clone()
+            x.diagonal().add_(self.eps)
+            return torch.linalg.inv(x)
