@@ -5,8 +5,8 @@ import numpy as np
 
 
 class Environment:
-    def __init__(self, id: str, seed: int, custom_reward_fn = None):
-        self.env = gym.make(id)
+    def __init__(self, id: str, seed: int, custom_reward_fn=None, render_mode: str = None):
+        self.env = gym.make(id, render_mode=render_mode)
         self.env.reset(seed=seed)
         self.env.action_space.seed(seed)
         self.env.observation_space.seed(seed)
@@ -37,25 +37,29 @@ class Environment:
                 f"Unsupported action space: {type(self.env.action_space)}. "
                 "Only Discrete and Box action spaces are supported."
             )
-        
+
         self.custom_reward_fn = custom_reward_fn
+        self.render_mode = render_mode
 
         self.reset()
 
     @property
     def action_space(self):
         return self.env.action_space
-    
+
     @property
     def observation_space(self):
         return self.env.observation_space
+
+    def render(self):
+        return self.env.render()
 
     def reset(self):
         state, _ = self.env.reset()
         state = torch.as_tensor(state, dtype=torch.float32).flatten()
         self.state = state
         return state
-    
+
     def step(self, action: torch.Tensor):
         if self.is_discrete:
             action_for_env = int(action.item())
@@ -67,7 +71,7 @@ class Environment:
 
         if self.custom_reward_fn is not None:
             reward = self.custom_reward_fn(self.state, action)
-        
+
         next_state = torch.as_tensor(next_state, dtype=torch.float32).flatten()
         reward = torch.as_tensor(reward, dtype=torch.float32).reshape(1)
         done = torch.as_tensor(done, dtype=torch.float32).reshape(1)
@@ -75,11 +79,11 @@ class Environment:
         self.state = next_state
 
         return next_state, reward, done
-    
+
     def get_random_action(self):
         action = self.env.action_space.sample()
         action = torch.as_tensor(action, dtype=torch.float32)
         return action
-    
+
     def close(self):
         self.env.close()
