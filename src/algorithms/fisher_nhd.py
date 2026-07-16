@@ -6,7 +6,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from src.utils.policies import Policy
-from src.algorithms.approximations import SCFD
+from src.algorithms.approximations import SCFD, CBSCFD
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
 from src.evaluation.metrics import relative_error
@@ -143,12 +143,51 @@ class FisherNHD:
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, policy_dim)
         return grads
 
+    def fisher_solve_sketch_profile(self, trajs, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
+        policy_dim = num_params(self.policy)
+        device = next(self.policy.parameters()).device
+
+        g = g.to(device=device, dtype=torch.float32)
+        sketch = CBSCFD(dim=policy_dim, m=sketch_size, alpha_0=self.fisher_reg)
+
+        score_time = 0.0
+        extend_time = 0.0
+
+        n_trajs = len(trajs)
+        for traj in tqdm(trajs, desc="Fisher sketch", leave=False):
+            states = to_device(traj["states"], device)
+            actions = to_device(traj["actions"], device)
+            T = states.size(0)
+
+            start = time.perf_counter()
+            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions).to(torch.float32)  # (T, policy_dim)
+            score_time += time.perf_counter() - start
+
+            weights = discount_weights(T, self.discount, device, dtype=torch.float32)  # (T,)
+
+            row_scale = torch.sqrt((self.alpha / n_trajs) * weights)  # (T,)
+            X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (T, policy_dim)
+
+            start = time.perf_counter()
+            sketch.extend(X_rows)
+            extend_time += time.perf_counter() - start
+
+        solution = sketch.solve(g)
+
+        stats = sketch.profiling_stats()
+
+        stats["score_time"] = score_time
+        stats["extend_time"] = extend_time
+        stats["total_time"] = score_time + extend_time + stats["solve_time"]
+
+        return solution, stats
+
     def fisher_solve_sketch(self, trajs, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
         g = g.to(device=device, dtype=torch.float32)
-        sketch = SCFD(dim=policy_dim, m=sketch_size, alpha_0=self.fisher_reg)
+        sketch = CBSCFD(dim=policy_dim, m=sketch_size, alpha_0=self.fisher_reg)
 
         n_trajs = len(trajs)
         for traj in tqdm(trajs, desc="Fisher sketch", leave=False):
@@ -246,6 +285,7 @@ class FisherNHD:
         return -(out / len(trajs))
 
     def hypergradient_with_explicit_hessian(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        "DEPRECATED"
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         hessian = self.explicit_hessian(agent_trajs)
         fisher_inv_d_outer_d_policy = torch.linalg.solve(hessian, d_outer_d_policy)
@@ -297,48 +337,85 @@ class FisherNHD:
 
         return hypergradient
 
-    def sweep_sketch_sizes(self, expert_trajs, agent_trajs, sketch_sizes, compare_hypergradients: bool = False):
+    def sweep_sketch_sizes(
+        self,
+        expert_trajs,
+        agent_trajs,
+        sketch_sizes,
+        compare_hypergradients: bool = False,
+    ):
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
 
-        start = time.perf_counter()
+        exact_start = time.perf_counter()
+
         fisher_exact = self.fisher(agent_trajs)
         fisher_end = time.perf_counter()
 
-        v_exact = torch.linalg.solve(fisher_exact, d_outer_d_policy.to(dtype=fisher_exact.dtype)).to(
-            dtype=torch.float32
-        )
+        v_exact = torch.linalg.solve(
+            fisher_exact,
+            d_outer_d_policy.to(dtype=fisher_exact.dtype),
+        ).to(dtype=torch.float32)
+
         solve_end = time.perf_counter()
 
-        print(f"\nExact Fisher construction time: {fisher_end - start:>8.2f}s")
-        print(f"Exact Fisher solve time:        {solve_end - fisher_end:>8.2f}s")
-        print(f"Exact Fisher total time:        {solve_end - start:>8.2f}s")
+        print(f"\nExact Fisher construction time: " f"{fisher_end - exact_start:>8.2f}s")
+        print(f"Exact Fisher solve time:        " f"{solve_end - fisher_end:>8.2f}s")
+        print(f"Exact Fisher total time:        " f"{solve_end - exact_start:>8.2f}s")
 
         hypergrad_exact = None
 
         if compare_hypergradients:
-            hypergrad_exact = -self.d_cross_vec_product(agent_trajs, v_exact)
+            hypergrad_exact = -self.d_cross_vec_product(
+                agent_trajs,
+                v_exact,
+            )
 
         results = []
 
-        print(
-            "\n" f"{'m':>6} | " f"{'solve rel':>10} | " f"{'solve cos':>10} | " f"{'norm ratio':>10} | " f"{'time':>9}",
-            end="",
+        header = (
+            f"{'m':>5} | "
+            f"{'solve rel':>9} | "
+            f"{'solve cos':>9} | "
+            f"{'norm ratio':>10} | "
+            f"{'total':>9} | "
+            f"{'score':>9} | "
+            f"{'extend':>9} | "
+            f"{'append':>9} | "
+            f"{'update':>9} | "
+            f"{'solve':>9} | "
+            f"{'app n':>7} | "
+            f"{'upd n':>7} | "
+            f"{'input blk':>9} | "
+            f"{'append blk':>10} | "
+            f"{'max app':>7} | "
+            f"{'rank':>6} | "
+            f"{'alpha':>10}"
         )
 
         if compare_hypergradients:
-            print(f" | {'hyper rel':>10} | " f"{'hyper cos':>10}")
-        else:
-            print()
+            header += f" | {'hyper rel':>9}" f" | {'unit h rel':>10}" f" | {'hyper cos':>9}"
 
-        print("-" * (85 if compare_hypergradients else 61))
+        print("\n" + header)
+        print("-" * len(header))
 
         for sketch_size in sketch_sizes:
-            start = time.perf_counter()
-            v_sketch = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, sketch_size)
-            end = time.perf_counter()
+            v_sketch, profiling = self.fisher_solve_sketch_profile(
+                agent_trajs,
+                d_outer_d_policy,
+                sketch_size,
+            )
 
-            solve_rel_error = relative_error(v_sketch, v_exact)
-            solve_cosine = F.cosine_similarity(v_sketch.unsqueeze(0), v_exact.unsqueeze(0), dim=1).item()
+            solve_rel_error = relative_error(
+                v_sketch,
+                v_exact,
+            )
+
+            solve_cosine = F.cosine_similarity(
+                v_sketch.unsqueeze(0),
+                v_exact.unsqueeze(0),
+                dim=1,
+            ).item()
+
             norm_ratio = (v_sketch.norm() / (v_exact.norm() + 1e-12)).item()
 
             result = {
@@ -346,32 +423,83 @@ class FisherNHD:
                 "solve_relative_error": solve_rel_error,
                 "solve_cosine": solve_cosine,
                 "solve_norm_ratio": norm_ratio,
-                "runtime_sec": end - start,
+                "total_time": profiling["total_time"],
+                "score_time": profiling["score_time"],
+                "extend_time": profiling["extend_time"],
+                "append_time": profiling["append_time"],
+                "update_time": profiling["update_time"],
+                "solve_time": profiling["solve_time"],
+                "append_calls": profiling["append_calls"],
+                "update_calls": profiling["update_calls"],
+                "solve_calls": profiling["solve_calls"],
+                "blocks_seen": profiling["blocks_seen"],
+                "rows_seen": profiling["rows_seen"],
+                "mean_input_block_size": profiling["mean_input_block_size"],
+                "mean_append_block_size": profiling["mean_append_block_size"],
+                "max_append_block_size": profiling["max_append_block_size"],
+                "final_rank": profiling["final_rank"],
+                "final_alpha": profiling["final_alpha"],
             }
 
             row = (
-                f"{sketch_size:>6} | "
-                f"{solve_rel_error:>10.4f} | "
-                f"{solve_cosine:>10.4f} | "
+                f"{sketch_size:>5} | "
+                f"{solve_rel_error:>9.4f} | "
+                f"{solve_cosine:>9.4f} | "
                 f"{norm_ratio:>10.4f} | "
-                f"{end - start:>8.2f}s"
+                f"{profiling['total_time']:>8.2f}s | "
+                f"{profiling['score_time']:>8.2f}s | "
+                f"{profiling['extend_time']:>8.2f}s | "
+                f"{profiling['append_time']:>8.2f}s | "
+                f"{profiling['update_time']:>8.2f}s | "
+                f"{profiling['solve_time']:>8.4f}s | "
+                f"{profiling['append_calls']:>7} | "
+                f"{profiling['update_calls']:>7} | "
+                f"{profiling['mean_input_block_size']:>9.1f} | "
+                f"{profiling['mean_append_block_size']:>10.1f} | "
+                f"{profiling['max_append_block_size']:>7} | "
+                f"{profiling['final_rank']:>6} | "
+                f"{profiling['final_alpha']:>10.3e}"
             )
 
             if compare_hypergradients:
-                hypergrad_sketch = -self.d_cross_vec_product(agent_trajs, v_sketch)
-                hypergrad_rel_error = relative_error(hypergrad_sketch, hypergrad_exact)
+                hypergrad_sketch = -self.d_cross_vec_product(
+                    agent_trajs,
+                    v_sketch,
+                )
+
+                hypergrad_rel_error = relative_error(
+                    hypergrad_sketch,
+                    hypergrad_exact,
+                )
+
                 hypergrad_cosine = F.cosine_similarity(
-                    hypergrad_sketch.unsqueeze(0), hypergrad_exact.unsqueeze(0), dim=1
+                    hypergrad_sketch.unsqueeze(0),
+                    hypergrad_exact.unsqueeze(0),
+                    dim=1,
                 ).item()
+
+                hypergrad_sketch_unit = hypergrad_sketch / (hypergrad_sketch.norm() + 1e-12)
+
+                hypergrad_exact_unit = hypergrad_exact / (hypergrad_exact.norm() + 1e-12)
+
+                hypergrad_unit_rel_error = relative_error(
+                    hypergrad_sketch_unit,
+                    hypergrad_exact_unit,
+                )
 
                 result.update(
                     {
                         "hypergrad_relative_error": hypergrad_rel_error,
+                        "hypergrad_unit_relative_error": hypergrad_unit_rel_error,
                         "hypergrad_cosine": hypergrad_cosine,
                     }
                 )
 
-                row += f" | {hypergrad_rel_error:>10.4f} | " f"{hypergrad_cosine:>10.4f}"
+                row += (
+                    f" | {hypergrad_rel_error:>9.4f}"
+                    f" | {hypergrad_unit_rel_error:>10.4f}"
+                    f" | {hypergrad_cosine:>9.4f}"
+                )
 
             print(row)
             results.append(result)

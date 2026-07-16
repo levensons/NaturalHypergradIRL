@@ -1,4 +1,5 @@
 import torch
+import time
 
 
 class SCFD:
@@ -126,6 +127,20 @@ class CBSCFD:
         self.H = torch.empty(0, 0, dtype=torch.float32)
         self.rank = 0
 
+        self.append_time = 0.0
+        self.update_time = 0.0
+        self.solve_time = 0.0
+
+        self.append_calls = 0
+        self.update_calls = 0
+        self.solve_calls = 0
+
+        self.blocks_seen = 0
+        self.rows_seen = 0
+
+        self.appended_rows = 0
+        self.max_append_block_size = 0
+
     @property
     def active_Z(self) -> torch.Tensor:
         return self.Z[: self.rank]
@@ -137,9 +152,12 @@ class CBSCFD:
         if rows.ndim == 1:
             rows = rows.unsqueeze(0)
         if rows.ndim != 2:
-            raise ValueError(f"`rows` must have shape ({self.dim},) or (n, {self.dim}), " f"got {tuple(rows.shape)}.")
+            raise ValueError(f"`rows` must have shape ({self.dim},) or " f"(n, {self.dim}), got {tuple(rows.shape)}.")
         if rows.shape[1] != self.dim:
             raise ValueError(f"`rows` must have last dimension {self.dim}, " f"got {tuple(rows.shape)}.")
+
+        self.blocks_seen += 1
+        self.rows_seen += rows.shape[0]
 
         start = 0
 
@@ -152,7 +170,15 @@ class CBSCFD:
             will_shrink = self.rank + take == 2 * self.m
 
             if not will_shrink:
+                append_start = time.perf_counter()
+
                 self.append_block(block)
+
+                self.append_time += time.perf_counter() - append_start
+                self.append_calls += 1
+                self.appended_rows += take
+                self.max_append_block_size = max(self.max_append_block_size, take)
+
             else:
                 self.Z[self.rank : self.rank + take].copy_(block)
                 self.rank += take
@@ -160,7 +186,10 @@ class CBSCFD:
             start += take
 
             if self.rank == 2 * self.m:
+                update_start = time.perf_counter()
                 self.update()
+                self.update_time += time.perf_counter() - update_start
+                self.update_calls += 1
 
     @torch.no_grad()
     def append_block(self, rows: torch.Tensor) -> None:
@@ -236,6 +265,8 @@ class CBSCFD:
 
     @torch.no_grad()
     def solve(self, g: torch.Tensor) -> torch.Tensor:
+        solve_start = time.perf_counter()
+
         g = g.detach().to(device=self.Z.device, dtype=self.Z.dtype)
 
         if g.ndim != 1:
@@ -243,12 +274,17 @@ class CBSCFD:
         if g.shape[0] != self.dim:
             raise ValueError(f"`g` must have shape ({self.dim},), " f"got {tuple(g.shape)}.")
         if self.rank == 0:
-            return g / self.alpha
+            result = g / self.alpha
 
-        Z = self.active_Z
-        Zg = torch.matmul(Z, g)
-        HZg = torch.matmul(self.H, Zg)
-        return (g - torch.matmul(Z.T, HZg)) / self.alpha
+        else:
+            Z = self.active_Z
+            Zg = torch.matmul(Z, g)
+            HZg = torch.matmul(self.H, Zg)
+            result = (g - torch.matmul(Z.T, HZg)) / self.alpha
+
+        self.solve_time += time.perf_counter() - solve_start
+        self.solve_calls += 1
+        return result
 
     @torch.no_grad()
     def inv(self) -> torch.Tensor:
@@ -270,3 +306,20 @@ class CBSCFD:
             x = x.clone()
             x.diagonal().add_(self.eps)
             return torch.linalg.inv(x)
+
+    def profiling_stats(self) -> dict:
+        return {
+            "append_time": self.append_time,
+            "update_time": self.update_time,
+            "solve_time": self.solve_time,
+            "append_calls": self.append_calls,
+            "update_calls": self.update_calls,
+            "solve_calls": self.solve_calls,
+            "blocks_seen": self.blocks_seen,
+            "rows_seen": self.rows_seen,
+            "mean_input_block_size": (self.rows_seen / max(self.blocks_seen, 1)),
+            "mean_append_block_size": (self.appended_rows / max(self.append_calls, 1)),
+            "max_append_block_size": self.max_append_block_size,
+            "final_rank": self.rank,
+            "final_alpha": float(self.alpha.item()),
+        }
