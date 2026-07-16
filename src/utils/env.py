@@ -6,6 +6,9 @@ import numpy as np
 
 class Environment:
     def __init__(self, id: str, seed: int, custom_reward_fn=None, render_mode: str = None):
+        self.id = id
+        self.seed = seed
+
         self.env = gym.make(id, render_mode=render_mode)
         self.env.reset(seed=seed)
         self.env.action_space.seed(seed)
@@ -42,6 +45,9 @@ class Environment:
         self.render_mode = render_mode
 
         self.reset()
+
+    def clone(self):
+        return Environment(self.id, self.seed, self.custom_reward_fn, self.render_mode)
 
     @property
     def action_space(self):
