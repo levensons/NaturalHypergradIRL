@@ -27,7 +27,7 @@ def record_policy_video(
     policy.eval()
 
     video_env = RecordVideo(
-        env=env.env,
+        env=env.clone().env,
         video_folder=str(video_dir),
         episode_trigger=lambda episode_id: episode_id == 0,
         name_prefix=name_prefix,
@@ -61,8 +61,19 @@ def record_policy_video(
     if was_training:
         policy.train()
 
-    video_files = sorted(video_dir.glob(f"{name_prefix}*.mp4"), key=lambda path: path.stat().st_mtime)
-    video_path = str(video_files[-1]) if video_files else None
+    generated_files = sorted(video_dir.glob(f"{name_prefix}-episode-*.mp4"), key=lambda path: path.stat().st_mtime)
+
+    if not generated_files:
+        raise RuntimeError("RecordVideo did not create a video file.")
+
+    generated_path = generated_files[-1]
+
+    video_path = video_dir / f"{name_prefix}.mp4"
+
+    if video_path.exists():
+        video_path.unlink()
+
+    generated_path.rename(video_path)
 
     stats = {
         "return": total_reward,
