@@ -10,7 +10,6 @@ def collect_trajectories(
     env: Environment,
     policy: Policy,
     n: int,
-    max_steps: int = 1000,
     deterministic: bool = False,
     desc: str = "collect trajs",
     verbose: bool = True,
@@ -24,22 +23,26 @@ def collect_trajectories(
         states = []
         actions = []
         rewards = []
+        next_states = []
+        terminateds = []
 
         state = env.reset()
 
-        for _ in range(max_steps):
+        while True:
             with torch.no_grad():
                 action = policy.sample(states=state, deterministic=deterministic)
 
-            next_state, reward, done = env.step(action)
+            next_state, reward, terminated, truncated = env.step(action)
 
             states.append(state.detach())
             actions.append(action.detach())
             rewards.append(reward.detach())
+            next_states.append(next_state.detach())
+            terminateds.append(terminated.detach())
 
             state = next_state
 
-            if done.item():
+            if terminated.item() or truncated.item():
                 break
 
         trajs.append(
@@ -47,6 +50,8 @@ def collect_trajectories(
                 "states": torch.stack(states),
                 "actions": torch.stack(actions),
                 "rewards": torch.stack(rewards),
+                "next_states": torch.stack(next_states),
+                "terminateds": torch.stack(terminateds),
             }
         )
 

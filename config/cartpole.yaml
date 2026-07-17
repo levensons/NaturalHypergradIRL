@@ -107,6 +107,7 @@ data:
   expert_train_trajs: data/cartpole/expert_train_trajs.pt
   expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
   expert_test_trajs: data/cartpole/expert_test_trajs.pt
+  random_train_trajs: data/hopper/random_train_trajs.pt
   random_valid_trajs: data/cartpole/random_valid_trajs.pt
   random_test_trajs: data/cartpole/random_test_trajs.pt
 

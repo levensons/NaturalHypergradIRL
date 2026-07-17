@@ -39,7 +39,7 @@ def collect_and_save(
     policy: Policy,
     output_path: Path,
     n_trajectories: int,
-    max_steps: int,
+    deterministic: bool,
     desc: str,
     overwrite: bool,
 ) -> None:
@@ -51,7 +51,7 @@ def collect_and_save(
         env,
         policy,
         n_trajectories,
-        max_steps=max_steps,
+        deterministic=deterministic,
         desc=desc,
         verbose=True,
     )
@@ -75,7 +75,7 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_random_seed(split_cfg["random_seed"])
-    env = Environment(env_id, split_cfg["env_seed"])
+    env = Environment(env_id, split_cfg["env_seed"], max_steps)
 
     expert_algo = expert_cfg["algo"].lower()
     expert_path = normalize_sb3_load_path(expert_cfg["save_path"])
@@ -93,8 +93,8 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
 
     saved_files = {}
 
+    # EXPERT COLLECTION
     expert_split_names = ["train", "valid", "test"]
-    random_split_names = ["valid", "test"]
 
     for split_name in expert_split_names:
         if split_name not in split_cfg:
@@ -109,16 +109,21 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
             policy=expert_policy,
             output_path=output_path,
             n_trajectories=n_trajectories,
-            max_steps=max_steps,
+            deterministic=False,
             desc=f"expert {split_name}",
             overwrite=overwrite,
         )
 
         saved_files[f"expert_{split_name}"] = str(output_path)
 
+    # RANDOM COLLECTION
+    random_split_names = ["train", "valid", "test"]
+
     for split_name in random_split_names:
         if split_name not in split_cfg:
             continue
+
+        n_trajectories = int(split_cfg[split_name]["n"])
 
         output_path = output_dir / f"random_{split_name}_trajs.pt"
 
@@ -127,7 +132,7 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
             policy=random_policy,
             output_path=output_path,
             n_trajectories=n_trajectories,
-            max_steps=max_steps,
+            deterministic=False,
             desc=f"random {split_name}",
             overwrite=overwrite,
         )
@@ -147,6 +152,8 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
             "states": "[T, state_dim], torch.float32",
             "actions": "[T] for discrete or [T, action_dim] for continuous",
             "rewards": "[T], torch.float32",
+            "next_states": "[T, state_dim], torch.float32",
+            "terminateds": "[T], torch.bool",
         },
     }
 

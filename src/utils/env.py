@@ -1,3 +1,4 @@
+from typing import Callable
 import gymnasium as gym
 from gymnasium import spaces
 import torch
@@ -5,11 +6,23 @@ import numpy as np
 
 
 class Environment:
-    def __init__(self, id: str, seed: int, custom_reward_fn=None, render_mode: str = None):
+    def __init__(
+        self,
+        id: str,
+        seed: int,
+        max_episode_steps: int,
+        custom_reward_fn: Callable = None,
+        render_mode: str = None,
+    ):
         self.id = id
+        self.max_episode_steps = max_episode_steps
         self.seed = seed
+        self.custom_reward_fn = custom_reward_fn
+        self.render_mode = render_mode
 
-        self.env = gym.make(id, render_mode=render_mode)
+        self.env = gym.make(
+            id, max_episode_steps=max_episode_steps, render_mode=render_mode
+        )
         self.env.reset(seed=seed)
         self.env.action_space.seed(seed)
         self.env.observation_space.seed(seed)
@@ -32,8 +45,12 @@ class Environment:
 
         elif self.is_continuous:
             self.action_dim = int(np.prod(self.env.action_space.shape))
-            self.action_low = torch.as_tensor(self.env.action_space.low, dtype=torch.float32)
-            self.action_high = torch.as_tensor(self.env.action_space.high, dtype=torch.float32)
+            self.action_low = torch.as_tensor(
+                self.env.action_space.low, dtype=torch.float32
+            )
+            self.action_high = torch.as_tensor(
+                self.env.action_space.high, dtype=torch.float32
+            )
 
         else:
             raise TypeError(
@@ -41,13 +58,16 @@ class Environment:
                 "Only Discrete and Box action spaces are supported."
             )
 
-        self.custom_reward_fn = custom_reward_fn
-        self.render_mode = render_mode
-
         self.reset()
 
     def clone(self):
-        return Environment(self.id, self.seed, self.custom_reward_fn, self.render_mode)
+        return Environment(
+            self.id,
+            self.seed,
+            self.max_episode_steps,
+            self.custom_reward_fn,
+            self.render_mode,
+        )
 
     @property
     def action_space(self):
@@ -71,20 +91,23 @@ class Environment:
             action_for_env = int(action.item())
         else:
             action_for_env = action.detach().cpu().numpy()
-            action_for_env = np.asarray(action_for_env, dtype=np.float32).reshape(self.env.action_space.shape)
+            action_for_env = np.asarray(action_for_env, dtype=np.float32).reshape(
+                self.env.action_space.shape
+            )
 
-        next_state, reward, done, _, _ = self.env.step(action_for_env)
+        next_state, reward, terminated, truncated, _ = self.env.step(action_for_env)
 
         if self.custom_reward_fn is not None:
             reward = self.custom_reward_fn(self.state, action)
 
         next_state = torch.as_tensor(next_state, dtype=torch.float32).flatten()
         reward = torch.as_tensor(reward, dtype=torch.float32).reshape(1)
-        done = torch.as_tensor(done, dtype=torch.float32).reshape(1)
+        terminated = torch.tensor(terminated, dtype=torch.bool).reshape(1)
+        truncated = torch.tensor(truncated, dtype=torch.bool).reshape(1)
 
         self.state = next_state
 
-        return next_state, reward, done
+        return next_state, reward, terminated, truncated
 
     def get_random_action(self):
         action = self.env.action_space.sample()

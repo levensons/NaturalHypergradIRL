@@ -20,12 +20,15 @@
     "expert_train": "data/cartpole/expert_train_trajs.pt",
     "expert_valid": "data/cartpole/expert_valid_trajs.pt",
     "expert_test": "data/cartpole/expert_test_trajs.pt",
+    "random_train": "data/cartpole/random_train_trajs.pt",
     "random_valid": "data/cartpole/random_valid_trajs.pt",
     "random_test": "data/cartpole/random_test_trajs.pt"
   },
   "trajectory_format": {
     "states": "[T, state_dim], torch.float32",
     "actions": "[T] for discrete or [T, action_dim] for continuous",
-    "rewards": "[T], torch.float32"
+    "rewards": "[T], torch.float32",
+    "next_states": "[T, state_dim], torch.float32",
+    "terminateds": "[T], torch.bool"
   }
 }
