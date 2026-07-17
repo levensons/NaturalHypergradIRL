@@ -16,7 +16,7 @@ class ReplayBuffer:
         self.action_buf = torch.empty(capacity, action_dim, dtype=torch.float32)
         self.reward_buf = torch.empty(capacity, 1, dtype=torch.float32)
         self.next_state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
-        self.done_buf = torch.empty(capacity, 1, dtype=torch.float32)
+        self.terminated_buf = torch.empty(capacity, 1, dtype=torch.float32)
 
         self.ptr = 0
         self.size = 0
@@ -24,12 +24,12 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, terminated):
         self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
         self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
         self.reward_buf[self.ptr] = torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1)
         self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
-        self.done_buf[self.ptr] = torch.as_tensor(done, dtype=torch.float32).detach().reshape(1)
+        self.terminated_buf[self.ptr] = torch.as_tensor(terminated, dtype=torch.float32).detach().reshape(1)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -41,9 +41,40 @@ class ReplayBuffer:
         actions = self.action_buf[idxs]
         rewards = self.reward_buf[idxs].reshape(-1)
         next_states = self.next_state_buf[idxs]
-        dones = self.done_buf[idxs].reshape(-1)
+        terminateds = self.terminated_buf[idxs].reshape(-1)
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, terminateds
+    
+    def extend_from_trajectories(self, trajs):
+        for trajectory in tqdm(trajs, desc="Load trajectories into replay buffer", leave=False):
+            states = trajectory["states"]
+            actions = trajectory["actions"]
+
+            if len(states) == 0:
+                continue
+
+            next_states = trajectory["next_states"]
+
+            rewards = trajectory.get("rewards")
+            if rewards is None:
+                rewards = torch.zeros(len(states), dtype=states.dtype, device=states.device)
+
+            terminateds = trajectory.get("terminateds")
+            if terminateds is None:
+                terminateds = torch.zeros(len(states),dtype=torch.bool, device=states.device)
+
+            if not (len(states) == len(actions) == len(rewards) == len(next_states) == len(terminateds)):
+                raise ValueError(
+                    "Trajectory fields must have equal lengths: "
+                    f"states={len(states)}, "
+                    f"actions={len(actions)}, "
+                    f"rewards={len(rewards)}, "
+                    f"next_states={len(next_states)}, "
+                    f"terminateds={len(terminateds)}"
+                )
+
+            for state, action, reward, next_state, terminated in zip(states, actions, rewards, next_states, terminateds):
+                self.push(state, action, reward, next_state, terminated)
 
     def recalc_rewards(self, reward_fn, batch_size: int = 4096):
         if self.size == 0:
@@ -57,19 +88,6 @@ class ReplayBuffer:
 
             rewards = reward_fn(states, actions)
             self.reward_buf[start:end, :] = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1, 1)
-
-    def collect_random_transitions(self, env: Environment, n: int):
-        state = env.reset()
-        for _ in tqdm(range(n), desc="Collect random transitions", leave=False):
-            action = env.get_random_action()
-
-            next_state, reward, done = env.step(action)
-            self.push(state, action, reward, next_state, done)
-
-            if done:
-                state = env.reset()
-            else:
-                state = next_state
 
 
 class QFunction(nn.Module):
@@ -132,6 +150,20 @@ class SAC:
         self.alpha = alpha
         self.tau = tau
 
+    def collect_random_rollout(self, env: Environment, n_steps: int):
+        state = env.reset()
+
+        for _ in tqdm(range(n_steps), desc="Collect random transitions", leave=False):
+            action = env.get_random_action()
+
+            next_state, reward, terminated, truncated = env.step(action)
+            self.replay_buffer.push(state, action, reward, next_state, terminated)
+
+            if terminated.item() or truncated.item():
+                state = env.reset()
+            else:
+                state = next_state
+
     @torch.no_grad()
     def soft_update(self):
         for tp, p in zip(self.q1_target.parameters(), self.q1.parameters()):
@@ -146,7 +178,6 @@ class SAC:
         self,
         train_env: Environment,
         total_steps: int = 1_000_000,
-        learning_starts: int = 10_000,
         batch_size: int = 256,
         max_grad_norm: float = 1.0,
         gradient_update_steps: int = 1,
@@ -171,27 +202,21 @@ class SAC:
 
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
-            # if ts < learning_starts:
-            #     action = train_env.get_random_action()
-            # else:
             with torch.no_grad():
                 action = self.policy.sample(state)
 
-            next_state, reward, done = train_env.step(action)
-            self.replay_buffer.push(state, action, reward, next_state, done)
+            next_state, reward, terminated, truncated = train_env.step(action)
+            self.replay_buffer.push(state, action, reward, next_state, terminated)
 
-            if done:
+            if terminated.item() or truncated.item():
                 state = train_env.reset()
             else:
                 state = next_state
 
-            if len(self.replay_buffer) < learning_starts:
-                continue
-
             # UPDATE
             for _ in range(gradient_update_steps):
                 # CRITIC
-                states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
+                states, actions, rewards, next_states, terminateds = self.replay_buffer.sample(batch_size)
 
                 with torch.no_grad():
                     next_actions, next_log_probs = self.policy.sample(next_states, return_log_probs=True)
@@ -199,7 +224,7 @@ class SAC:
                     next_q1 = self.q1_target(next_states, next_actions)
                     next_q2 = self.q2_target(next_states, next_actions)
                     next_q = torch.min(next_q1, next_q2)
-                    target_q = rewards + self.gamma * (1.0 - dones) * (next_q - self.alpha * next_log_probs)
+                    target_q = rewards + self.gamma * (1.0 - terminateds) * (next_q - self.alpha * next_log_probs)
 
                 current_q1 = self.q1(states, actions)
                 current_q2 = self.q2(states, actions)
