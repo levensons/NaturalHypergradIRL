@@ -6,7 +6,9 @@ from src.utils.trajectories import discount_weights
 
 
 @torch.no_grad()
-def relative_error(x: torch.Tensor, reference: torch.Tensor, eps: float = 1e-12) -> float:
+def relative_error(
+    x: torch.Tensor, reference: torch.Tensor, eps: float = 1e-12
+) -> float:
     return float((x - reference).norm() / (reference.norm() + eps))
 
 
@@ -70,27 +72,25 @@ def rank_corr(reward, trajs) -> float:
 
 
 @torch.no_grad()
-def policy_nll(policy, expert_trajs) -> float:
+def policy_nll(policy, trajs) -> float:
     device = next(policy.parameters()).device
     policy.eval()
 
     nll = 0.0
-    for traj in expert_trajs:
+    for traj in trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
 
         log_probs = policy.log_prob(states, actions)
         nll += log_probs.sum().item()
 
-    return -nll / len(expert_trajs)
+    return -nll / len(trajs)
 
 
 @torch.no_grad()
-def outer_loss(policy, expert_trajs, discount: float) -> float:
-    if not (0.0 < discount <= 1.0):
-        raise ValueError(f"`discount` must satisfy 0 < discount <= 1, got {discount}.")
-    
+def outer_loss(policy, expert_trajs) -> float:
     device = next(policy.parameters()).device
+    policy.eval()
 
     loss = 0.0
     for traj in expert_trajs:
@@ -98,8 +98,7 @@ def outer_loss(policy, expert_trajs, discount: float) -> float:
         actions = to_device(traj["actions"], device)
 
         log_probs = policy.log_prob(states, actions)
-        weights = discount_weights(log_probs.size(0), discount, device)
-        loss += (weights * log_probs).sum().item()
+        loss += log_probs.sum().item()
 
     return -loss / len(expert_trajs)
 
@@ -108,20 +107,23 @@ def outer_loss(policy, expert_trajs, discount: float) -> float:
 def inner_loss(policy, reward, trajs, discount: float, alpha: float = 1.0) -> float:
     if not (0.0 < discount <= 1.0):
         raise ValueError(f"`discount` must satisfy 0 < discount <= 1, got {discount}.")
-    
+
     if not (0.0 < alpha):
         raise ValueError(f"`alpha` must satisfy alpha > 0, got {alpha}.")
-    
+
     device = next(policy.parameters()).device
+    policy.eval()
+    reward.eval()
 
     loss = 0.0
     for traj in trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
+        T = states.size(0)
 
         log_probs = policy.log_prob(states, actions)
         rewards = reward.rewards(states, actions)
-        weights = discount_weights(log_probs.size(0), discount, device)
+        weights = discount_weights(T, discount, device)
         loss += (weights * (alpha * log_probs - rewards)).sum().item()
 
     return loss / len(trajs)
@@ -132,12 +134,14 @@ def env_reward(trajs) -> float:
     total = 0.0
     for traj in trajs:
         total += torch.as_tensor(traj["rewards"]).sum().item()
+
     return total / len(trajs)
 
 
 @torch.no_grad()
 def learned_reward_stats(reward, trajs, discount: float = 1.0) -> dict[str, float]:
     device = next(reward.parameters()).device
+    reward.eval()
 
     returns = []
     means = []
