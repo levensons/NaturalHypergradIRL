@@ -1,24 +1,34 @@
-from typing import Any, Tuple
+from typing import Any, Tuple, Iterable
 import torch
 from torch import nn
 
 
-def flat_grad(params):
-    return torch.cat([p.flatten() for p in params])
+def flat_grad(grad, flat_dim: int = 0) -> torch.Tensor:
+    grads = [g for g in grad if g is not None]
+
+    if flat_dim == 0:
+        return torch.cat([g.reshape(-1) for g in grads], dim=0)
+
+    if flat_dim == 1:
+        return torch.cat([g.reshape(g.shape[0], -1) for g in grads], dim=1)
+
+    raise ValueError(f"Unsupported flat_dim={flat_dim}. Expected 0 or 1.")
 
 
 def num_params(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
 
 
-def assign_flat_gradients(module, flat_grad: torch.Tensor):
+def assign_flat_gradients(module: nn.Module, flat_grad: torch.Tensor) -> None:
     i = 0
 
     for p in module.parameters():
         n = p.numel()
         grad_chunk = flat_grad[i : i + n]
+        
         if grad_chunk.numel() != n:
             raise ValueError("Flat gradient has incorrect size: not enough elements.")
+        
         p.grad = grad_chunk.reshape(p.shape).clone()
         i += n
 

@@ -37,62 +37,96 @@ trajectory_collection:
   test:
     n: 100
 
-policy:
-  hidden: 64
-  n_hidden_layers: 2
-  log_std_min: -5
-  log_std_max: 2
-
 reward:
-  hidden: 64
-  gamma: 0.99
+  hidden_dim: 64
+  n_hidden_layers: 2
+  clamp_magnitude: 10
+
+policy:
+  hidden_dim: 64
+  n_hidden_layers: 2
+  log_std_min: -20
+  log_std_max: 2
 
 fisher:
   random_seed: 42
   env_seed: 42
   
-  n_outer_steps: 1000
+  n_outer_steps: 100
   n_inner_steps: 100000
-  n_agent_traj: 100
+  n_agent_traj: 500
 
-  lr_reward: 1e-3
+  discount: 0.99
+  alpha: 0.2
   fisher_reg: 1.0
-  gamma: 0.99
+  fisher_sketch_size: 64
+
+  lr_reward: 0.003
+  scheduler_gamma: 1.0
   max_grad_norm: 1.0
 
   inner:
-    sac_env_seed: 67
     type: sac
-    lr_actor: 1e-5
+    train_env_seed: 100
+    eval_env_seed: 101
+
     sac:
-      lr_q: 1e-4
-      buffer_size: 300000
+      max_grad_norm: null
+      gradient_update_steps: 1
+      target_update_interval: 1
+      q_hidden_dim: 256
+      q_n_hidden_layers: 2
+      critic_lr: 0.0003
+      actor_lr: 0.0003
       batch_size: 256
-      learning_starts: 500
+      learning_starts: 10000
       tau: 0.005
-      alpha: 0.2
-      autotune: true
-      policy_frequency: 2
-      target_network_frequency: 1
-      gamma: 0.99
+      replay_buffer_capacity: 1000000
 
 ttsa:
   random_seed: 42
   env_seed: 42
 
-  n_iterations: 2000
-  n_traj_per_step: 20
+  n_outer_steps: 200
+  sac_steps_per_iter: 5000
+
+  agent_train_trajs: 10
+  expert_resample_trajs: 10
+  n_expert_train_trajs: 1000
+
+  eval_trajs: 10
   metrics_every: 1
+  ema_beta: 0.95
 
-  lr_policy: 3e-3
-  lr_reward: 3e-4
+  discount: 0.99
 
-  gamma: 0.99
-  n_cg_steps: 10
-  fisher_reg: 1e-2
+  reward_lr: 3e-4
+  reward_max_grad_norm: 1.0
+  reward_weight_decay: 0.0
+  reward_scheduler_gamma: 1.0
 
-  inner_grad_max_norm: 5.0
-  outer_grad_max_norm: 1.0
+  sac_train_env_seed: 100
+  eval_env_seed: 101
+  reward_agent_env_seed: 102
+
+  critic_refresh_steps: 0
+  critic_refresh_log_every: 500
+  learning_starts_after_first: 0
+
+  sac:
+    q_hidden_dim: 256
+    q_n_hidden_layers: 2
+    gamma: 0.99
+    alpha: 1.0
+    tau: 0.005
+    replay_buffer_capacity: 1000000
+    batch_size: 256
+    learning_starts: 10000
+    gradient_update_steps: 50
+    target_update_interval: 50
+    critic_lr: 3e-4
+    actor_lr: 3e-4
+    max_grad_norm: 1.0
 
 data:
   expert_train_trajs: data/hopper/expert_train_trajs.pt

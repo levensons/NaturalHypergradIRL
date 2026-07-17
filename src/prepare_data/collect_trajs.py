@@ -12,16 +12,15 @@ Before running this script, train the expert first:
 import argparse
 import json
 from pathlib import Path
-import gymnasium as gym
-from gymnasium import Env
 import torch
 
 from src.utils.config import load_config, resolve_config_path
-from src.utils.seeding import set_random_seed, set_env_seed
+from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories
 from src.utils.sb3 import load_sb3_model, normalize_sb3_load_path
 from src.utils.trajectories import mean_trajectory_length, mean_trajectory_return
 from src.utils.policies import Policy, RandomPolicy, SB3PolicyWrapper
+from src.utils.env import Environment
 
 
 def save_trajectories(path: Path, trajectories) -> None:
@@ -36,7 +35,7 @@ def save_trajectories(path: Path, trajectories) -> None:
 
 
 def collect_and_save(
-    env: Env,
+    env: Environment,
     policy: Policy,
     output_path: Path,
     n_trajectories: int,
@@ -49,11 +48,12 @@ def collect_and_save(
         return
 
     trajectories = collect_trajectories(
-        env=env,
-        policy=policy,
-        n=n_trajectories,
+        env,
+        policy,
+        n_trajectories,
         max_steps=max_steps,
         desc=desc,
+        verbose=True,
     )
 
     save_trajectories(output_path, trajectories)
@@ -75,8 +75,7 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_random_seed(split_cfg["random_seed"])
-    env = gym.make(env_id)
-    set_env_seed(env, split_cfg["env_seed"])
+    env = Environment(env_id, split_cfg["env_seed"])
 
     expert_algo = expert_cfg["algo"].lower()
     expert_path = normalize_sb3_load_path(expert_cfg["save_path"])
@@ -147,7 +146,7 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
         "trajectory_format": {
             "states": "[T, state_dim], torch.float32",
             "actions": "[T] for discrete or [T, action_dim] for continuous",
-            "env_rewards": "[T], torch.float32",
+            "rewards": "[T], torch.float32",
         },
     }
 

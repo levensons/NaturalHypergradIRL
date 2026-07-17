@@ -26,11 +26,11 @@ from src.utils.data import load_trajectories
 from src.utils.seeding import set_random_seed, set_env_seed
 from src.utils.trajectories import collect_trajectories
 
-_REGISTRY: dict[tuple[str, str, str], str] = {
-    ("cartpole", "fisher", "reinforce"): "src.irl.cartpole.fisher",
-    ("cartpole", "ttsa", "reinforce"): "src.irl.cartpole.ttsa",
-    ("hopper", "fisher", "sac"): "src.irl.hopper.fisher",
-    ("hopper", "ttsa", "reinforce"): "src.irl.hopper.ttsa",
+_REGISTRY: dict[tuple[str, str], str] = {
+    ("cartpole", "fisher"): "src.irl.cartpole.fisher",
+    ("cartpole", "ttsa"): "src.irl.cartpole.ttsa",
+    ("hopper", "fisher"): "src.irl.hopper.fisher",
+    ("hopper", "ttsa"): "src.irl.hopper.ttsa",
 }
 
 
@@ -94,14 +94,14 @@ def build_reward(module, arch: dict, method: str):
     if method == "ttsa":
         return module.Reward(
             state_dim=arch["state_dim"],
-            gamma=arch.get("reward_gamma", 0.99),
+            gamma=arch.get("reward_gamma", arch.get("reward_discount", 0.99)),
         )
 
     return module.Reward(
         state_dim=arch["state_dim"],
         action_dim=arch["action_dim"],
         hidden=arch.get("reward_hidden", 64),
-        gamma=arch.get("reward_gamma", 0.99),
+        discount=arch.get("reward_discount", arch.get("reward_gamma", 0.99)),
     )
 
 
@@ -217,12 +217,16 @@ def main() -> None:
     eval_cfg = config["evaluation"]
     bootstrap_cfg = eval_cfg.get("bootstrap", {})
 
+    ckpt = load_checkpoint(args.checkpoint)
+    arch = ckpt["arch"]
+
     method_inferred, agent_inferred = infer_method_agent(args.checkpoint)
-    method = args.method or method_inferred
-    agent = args.agent or agent_inferred
+
+    method = args.method or arch.get("method") or method_inferred
+    agent = args.agent or arch.get("agent") or agent_inferred
     env_name = env_cfg["name"]
 
-    key = (env_name, method, agent)
+    key = (env_name, method)
     if key not in _REGISTRY:
         raise ValueError(
             f"Unknown combination (env={env_name}, method={method}, agent={agent}). " f"Available: {list(_REGISTRY)}"
@@ -243,9 +247,6 @@ def main() -> None:
     set_env_seed(env, env_seed)
 
     try:
-        ckpt = load_checkpoint(args.checkpoint)
-        arch = ckpt["arch"]
-
         module = importlib.import_module(module_path)
 
         policy = build_policy(
@@ -256,6 +257,7 @@ def main() -> None:
             method=method,
             agent=agent,
         )
+
         reward = build_reward(
             module=module,
             arch=arch,
