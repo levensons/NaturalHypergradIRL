@@ -221,11 +221,9 @@ class FisherNHD:
             weights = discount_weights(T, self.discount, device, dtype=torch.float64)  # (T,)
             F += torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s)  # (policy_dim, policy_dim)
 
-        F /= len(trajs)
+        F.div_(len(trajs))
         F = 0.5 * (F + F.T)
-        F = self.alpha * F
-        F += self.fisher_reg * torch.eye(policy_dim, dtype=torch.float64, device=device)
-        F = 0.5 * (F + F.T)
+        F.mul_(self.alpha)
         return F
 
     def d_outer_d_policy(self, expert_trajs) -> torch.Tensor:
@@ -301,8 +299,31 @@ class FisherNHD:
             )
 
         return hypergrad
+    
+    def hypergradient_with_exact_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        d_outer_d_policy = self.d_outer_d_policy(expert_trajs).to(dtype=torch.float64)  # (policy_dim,)
 
-    def hypergradient(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        fisher = self.fisher(agent_trajs)  # (policy_dim, policy_dim), float64
+        fisher.diagonal().add_(self.fisher_reg)
+        fisher = 0.5 * (fisher + fisher.T)
+
+        fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (policy_dim,)
+        fisher_inv_d_outer_d_policy = fisher_inv_d_outer_d_policy.to(dtype=torch.float32)
+
+        hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+
+        with torch.no_grad():
+            tqdm.write(
+                f"Fisher stats | "
+                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
+                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
+                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
+                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
+            )
+
+        return hypergrad
+
+    def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size)
         hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
@@ -319,7 +340,7 @@ class FisherNHD:
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        hypergradient = self.hypergradient(expert_trajs, agent_trajs)
+        hypergradient = self.hypergradient_with_exact_fisher(expert_trajs, agent_trajs)
 
         self.raw_grad_norm = hypergradient.norm().item()
         if self.max_grad_norm is not None and self.raw_grad_norm > self.max_grad_norm:

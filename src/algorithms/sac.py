@@ -58,6 +58,19 @@ class ReplayBuffer:
             rewards = reward_fn(states, actions)
             self.reward_buf[start:end, :] = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1, 1)
 
+    def collect_random_transitions(self, env: Environment, n: int):
+        state = env.reset()
+        for _ in tqdm(range(n), desc="Collect random transitions", leave=False):
+            action = env.get_random_action()
+
+            next_state, reward, done = env.step(action)
+            self.push(state, action, reward, next_state, done)
+
+            if done:
+                state = env.reset()
+            else:
+                state = next_state
+
 
 class QFunction(nn.Module):
     def __init__(
@@ -158,11 +171,11 @@ class SAC:
 
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
-            if ts < learning_starts:
-                action = train_env.get_random_action()
-            else:
-                with torch.no_grad():
-                    action = self.policy.sample(state)
+            # if ts < learning_starts:
+            #     action = train_env.get_random_action()
+            # else:
+            with torch.no_grad():
+                action = self.policy.sample(state)
 
             next_state, reward, done = train_env.step(action)
             self.replay_buffer.push(state, action, reward, next_state, done)
