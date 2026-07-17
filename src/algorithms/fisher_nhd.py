@@ -42,6 +42,33 @@ class FisherNHD:
 
         self.outer_step = 0
 
+    def d_outer_d_policy(self, expert_trajs) -> torch.Tensor:
+        policy_dim = num_params(self.policy)
+        device = next(self.policy.parameters()).device
+
+        E = torch.zeros(policy_dim, dtype=torch.float32, device=device)
+
+        for traj in tqdm(expert_trajs, desc="Outer grad", leave=False):
+            states = to_device(traj["states"], device)
+            actions = to_device(traj["actions"], device)
+
+            log_pi_a_s = self.policy.log_prob(states, actions)  # (T,)
+            sum_log_pi_a_s = log_pi_a_s.sum() # (1,)
+
+            grad = torch.autograd.grad(
+                sum_log_pi_a_s,
+                self.policy.parameters(),
+                retain_graph=False,
+                create_graph=False,
+            )
+            grad = flat_grad(grad).detach() # (policy_dim,)
+
+            E.add_(grad)
+
+        E.div_(len(expert_trajs))
+        E.neg_()
+        return E
+    
     def explicit_hessian(self, trajs) -> torch.Tensor:
         "DEPRECATED"
         policy_dim = num_params(self.policy)
@@ -91,13 +118,13 @@ class FisherNHD:
 
             L_H_plus_alpha_H_gamma = flat_grad(second_grads, flat_dim=1).detach()
 
-            H += (
+            H.add_(
                 L * torch.outer(S, S)
                 + self.alpha * (torch.outer(S_gamma, S) + torch.outer(S, S_gamma))
                 + L_H_plus_alpha_H_gamma
             )
 
-        H /= len(trajs)
+        H.div_(len(trajs))
         H = 0.5 * (H + H.T)
         return H
 
@@ -119,8 +146,8 @@ class FisherNHD:
             retain_graph=False,
             create_graph=False,
         )
-
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, reward_dim)
+
         suffix_sums = torch.flip(torch.cumsum(torch.flip(grads, dims=[0]), dim=0), dims=[0])  # (T, reward_dim)
         return suffix_sums
 
@@ -139,8 +166,8 @@ class FisherNHD:
             retain_graph=False,
             create_graph=False,
         )
-
         grads = flat_grad(grads, flat_dim=1).detach()  # (T, policy_dim)
+
         return grads
 
     def fisher_solve_sketch_profile(self, trajs, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
@@ -219,41 +246,16 @@ class FisherNHD:
 
             grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions).to(torch.float64)  # (T, policy_dim)
             weights = discount_weights(T, self.discount, device, dtype=torch.float64)  # (T,)
-            F += torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s)  # (policy_dim, policy_dim)
+            F.add_(torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s))  # (policy_dim, policy_dim)
 
         F.div_(len(trajs))
         F = 0.5 * (F + F.T)
         F.mul_(self.alpha)
         return F
 
-    def d_outer_d_policy(self, expert_trajs) -> torch.Tensor:
-        policy_dim = num_params(self.policy)
-        device = next(self.policy.parameters()).device
+    def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
+        "d_inner_d_cross @ v = u"
 
-        E = torch.zeros(policy_dim, dtype=torch.float32, device=device)
-
-        for traj in tqdm(expert_trajs, desc="Outer grad", leave=False):
-            states = to_device(traj["states"], device)
-            actions = to_device(traj["actions"], device)
-            T = states.size(0)
-
-            log_pi_a_s = self.policy.log_prob(states, actions)  # (T,)
-            weights = discount_weights(T, self.discount, device)  # (T,)
-            sum_weighted_log_pi_a_s = (weights * log_pi_a_s).sum()  # (1,)
-
-            grad = torch.autograd.grad(
-                sum_weighted_log_pi_a_s,
-                self.policy.parameters(),
-                retain_graph=False,
-                create_graph=False,
-            )
-
-            grad = flat_grad(grad).detach()  # (policy_dim,)
-            E += grad
-
-        return -(E / len(expert_trajs))
-
-    def d_cross_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
         reward_dim = num_params(self.reward)
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
@@ -263,7 +265,7 @@ class FisherNHD:
         if v.numel() != policy_dim:
             raise ValueError(f"`v` must have shape ({policy_dim},), got {tuple(v.shape)}.")
 
-        out = torch.zeros(reward_dim, dtype=torch.float32, device=device)
+        U = torch.zeros(reward_dim, dtype=torch.float32, device=device)
 
         for traj in tqdm(trajs, desc="Cross vec product", leave=False):
             states = to_device(traj["states"], device)
@@ -278,16 +280,20 @@ class FisherNHD:
             weights = discount_weights(T, self.discount, device)  # (T,)
             scalar = (prefix * weights * rewards).sum()
             grad = torch.autograd.grad(scalar, self.reward.parameters(), retain_graph=False, create_graph=False)
-            out += flat_grad(grad).detach()  # (reward_dim,)
+            grad = flat_grad(grad).detach()
 
-        return -(out / len(trajs))
+            U.add_(grad)  # (reward_dim,)
+
+        U.div_(len(trajs))
+        U.neg_()
+        return U
 
     def hypergradient_with_explicit_hessian(self, expert_trajs, agent_trajs) -> torch.Tensor:
         "DEPRECATED"
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         hessian = self.explicit_hessian(agent_trajs)
         fisher_inv_d_outer_d_policy = torch.linalg.solve(hessian, d_outer_d_policy)
-        hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
 
         with torch.no_grad():
             tqdm.write(
@@ -305,12 +311,11 @@ class FisherNHD:
 
         fisher = self.fisher(agent_trajs)  # (policy_dim, policy_dim), float64
         fisher.diagonal().add_(self.fisher_reg)
-        fisher = 0.5 * (fisher + fisher.T)
 
         fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (policy_dim,)
         fisher_inv_d_outer_d_policy = fisher_inv_d_outer_d_policy.to(dtype=torch.float32)
 
-        hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
 
         with torch.no_grad():
             tqdm.write(
@@ -326,7 +331,7 @@ class FisherNHD:
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size)
-        hypergrad = -self.d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
 
         with torch.no_grad():
             tqdm.write(
@@ -386,7 +391,7 @@ class FisherNHD:
         hypergrad_exact = None
 
         if compare_hypergradients:
-            hypergrad_exact = -self.d_cross_vec_product(
+            hypergrad_exact = -self.d_inner_d_cross_vec_product(
                 agent_trajs,
                 v_exact,
             )
@@ -483,7 +488,7 @@ class FisherNHD:
             )
 
             if compare_hypergradients:
-                hypergrad_sketch = -self.d_cross_vec_product(
+                hypergrad_sketch = -self.d_inner_d_cross_vec_product(
                     agent_trajs,
                     v_sketch,
                 )
