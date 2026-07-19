@@ -54,11 +54,11 @@ fisher:
   
   n_outer_steps: 100
   n_inner_steps: 300000
-  n_agent_traj: 100
+  n_agent_traj: 1000
 
   discount: 0.99
   alpha: 0.2
-  fisher_reg: 1.0
+  fisher_reg: 1e-12
   fisher_sketch_size: 128
 
   lr_reward: 0.0001

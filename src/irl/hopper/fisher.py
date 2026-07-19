@@ -418,6 +418,8 @@ def train_bilevel(config: dict, logger) -> dict:
     q2_state = torch.nn.utils.parameters_to_vector(sac.q2.parameters()).detach().clone()
 
     def inner_optimize(outer_step: int):
+        policy.train()
+        
         current_reward_fn = reward.as_fn()
 
         sac.replay_buffer.recalc_rewards(current_reward_fn)
@@ -439,7 +441,6 @@ def train_bilevel(config: dict, logger) -> dict:
             custom_reward_fn=None,
         )
 
-        @torch.no_grad()
         def validate(ts: int, n_eval_traj: int = 10):
             sac.policy.eval()
 
@@ -464,10 +465,21 @@ def train_bilevel(config: dict, logger) -> dict:
                 expert_trajs=expert_valid_trajs,
             )
 
+            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
+            grad_norm = l_inner_grad.norm()
+            grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
+            grad_abs_max = l_inner_grad.abs().max()
+            policy_vector = torch.nn.utils.parameters_to_vector(sac.policy.parameters()).detach()
+            relative_grad_norm = grad_norm / (policy_vector.norm() + 1e-12)
+
             mlflow.log_metrics(
                 {
-                    f"sac_{outer_step}/l_inner": float(l_inner),
-                    f"sac_{outer_step}/l_outer": float(l_outer),
+                    f"sac_{outer_step}/l_inner": l_inner,
+                    f"sac_{outer_step}/l_outer": l_outer,
+                    f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
+                    f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
+                    f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
+                    f"sac_{outer_step}/inner_grad_relative": relative_grad_norm.item(),
                 },
                 step=ts,
             )
@@ -484,7 +496,7 @@ def train_bilevel(config: dict, logger) -> dict:
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
             validate_fn=validate,
-            validate_every=1000,
+            validate_every=10000,
         )
 
         sac_train_env.close()
@@ -512,6 +524,10 @@ def train_bilevel(config: dict, logger) -> dict:
         verbose=True,
     )
 
+    outer_optimizer.sweep_n_agent_trajs(expert_valid_trajs, agent_trajs, n_prefixes=10)
+
+    # outer_optimizer.compare_hessian_and_fisher(agent_trajs)
+
     # sketch_sweep_results = outer_optimizer.sweep_sketch_sizes(
     #     expert_trajs=expert_train_trajs,
     #     agent_trajs=agent_trajs,
@@ -519,7 +535,7 @@ def train_bilevel(config: dict, logger) -> dict:
     #     compare_hypergradients=True,
     # )
 
-    log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
+    # log_and_checkpoint(outer_step=0, agent_trajs=agent_trajs)
 
     for outer_step in range(1, n_outer_steps + 1):
         outer_optimizer.step(expert_train_trajs, agent_trajs)

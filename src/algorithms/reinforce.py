@@ -64,7 +64,6 @@ class REINFORCE:
         train_env: Environment,
         total_steps: int = 100,
         n_traj_per_update: int = 10,
-        max_steps: int = 500,
         max_grad_norm: float = 1.0,
         actor_lr: float = 1e-3,
         scheduler_gamma: float = 1.0,
@@ -81,8 +80,7 @@ class REINFORCE:
                 env=train_env,
                 policy=self.policy,
                 n=n_traj_per_update,
-                max_steps=max_steps,
-                desc="reinforce inner trajs",
+                deterministic=False,
                 verbose=False,
             )
 
