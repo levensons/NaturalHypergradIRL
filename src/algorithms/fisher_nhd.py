@@ -17,10 +17,10 @@ class FisherNHD:
         self,
         reward: nn.Module,
         policy: Policy,
+        gamma: float,
+        alpha: float,
         lr: float,
         fisher_reg: float,
-        discount: float,
-        alpha: float,
         max_grad_norm=None,
         scheduler_gamma: float = 1.0,
         sketch_size: int = 128,
@@ -28,7 +28,7 @@ class FisherNHD:
         self.reward = reward
         self.policy = policy
         self.fisher_reg = fisher_reg
-        self.discount = discount
+        self.gamma = gamma
         self.alpha = alpha
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
@@ -40,48 +40,48 @@ class FisherNHD:
         self.optimizer = torch.optim.Adam(self.reward.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
 
-        self.outer_step = 0
-
     def d_outer_d_policy(self, expert_trajs, verbose: bool = True) -> torch.Tensor:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        E = torch.zeros(policy_dim, dtype=torch.float32, device=device)
+        out = torch.zeros(policy_dim, dtype=torch.float32, device=device)
 
         for traj in tqdm(expert_trajs, desc="Outer grad", leave=False, disable=not verbose):
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
+            T = states.size(0)
 
             log_pi_a_s = self.policy.log_prob(states, actions)  # (T,)
-            sum_log_pi_a_s = log_pi_a_s.sum() # (1,)
+            weights = discount_weights(T, self.gamma, device, log_pi_a_s.dtype) # (T,)
+            sum_weighted_log_pi_a_s = torch.sum(weights * log_pi_a_s) # (1,)
 
             grad = torch.autograd.grad(
-                sum_log_pi_a_s,
+                sum_weighted_log_pi_a_s,
                 self.policy.parameters(),
                 retain_graph=False,
                 create_graph=False,
             )
             grad = flat_grad(grad).detach() # (policy_dim,)
 
-            E.add_(grad)
+            out.add_(grad)
 
-        E.div_(len(expert_trajs))
-        E.neg_()
-        return E
+        out.div_(len(expert_trajs))
+        out.neg_()
+        return out
     
     def d_inner_d_policy(self, trajs, verbose: bool = True) -> torch.Tensor:
         policy_params = list(self.policy.parameters())
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        grad_inner = torch.zeros(policy_dim, dtype=torch.float64, device=device)
+        grad_inner = torch.zeros(policy_dim, dtype=torch.float32, device=device)
 
         for traj in tqdm(trajs, desc="Inner gradient", leave=False, disable=not verbose):
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
             T = states.size(0)
 
-            weights = discount_weights(T, self.discount, device, dtype=states.dtype)
+            weights = discount_weights(T, self.gamma, device, states.dtype)
             log_probs = self.policy.log_prob(states, actions)
             rewards = self.reward(states, actions).detach()
 
@@ -93,7 +93,7 @@ class FisherNHD:
                 retain_graph=True,
                 create_graph=False,
             )
-            score = flat_grad(score).detach().to(torch.float64)
+            score = flat_grad(score).detach()
 
             discounted_score = torch.autograd.grad(
                 (weights * log_probs).sum(),
@@ -104,11 +104,10 @@ class FisherNHD:
             discounted_score = (
                 flat_grad(discounted_score)
                 .detach()
-                .to(torch.float64)
             )
 
             grad_inner.add_(
-                trajectory_loss.to(torch.float64) * score
+                trajectory_loss * score
                 + self.alpha * discounted_score
             )
 
@@ -128,10 +127,9 @@ class FisherNHD:
             actions = to_device(traj["actions"], device)
             T = states.size(0)
 
-            weights = discount_weights(T, self.discount, device, dtype=torch.float32)
-
             log_probs = self.policy.log_prob(states, actions)  # (T,)
             rewards = self.reward(states, actions).detach()  # (T,)
+            weights = discount_weights(T, self.gamma, device, log_probs.dtype)
 
             L = torch.sum(weights * (self.alpha * log_probs - rewards)).detach()  # (1,)
 
@@ -179,7 +177,7 @@ class FisherNHD:
         T = states.size(0)
 
         r_a_s_t = self.reward(states, actions)  # (T,)
-        weights = discount_weights(T, self.discount, device)  # (T,)
+        weights = discount_weights(T, self.gamma, device, r_a_s_t.dtype)  # (T,)
         r_a_s_t = weights * r_a_s_t
 
         grad_outputs = torch.eye(T, dtype=r_a_s_t.dtype, device=device)  # (T, T)
@@ -220,7 +218,6 @@ class FisherNHD:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        g = g.to(device=device, dtype=torch.float32)
         sketch = CBSCFD(dim=policy_dim, m=sketch_size, alpha_0=self.fisher_reg)
 
         score_time = 0.0
@@ -233,10 +230,10 @@ class FisherNHD:
             T = states.size(0)
 
             start = time.perf_counter()
-            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions).to(torch.float32)  # (T, policy_dim)
+            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
             score_time += time.perf_counter() - start
 
-            weights = discount_weights(T, self.discount, device, dtype=torch.float32)  # (T,)
+            weights = discount_weights(T, self.gamma, device, dtype=torch.float32)  # (T,)
 
             row_scale = torch.sqrt((self.alpha / n_trajs) * weights)  # (T,)
             X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (T, policy_dim)
@@ -259,7 +256,6 @@ class FisherNHD:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        g = g.to(device=device, dtype=torch.float32)
         sketch = CBSCFD(dim=policy_dim, m=sketch_size, alpha_0=self.fisher_reg)
 
         n_trajs = len(trajs)
@@ -268,8 +264,8 @@ class FisherNHD:
             actions = to_device(traj["actions"], device)
             T = states.size(0)
 
-            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions).to(torch.float32)  # (T, policy_dim)
-            weights = discount_weights(T, self.discount, device, dtype=torch.float32)  # (T,)
+            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
+            weights = discount_weights(T, self.gamma, device, dtype=torch.float32)  # (T,)
 
             row_scale = torch.sqrt((self.alpha / n_trajs) * weights)  # (T,)
             X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (T, policy_dim)
@@ -278,20 +274,19 @@ class FisherNHD:
 
         return sketch.solve(g)
 
-    def fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
-        "DEPRECATED"
+    def exact_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        F = torch.zeros(policy_dim, policy_dim, dtype=torch.float64, device=device)
+        F = torch.zeros(policy_dim, policy_dim, dtype=torch.float32, device=device)
 
         for traj in tqdm(trajs, desc="Fisher", leave=False, disable=not verbose):
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
             T = states.size(0)
 
-            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions).to(torch.float64)  # (T, policy_dim)
-            weights = discount_weights(T, self.discount, device, dtype=torch.float64)  # (T,)
+            grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
+            weights = discount_weights(T, self.gamma, device, dtype=grad_log_pi_a_s.dtype)  # (T,)
             F.add_(torch.einsum("t,ti,tj->ij", weights, grad_log_pi_a_s, grad_log_pi_a_s))  # (policy_dim, policy_dim)
 
         F.div_(len(trajs))
@@ -300,18 +295,18 @@ class FisherNHD:
         return F
 
     def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
-        "d_inner_d_cross @ v = u"
+        """
+        Compute (∇²_{θφ} L_inner)^T v.
+        """
 
         reward_dim = num_params(self.reward)
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
 
-        v = v.to(dtype=torch.float32, device=device)
-
         if v.numel() != policy_dim:
             raise ValueError(f"`v` must have shape ({policy_dim},), got {tuple(v.shape)}.")
 
-        U = torch.zeros(reward_dim, dtype=torch.float32, device=device)
+        out = torch.zeros(reward_dim, dtype=torch.float32, device=device)
 
         for traj in tqdm(trajs, desc="Cross vec product", leave=False, disable=not verbose):
             states = to_device(traj["states"], device)
@@ -323,23 +318,51 @@ class FisherNHD:
             prefix = torch.cumsum(score_v, dim=0).detach()  # (T,)
 
             rewards = self.reward(states, actions)  # (T,)
-            weights = discount_weights(T, self.discount, device)  # (T,)
+            weights = discount_weights(T, self.gamma, device)  # (T,)
             scalar = (prefix * weights * rewards).sum()
             grad = torch.autograd.grad(scalar, self.reward.parameters(), retain_graph=False, create_graph=False)
             grad = flat_grad(grad).detach()
 
-            U.add_(grad)  # (reward_dim,)
+            out.add_(grad)  # (reward_dim,)
 
-        U.div_(len(trajs))
-        U.neg_()
-        return U
+        out.div_(len(trajs))
+        out.neg_()
+        return out
+
+    # def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     OLD VERSION
+    #     Compute (∇²_{θφ} L_inner)^T v.
+    #     """
+        
+    #     reward_dim = num_params(self.reward)
+    #     policy_dim = num_params(self.policy)
+    #     device = next(self.policy.parameters()).device
+
+    #     if v.numel() != policy_dim:
+    #         raise ValueError(f"`v` must have shape ({policy_dim},), got {tuple(v.shape)}.")
+
+    #     out = torch.zeros(reward_dim, dtype=torch.float32, device=device)
+
+    #     for traj in tqdm(trajs, desc="Cross vec product", leave=False):
+    #         states = to_device(traj["states"], device)
+    #         actions = to_device(traj["actions"], device)
+
+    #         grad_R_tail_with_discount = self._grad_R_tail_with_discount(states, actions)  # (T, reward_dim)
+    #         grad_log_pi_a_s = self._grad_log_pi_a_s(states, actions)  # (T, policy_dim)
+    #         out.add_(torch.einsum("tr,tp,p->r", grad_R_tail_with_discount, grad_log_pi_a_s, v))  # (reward_dim,)
+
+    #     out.div_(len(trajs))
+    #     out.neg_()
+    #     return out
 
     def hypergradient_with_explicit_hessian(self, expert_trajs, agent_trajs) -> torch.Tensor:
         "DEPRECATED"
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         hessian = self.explicit_hessian(agent_trajs)
         fisher_inv_d_outer_d_policy = torch.linalg.solve(hessian, d_outer_d_policy)
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad.neg_()
 
         with torch.no_grad():
             tqdm.write(
@@ -353,15 +376,15 @@ class FisherNHD:
         return hypergrad
     
     def hypergradient_with_exact_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs).to(dtype=torch.float64)  # (policy_dim,)
+        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
 
-        fisher = self.fisher(agent_trajs)  # (policy_dim, policy_dim), float64
+        fisher = self.exact_fisher(agent_trajs)  # (policy_dim, policy_dim)
         fisher.diagonal().add_(self.fisher_reg)
 
         fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (policy_dim,)
-        fisher_inv_d_outer_d_policy = fisher_inv_d_outer_d_policy.to(dtype=torch.float32)
 
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad.neg_()
 
         with torch.no_grad():
             tqdm.write(
@@ -377,7 +400,8 @@ class FisherNHD:
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # (policy_dim,)
         fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size)
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad = self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # (reward_dim,)
+        hypergrad.neg_()
 
         with torch.no_grad():
             tqdm.write(
@@ -393,6 +417,9 @@ class FisherNHD:
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
         hypergradient = self.hypergradient_with_exact_fisher(expert_trajs, agent_trajs)
 
+        if not torch.isfinite(hypergradient).all():
+            raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")
+
         self.raw_grad_norm = hypergradient.norm().item()
         if self.max_grad_norm is not None and self.raw_grad_norm > self.max_grad_norm:
             hypergradient = hypergradient * (self.max_grad_norm / self.raw_grad_norm)
@@ -404,8 +431,6 @@ class FisherNHD:
 
         if self.scheduler:
             self.scheduler.step()
-
-        self.outer_step += 1
 
         return hypergradient
 
@@ -420,14 +445,11 @@ class FisherNHD:
 
         exact_start = time.perf_counter()
 
-        fisher_exact = self.fisher(agent_trajs)
+        fisher_exact = self.exact_fisher(agent_trajs)
         fisher_exact.diagonal().add_(self.fisher_reg)
         fisher_end = time.perf_counter()
 
-        v_exact = torch.linalg.solve(
-            fisher_exact,
-            d_outer_d_policy.to(dtype=fisher_exact.dtype),
-        ).to(dtype=torch.float32)
+        v_exact = torch.linalg.solve(fisher_exact, d_outer_d_policy.to(device=fisher_exact.device, dtype=fisher_exact.dtype))
 
         solve_end = time.perf_counter()
 
@@ -438,10 +460,8 @@ class FisherNHD:
         hypergrad_exact = None
 
         if compare_hypergradients:
-            hypergrad_exact = -self.d_inner_d_cross_vec_product(
-                agent_trajs,
-                v_exact,
-            )
+            hypergrad_exact = self.d_inner_d_cross_vec_product(agent_trajs, v_exact)
+            hypergrad_exact.neg_()
 
         results = []
 
@@ -579,338 +599,328 @@ class FisherNHD:
 
         return results
     
-    def compare_hessian_and_fisher(
-        self,
-        trajs,
-        probe_vectors: int = 20,
-    ):
-        device = next(self.policy.parameters()).device
+    # def compare_hessian_and_fisher(
+    #     self,
+    #     trajs,
+    #     probe_vectors: int = 20,
+    # ):
+    #     device = next(self.policy.parameters()).device
 
-        # Проверяем предпосылку оптимальности
-        inner_grad = self.d_inner_d_policy(trajs)
+    #     # Проверяем предпосылку оптимальности
+    #     inner_grad = self.d_inner_d_policy(trajs)
 
-        # Оцениваем обе матрицы на одних и тех же траекториях
-        H = self.explicit_hessian(trajs).to(torch.float64)
-        F_mat = self.fisher(trajs).to(torch.float64)
+    #     # Оцениваем обе матрицы на одних и тех же траекториях
+    #     H = self.explicit_hessian(trajs)
+    #     F_mat = self.fisher(trajs)
 
-        # На всякий случай ещё раз симметризуем
-        H = 0.5 * (H + H.T)
-        F_mat = 0.5 * (F_mat + F_mat.T)
+    #     # На всякий случай ещё раз симметризуем
+    #     H = 0.5 * (H + H.T)
+    #     F_mat = 0.5 * (F_mat + F_mat.T)
 
-        diff = H - F_mat
+    #     diff = H - F_mat
 
-        h_norm = torch.linalg.matrix_norm(H, ord="fro")
-        f_norm = torch.linalg.matrix_norm(F_mat, ord="fro")
-        diff_norm = torch.linalg.matrix_norm(diff, ord="fro")
+    #     h_norm = torch.linalg.matrix_norm(H, ord="fro")
+    #     f_norm = torch.linalg.matrix_norm(F_mat, ord="fro")
+    #     diff_norm = torch.linalg.matrix_norm(diff, ord="fro")
 
-        relative_frobenius = (
-            diff_norm / h_norm.clamp_min(1e-12)
-        ).item()
+    #     relative_frobenius = (
+    #         diff_norm / h_norm.clamp_min(1e-12)
+    #     ).item()
 
-        symmetric_relative_frobenius = (
-            2.0 * diff_norm
-            / (h_norm + f_norm).clamp_min(1e-12)
-        ).item()
+    #     symmetric_relative_frobenius = (
+    #         2.0 * diff_norm
+    #         / (h_norm + f_norm).clamp_min(1e-12)
+    #     ).item()
 
-        # Косинус между матрицами как между векторами
-        matrix_cosine = F.cosine_similarity(
-            H.reshape(1, -1),
-            F_mat.reshape(1, -1),
-            dim=1,
-        ).item()
+    #     # Косинус между матрицами как между векторами
+    #     matrix_cosine = F.cosine_similarity(
+    #         H.reshape(1, -1),
+    #         F_mat.reshape(1, -1),
+    #         dim=1,
+    #     ).item()
 
-        trace_relative_error = (
-            torch.abs(torch.trace(H) - torch.trace(F_mat))
-            / torch.abs(torch.trace(H)).clamp_min(1e-12)
-        ).item()
+    #     trace_relative_error = (
+    #         torch.abs(torch.trace(H) - torch.trace(F_mat))
+    #         / torch.abs(torch.trace(H)).clamp_min(1e-12)
+    #     ).item()
 
-        # Спектральная ошибка: самое плохо приближённое направление
-        relative_spectral = (
-            torch.linalg.matrix_norm(diff, ord=2)
-            / torch.linalg.matrix_norm(H, ord=2).clamp_min(1e-12)
-        ).item()
+    #     # Спектральная ошибка: самое плохо приближённое направление
+    #     relative_spectral = (
+    #         torch.linalg.matrix_norm(diff, ord=2)
+    #         / torch.linalg.matrix_norm(H, ord=2).clamp_min(1e-12)
+    #     ).item()
 
-        # Сравнение квадратичных форм на случайных направлениях
-        quadratic_form_errors = []
+    #     # Сравнение квадратичных форм на случайных направлениях
+    #     quadratic_form_errors = []
 
-        for _ in range(probe_vectors):
-            z = torch.randn(
-                H.shape[0],
-                dtype=H.dtype,
-                device=device,
-            )
-            z /= z.norm().clamp_min(1e-12)
+    #     for _ in range(probe_vectors):
+    #         z = torch.randn(
+    #             H.shape[0],
+    #             dtype=H.dtype,
+    #             device=device,
+    #         )
+    #         z /= z.norm().clamp_min(1e-12)
 
-            q_h = z @ H @ z
-            q_f = z @ F_mat @ z
+    #         q_h = z @ H @ z
+    #         q_f = z @ F_mat @ z
 
-            error = torch.abs(q_h - q_f) / torch.maximum(
-                torch.maximum(q_h.abs(), q_f.abs()),
-                torch.tensor(1e-12, dtype=H.dtype, device=device),
-            )
+    #         error = torch.abs(q_h - q_f) / torch.maximum(
+    #             torch.maximum(q_h.abs(), q_f.abs()),
+    #             torch.tensor(1e-12, dtype=H.dtype, device=device),
+    #         )
 
-            quadratic_form_errors.append(error)
+    #         quadratic_form_errors.append(error)
 
-        quadratic_form_errors = torch.stack(quadratic_form_errors)
+    #     quadratic_form_errors = torch.stack(quadratic_form_errors)
 
-        results = {
-            "inner_grad_norm": inner_grad.norm().item(),
-            "inner_grad_rms": (
-                inner_grad.norm() / inner_grad.numel() ** 0.5
-            ).item(),
-            "inner_grad_abs_max": inner_grad.abs().max().item(),
+    #     results = {
+    #         "inner_grad_norm": inner_grad.norm().item(),
+    #         "inner_grad_rms": (
+    #             inner_grad.norm() / inner_grad.numel() ** 0.5
+    #         ).item(),
+    #         "inner_grad_abs_max": inner_grad.abs().max().item(),
 
-            "hessian_frobenius_norm": h_norm.item(),
-            "fisher_frobenius_norm": f_norm.item(),
-            "difference_frobenius_norm": diff_norm.item(),
+    #         "hessian_frobenius_norm": h_norm.item(),
+    #         "fisher_frobenius_norm": f_norm.item(),
+    #         "difference_frobenius_norm": diff_norm.item(),
 
-            "relative_frobenius_error": relative_frobenius,
-            "symmetric_relative_frobenius_error":
-                symmetric_relative_frobenius,
-            "relative_spectral_error": relative_spectral,
-            "matrix_cosine": matrix_cosine,
-            "trace_relative_error": trace_relative_error,
+    #         "relative_frobenius_error": relative_frobenius,
+    #         "symmetric_relative_frobenius_error":
+    #             symmetric_relative_frobenius,
+    #         "relative_spectral_error": relative_spectral,
+    #         "matrix_cosine": matrix_cosine,
+    #         "trace_relative_error": trace_relative_error,
 
-            "quadratic_error_mean":
-                quadratic_form_errors.mean().item(),
-            "quadratic_error_max":
-                quadratic_form_errors.max().item(),
-        }
+    #         "quadratic_error_mean":
+    #             quadratic_form_errors.mean().item(),
+    #         "quadratic_error_max":
+    #             quadratic_form_errors.max().item(),
+    #     }
 
-        print("\nHessian–Fisher comparison")
-        print("-" * 54)
-        print(
-            f"Inner grad norm:          "
-            f"{results['inner_grad_norm']:.4e}"
-        )
-        print(
-            f"Inner grad RMS:           "
-            f"{results['inner_grad_rms']:.4e}"
-        )
-        print(
-            f"||H||_F:                  "
-            f"{results['hessian_frobenius_norm']:.4e}"
-        )
-        print(
-            f"||F||_F:                  "
-            f"{results['fisher_frobenius_norm']:.4e}"
-        )
-        print(
-            f"||H-F||_F / ||H||_F:      "
-            f"{results['relative_frobenius_error']:.4e}"
-        )
-        print(
-            f"Symmetric relative error: "
-            f"{results['symmetric_relative_frobenius_error']:.4e}"
-        )
-        print(
-            f"Relative spectral error:  "
-            f"{results['relative_spectral_error']:.4e}"
-        )
-        print(
-            f"Matrix cosine:            "
-            f"{results['matrix_cosine']:.6f}"
-        )
-        print(
-            f"Trace relative error:     "
-            f"{results['trace_relative_error']:.4e}"
-        )
-        print(
-            f"Quadratic error mean:     "
-            f"{results['quadratic_error_mean']:.4e}"
-        )
-        print(
-            f"Quadratic error max:      "
-            f"{results['quadratic_error_max']:.4e}"
-        )
+    #     print("\nHessian–Fisher comparison")
+    #     print("-" * 54)
+    #     print(
+    #         f"Inner grad norm:          "
+    #         f"{results['inner_grad_norm']:.4e}"
+    #     )
+    #     print(
+    #         f"Inner grad RMS:           "
+    #         f"{results['inner_grad_rms']:.4e}"
+    #     )
+    #     print(
+    #         f"||H||_F:                  "
+    #         f"{results['hessian_frobenius_norm']:.4e}"
+    #     )
+    #     print(
+    #         f"||F||_F:                  "
+    #         f"{results['fisher_frobenius_norm']:.4e}"
+    #     )
+    #     print(
+    #         f"||H-F||_F / ||H||_F:      "
+    #         f"{results['relative_frobenius_error']:.4e}"
+    #     )
+    #     print(
+    #         f"Symmetric relative error: "
+    #         f"{results['symmetric_relative_frobenius_error']:.4e}"
+    #     )
+    #     print(
+    #         f"Relative spectral error:  "
+    #         f"{results['relative_spectral_error']:.4e}"
+    #     )
+    #     print(
+    #         f"Matrix cosine:            "
+    #         f"{results['matrix_cosine']:.6f}"
+    #     )
+    #     print(
+    #         f"Trace relative error:     "
+    #         f"{results['trace_relative_error']:.4e}"
+    #     )
+    #     print(
+    #         f"Quadratic error mean:     "
+    #         f"{results['quadratic_error_mean']:.4e}"
+    #     )
+    #     print(
+    #         f"Quadratic error max:      "
+    #         f"{results['quadratic_error_max']:.4e}"
+    #     )
 
-        return results
+    #     return results
 
-    def sweep_n_agent_trajs(
-        self,
-        expert_trajs,
-        agent_trajs,
-        n_prefixes: int = 25,
-    ):
-        if len(agent_trajs) == 0:
-            raise ValueError("agent_trajs must contain at least one trajectory.")
+    # def sweep_n_agent_trajs(
+    #     self,
+    #     expert_trajs,
+    #     agent_trajs,
+    #     n_prefixes: int = 25,
+    # ):
+    #     if len(agent_trajs) == 0:
+    #         raise ValueError("agent_trajs must contain at least one trajectory.")
 
-        if n_prefixes <= 0:
-            raise ValueError("n_prefixes must be positive.")
+    #     if n_prefixes <= 0:
+    #         raise ValueError("n_prefixes must be positive.")
 
-        n_agent_trajs = len(agent_trajs)
-        n_prefixes = min(n_prefixes, n_agent_trajs)
+    #     n_agent_trajs = len(agent_trajs)
+    #     n_prefixes = min(n_prefixes, n_agent_trajs)
 
-        # prefixes = (
-        #     torch.linspace(
-        #         1,
-        #         n_agent_trajs,
-        #         steps=n_prefixes,
-        #     )
-        #     .round()
-        #     .to(torch.int64)
-        #     .unique()
-        #     .tolist()
-        # )
+    #     # prefixes = (
+    #     #     torch.linspace(
+    #     #         1,
+    #     #         n_agent_trajs,
+    #     #         steps=n_prefixes,
+    #     #     )
+    #     #     .round()
+    #     #     .unique()
+    #     #     .tolist()
+    #     # )
 
-        prefixes = [1, 2, 5, 10, 25, 50, 100, 250, 300, 400, 500, 750, 800, 900, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000]
+    #     prefixes = [1, 2, 5, 10, 25, 50, 100, 250, 300, 400, 500, 750, 800, 900, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 5000]
 
-        # Общие величины, не зависящие от размера префикса
-        l_outer = outer_loss(
-            policy=self.policy,
-            expert_trajs=expert_trajs,
-        )
+    #     # Общие величины, не зависящие от размера префикса
+    #     l_outer = outer_loss(self.policy, expert_trajs, self.gamma)
 
-        policy_vector = torch.nn.utils.parameters_to_vector(
-            self.policy.parameters()
-        ).detach()
+    #     policy_vector = torch.nn.utils.parameters_to_vector(
+    #         self.policy.parameters()
+    #     ).detach()
 
-        policy_norm = torch.linalg.vector_norm(
-            policy_vector
-        ).clamp_min(1e-12)
+    #     policy_norm = torch.linalg.vector_norm(
+    #         policy_vector
+    #     ).clamp_min(1e-12)
 
-        # Reference строим по всем доступным агентским траекториям
-        reference_trajs = agent_trajs
+    #     # Reference строим по всем доступным агентским траекториям
+    #     reference_trajs = agent_trajs
 
-        fisher_ref = self.fisher(
-            reference_trajs,
-        )
+    #     fisher_ref = self.fisher(
+    #         reference_trajs,
+    #     )
 
-        fisher_ref_norm = torch.linalg.matrix_norm(
-            fisher_ref,
-            ord="fro",
-        ).clamp_min(1e-12)
+    #     fisher_ref_norm = torch.linalg.matrix_norm(
+    #         fisher_ref,
+    #         ord="fro",
+    #     ).clamp_min(1e-12)
 
-        d_outer = self.d_outer_d_policy(
-            expert_trajs
-        ).to(
-            device=fisher_ref.device,
-            dtype=fisher_ref.dtype,
-        )
+    #     d_outer = self.d_outer_d_policy(
+    #         expert_trajs
+    #     ).to(
+    #         device=fisher_ref.device,
+    #         dtype=fisher_ref.dtype,
+    #     )
 
-        fisher_ref_reg = fisher_ref.clone()
-        fisher_ref_reg.diagonal().add_(self.fisher_reg)
+    #     fisher_ref_reg = fisher_ref.clone()
+    #     fisher_ref_reg.diagonal().add_(self.fisher_reg)
 
-        v_ref = torch.linalg.solve(
-            fisher_ref_reg,
-            d_outer,
-        )
+    #     v_ref = torch.linalg.solve(
+    #         fisher_ref_reg,
+    #         d_outer,
+    #     )
 
-        v_ref_norm = torch.linalg.vector_norm(
-            v_ref
-        ).clamp_min(1e-12)
+    #     v_ref_norm = torch.linalg.vector_norm(
+    #         v_ref
+    #     ).clamp_min(1e-12)
 
-        header = (
-            f"{'N':>6} | "
-            f"{'L_inner':>10} | "
-            f"{'L_outer':>10} | "
-            f"{'||g||':>10} | "
-            f"{'g RMS':>9} | "
-            f"{'g rel':>9} | "
-            f"{'|g|max':>10} | "
-            f"{'F rel':>8} | "
-            f"{'F cos':>8} | "
-            f"{'solve rel':>10} | "
-            f"{'solve cos':>9}"
-        )
+    #     header = (
+    #         f"{'N':>6} | "
+    #         f"{'L_inner':>10} | "
+    #         f"{'L_outer':>10} | "
+    #         f"{'||g||':>10} | "
+    #         f"{'g RMS':>9} | "
+    #         f"{'g rel':>9} | "
+    #         f"{'|g|max':>10} | "
+    #         f"{'F rel':>8} | "
+    #         f"{'F cos':>8} | "
+    #         f"{'solve rel':>10} | "
+    #         f"{'solve cos':>9}"
+    #     )
 
-        print("\nFisher sample-size sweep")
-        print("=" * len(header))
-        print(header)
-        print("-" * len(header))
+    #     print("\nFisher sample-size sweep")
+    #     print("=" * len(header))
+    #     print(header)
+    #     print("-" * len(header))
 
-        results = []
+    #     results = []
 
-        for prefix in prefixes:
-            cur_trajs = agent_trajs[:prefix]
+    #     for prefix in prefixes:
+    #         cur_trajs = agent_trajs[:prefix]
 
-            l_inner = inner_loss(
-                policy=self.policy,
-                reward=self.reward,
-                trajs=cur_trajs,
-                discount=self.discount,
-                alpha=self.alpha,
-            )
+    #         l_inner = inner_loss(self.policy, self.reward, cur_trajs, self.gamma, self.alpha)
 
-            inner_grad = self.d_inner_d_policy(
-                cur_trajs,
-            )
+    #         inner_grad = self.d_inner_d_policy(
+    #             cur_trajs,
+    #         )
 
-            grad_norm = torch.linalg.vector_norm(inner_grad)
-            grad_rms = grad_norm / inner_grad.numel() ** 0.5
-            grad_abs_max = inner_grad.abs().max()
-            grad_relative = grad_norm / policy_norm
+    #         grad_norm = torch.linalg.vector_norm(inner_grad)
+    #         grad_rms = grad_norm / inner_grad.numel() ** 0.5
+    #         grad_abs_max = inner_grad.abs().max()
+    #         grad_relative = grad_norm / policy_norm
 
-            # Fisher без регуляризации:
-            # сравниваем именно оценки матрицы.
-            fisher_cur = self.fisher(
-                cur_trajs,
-            )
+    #         # Fisher без регуляризации:
+    #         # сравниваем именно оценки матрицы.
+    #         fisher_cur = self.fisher(
+    #             cur_trajs,
+    #         )
 
-            fisher_rel_error = (
-                torch.linalg.matrix_norm(
-                    fisher_cur - fisher_ref,
-                    ord="fro",
-                )
-                / fisher_ref_norm
-            )
+    #         fisher_rel_error = (
+    #             torch.linalg.matrix_norm(
+    #                 fisher_cur - fisher_ref,
+    #                 ord="fro",
+    #             )
+    #             / fisher_ref_norm
+    #         )
 
-            fisher_cosine = torch.nn.functional.cosine_similarity(
-                fisher_cur.flatten(),
-                fisher_ref.flatten(),
-                dim=0,
-            )
+    #         fisher_cosine = torch.nn.functional.cosine_similarity(
+    #             fisher_cur.flatten(),
+    #             fisher_ref.flatten(),
+    #             dim=0,
+    #         )
 
-            # Fisher с регуляризацией:
-            # сравниваем реально используемое решение системы.
-            fisher_cur_reg = fisher_cur.clone()
-            fisher_cur_reg.diagonal().add_(self.fisher_reg)
+    #         # Fisher с регуляризацией:
+    #         # сравниваем реально используемое решение системы.
+    #         fisher_cur_reg = fisher_cur.clone()
+    #         fisher_cur_reg.diagonal().add_(self.fisher_reg)
 
-            v_cur = torch.linalg.solve(
-                fisher_cur_reg,
-                d_outer,
-            )
+    #         v_cur = torch.linalg.solve(
+    #             fisher_cur_reg,
+    #             d_outer,
+    #         )
 
-            solve_rel_error = (
-                torch.linalg.vector_norm(v_cur - v_ref)
-                / v_ref_norm
-            )
+    #         solve_rel_error = (
+    #             torch.linalg.vector_norm(v_cur - v_ref)
+    #             / v_ref_norm
+    #         )
 
-            solve_cosine = torch.nn.functional.cosine_similarity(
-                v_cur,
-                v_ref,
-                dim=0,
-            )
+    #         solve_cosine = torch.nn.functional.cosine_similarity(
+    #             v_cur,
+    #             v_ref,
+    #             dim=0,
+    #         )
 
-            row = {
-                "n_trajs": prefix,
-                "l_inner": float(l_inner),
-                "l_outer": float(l_outer),
-                "grad_norm": grad_norm.item(),
-                "grad_rms": grad_rms.item(),
-                "grad_relative": grad_relative.item(),
-                "grad_abs_max": grad_abs_max.item(),
-                "fisher_relative_error": fisher_rel_error.item(),
-                "fisher_cosine": fisher_cosine.item(),
-                "solve_relative_error": solve_rel_error.item(),
-                "solve_cosine": solve_cosine.item(),
-            }
-            results.append(row)
+    #         row = {
+    #             "n_trajs": prefix,
+    #             "l_inner": float(l_inner),
+    #             "l_outer": float(l_outer),
+    #             "grad_norm": grad_norm.item(),
+    #             "grad_rms": grad_rms.item(),
+    #             "grad_relative": grad_relative.item(),
+    #             "grad_abs_max": grad_abs_max.item(),
+    #             "fisher_relative_error": fisher_rel_error.item(),
+    #             "fisher_cosine": fisher_cosine.item(),
+    #             "solve_relative_error": solve_rel_error.item(),
+    #             "solve_cosine": solve_cosine.item(),
+    #         }
+    #         results.append(row)
 
-            print(
-                f"{prefix:6d} | "
-                f"{row['l_inner']:10.3f} | "
-                f"{row['l_outer']:10.3f} | "
-                f"{row['grad_norm']:10.3e} | "
-                f"{row['grad_rms']:9.3e} | "
-                f"{row['grad_relative']:9.3e} | "
-                f"{row['grad_abs_max']:10.3e} | "
-                f"{row['fisher_relative_error']:8.4f} | "
-                f"{row['fisher_cosine']:8.4f} | "
-                f"{row['solve_relative_error']:10.4f} | "
-                f"{row['solve_cosine']:9.4f}"
-            )
+    #         print(
+    #             f"{prefix:6d} | "
+    #             f"{row['l_inner']:10.3f} | "
+    #             f"{row['l_outer']:10.3f} | "
+    #             f"{row['grad_norm']:10.3e} | "
+    #             f"{row['grad_rms']:9.3e} | "
+    #             f"{row['grad_relative']:9.3e} | "
+    #             f"{row['grad_abs_max']:10.3e} | "
+    #             f"{row['fisher_relative_error']:8.4f} | "
+    #             f"{row['fisher_cosine']:8.4f} | "
+    #             f"{row['solve_relative_error']:10.4f} | "
+    #             f"{row['solve_cosine']:9.4f}"
+    #         )
 
-        print("=" * len(header))
+    #     print("=" * len(header))
 
-        return results
+    #     return results

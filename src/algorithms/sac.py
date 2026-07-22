@@ -1,11 +1,13 @@
 from tqdm import tqdm
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.utils.env import Environment
 from src.utils.policies import Policy
+from src.utils.torch import set_optimizer_lr
 
 
 class ReplayBuffer:
@@ -120,7 +122,7 @@ class QFunction(nn.Module):
 class SAC:
     def __init__(
         self,
-        policy: Policy,
+        policy: Policy | nn.Module,
         state_dim: int,
         action_dim: int,
         hidden_dim: int = 64,
@@ -146,9 +148,17 @@ class SAC:
 
         self.replay_buffer = ReplayBuffer(state_dim, action_dim, replay_buffer_capacity)
 
-        self.gamma = gamma
+        self.policy_params = list(self.policy.parameters())
+        self.critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
+
+        self.policy_optimizer = torch.optim.Adam(self.policy_params)
+        self.critic_optimizer = torch.optim.Adam(self.critic_params)
+
         self.alpha = alpha
+        self.gamma = gamma
         self.tau = tau
+
+        self.global_gradient_update_step = 0
 
     def collect_random_rollout(self, env: Environment, n_steps: int):
         state = env.reset()
@@ -189,16 +199,11 @@ class SAC:
     ):
         state = train_env.reset()
 
-        policy_params = list(self.policy.parameters())
-        critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
+        set_optimizer_lr(self.policy_optimizer, actor_lr)
+        set_optimizer_lr(self.critic_optimizer, critic_lr)
 
-        policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
-        critic_optimizer = torch.optim.Adam(critic_params, lr=critic_lr)
-
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(policy_optimizer, gamma=1.0)
-        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(critic_optimizer, gamma=1.0)
-
-        global_gradient_update_step = 0
+        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, gamma=1.0)
+        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=1.0)
 
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
@@ -234,11 +239,11 @@ class SAC:
 
                 critic_loss = 0.5 * (q1_loss + q2_loss)
 
-                critic_optimizer.zero_grad()
-                torch.autograd.backward(critic_loss, inputs=critic_params)
+                self.critic_optimizer.zero_grad()
+                torch.autograd.backward(critic_loss, inputs=self.critic_params)
                 if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(critic_params, max_grad_norm)
-                critic_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(self.critic_params, max_grad_norm)
+                self.critic_optimizer.step()
                 critic_scheduler.step()
 
                 # ACTOR
@@ -250,18 +255,18 @@ class SAC:
 
                 policy_loss = torch.mean(self.alpha * log_probs - q)
 
-                policy_optimizer.zero_grad()
-                torch.autograd.backward(policy_loss, inputs=policy_params)
+                self.policy_optimizer.zero_grad()
+                torch.autograd.backward(policy_loss, inputs=self.policy_params)
                 if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
-                policy_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(self.policy_params, max_grad_norm)
+                self.policy_optimizer.step()
                 policy_scheduler.step()
 
                 # CRITIC-TARGET SOFT-UPDATE
-                global_gradient_update_step += 1
-                if global_gradient_update_step % target_update_interval == 0:
+                self.global_gradient_update_step += 1
+                if self.global_gradient_update_step % target_update_interval == 0:
                     self.soft_update()
 
             # VALIDATION
             if validate_fn is not None and ts % validate_every == 0:
-                validate_fn(ts=ts)
+                validate_fn(ts)

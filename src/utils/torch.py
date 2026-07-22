@@ -71,3 +71,8 @@ def to_device(obj: Any, device: torch.device | str) -> Any:
         return tuple(to_device(value, device) for value in obj)
 
     return obj
+
+
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr

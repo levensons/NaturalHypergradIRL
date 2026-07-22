@@ -49,18 +49,16 @@ def rank_corr(reward, trajs) -> float:
     device = next(reward.parameters()).device
     reward.eval()
 
-    env_returns, learned_returns = [], []
+    env_returns = []
+    learned_returns = []
 
     for traj in trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
         rewards = to_device(traj["rewards"], device)
 
-        env_return = rewards.sum()
-        learned_return = reward.trajectory_return(states, actions)
-
-        env_returns.append(env_return)
-        learned_returns.append(learned_return)
+        env_returns.append(rewards.sum())
+        learned_returns.append(reward.trajectory_return(states, actions))
 
     env_returns = torch.stack(env_returns)
     learned_returns = torch.stack(learned_returns)
@@ -68,7 +66,7 @@ def rank_corr(reward, trajs) -> float:
     env_ranks = _rankdata(env_returns)
     learned_ranks = _rankdata(learned_returns)
 
-    return _pearson_corr(env_ranks, learned_ranks).item()
+    return float(_pearson_corr(env_ranks, learned_ranks).item())
 
 
 @torch.no_grad()
@@ -88,7 +86,10 @@ def policy_nll(policy, trajs) -> float:
 
 
 @torch.no_grad()
-def outer_loss(policy, expert_trajs) -> float:
+def outer_loss(policy, expert_trajs, gamma: float) -> float:
+    if not (0.0 < gamma <= 1.0):
+        raise ValueError(f"`gamma` must satisfy 0 < gamma <= 1, got {gamma}.")
+    
     device = next(policy.parameters()).device
     policy.eval()
 
@@ -96,17 +97,19 @@ def outer_loss(policy, expert_trajs) -> float:
     for traj in expert_trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
+        T = states.size(0)
 
+        weights = discount_weights(T, gamma, device, states.dtype)
         log_probs = policy.log_prob(states, actions)
-        loss += log_probs.sum().item()
+        loss += (weights * log_probs).sum().item()
 
     return -loss / len(expert_trajs)
 
 
 @torch.no_grad()
-def inner_loss(policy, reward, trajs, discount: float, alpha: float = 1.0) -> float:
-    if not (0.0 < discount <= 1.0):
-        raise ValueError(f"`discount` must satisfy 0 < discount <= 1, got {discount}.")
+def inner_loss(policy, reward, trajs, gamma: float, alpha: float) -> float:
+    if not (0.0 < gamma <= 1.0):
+        raise ValueError(f"`gamma` must satisfy 0 < gamma <= 1, got {gamma}.")
 
     if not (0.0 < alpha):
         raise ValueError(f"`alpha` must satisfy alpha > 0, got {alpha}.")
@@ -123,7 +126,7 @@ def inner_loss(policy, reward, trajs, discount: float, alpha: float = 1.0) -> fl
 
         log_probs = policy.log_prob(states, actions)
         rewards = reward.rewards(states, actions)
-        weights = discount_weights(T, discount, device)
+        weights = discount_weights(T, gamma, device, states.dtype)
         loss += (weights * (alpha * log_probs - rewards)).sum().item()
 
     return loss / len(trajs)
@@ -139,7 +142,7 @@ def env_reward(trajs) -> float:
 
 
 @torch.no_grad()
-def learned_reward_stats(reward, trajs, discount: float = 1.0) -> dict[str, float]:
+def learned_reward_stats(reward, trajs) -> dict[str, float]:
     device = next(reward.parameters()).device
     reward.eval()
 
@@ -150,15 +153,12 @@ def learned_reward_stats(reward, trajs, discount: float = 1.0) -> dict[str, floa
     for traj in trajs:
         states = to_device(traj["states"], device)
         actions = to_device(traj["actions"], device)
-        T = states.size(0)
 
-        rewards = reward(states, actions)  # (T,)
-        weights = discount_weights(T, discount, device).to(dtype=rewards.dtype)
-        traj_return = (weights * rewards).sum()
+        rewards = reward(states, actions)
 
-        returns.append(traj_return.item())
+        returns.append(rewards.sum().item())
         means.append(rewards.mean().item())
-        lengths.append(float(T))
+        lengths.append(float(rewards.numel()))
 
     returns = np.asarray(returns, dtype=np.float64)
     means = np.asarray(means, dtype=np.float64)
