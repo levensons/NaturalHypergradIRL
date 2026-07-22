@@ -312,10 +312,10 @@ def train_bilevel(config: dict, logger) -> dict:
 
             l_outer = outer_loss(sac.policy, expert_valid_trajs, sac.gamma)
 
-            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
-            grad_norm = l_inner_grad.norm()
-            grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
-            grad_abs_max = l_inner_grad.abs().max()
+            # l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
+            # grad_norm = l_inner_grad.norm()
+            # grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
+            # grad_abs_max = l_inner_grad.abs().max()
 
             mlflow.log_metrics(
                 {
@@ -323,9 +323,9 @@ def train_bilevel(config: dict, logger) -> dict:
                     f"sac_{outer_step}/l_outer": l_outer,
                     f"sac_{outer_step}/env_return": float(mean_trajectory_return(agent_valid_trajs)),
                     f"sac_{outer_step}/length": float(mean_trajectory_length(agent_valid_trajs)),
-                    f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
-                    f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
-                    f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
+                    # f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
+                    # f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
+                    # f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
                 },
                 step=ts,
             )
@@ -499,7 +499,12 @@ def train_bilevel(config: dict, logger) -> dict:
         log_and_checkpoint(outer_step, agent_train_trajs)
 
         if outer_step < n_outer_steps:
-            # outer_optimizer.sweep_sketch_sizes(expert_train_trajs, agent_train_trajs, [1, 2, 4, 6, 8, 16, 32, 64, 128, 256], compare_hypergradients=True)
+            # outer_optimizer.sweep_sketch_sizes(
+            #     expert_train_trajs,
+            #     agent_train_trajs,
+            #     [1, 2, 4, 6, 8, 16, 32, 64, 128, 256, 512],
+            #     compare_hypergradients=True
+            # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
 
     env.close()
