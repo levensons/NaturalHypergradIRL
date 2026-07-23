@@ -283,13 +283,13 @@ def train_ml_irl(config: dict, logger) -> dict:
         sac_train_env.custom_reward_fn = current_reward_fn
         sac.replay_buffer.recalc_rewards(current_reward_fn)
 
-        def validate(ts: int, n_eval_trajs: int = 10) -> None:
+        def validate(ts: int) -> None:
             sac.policy.eval()
 
             agent_valid_trajs = collect_trajectories(
                 env=sac_eval_env,
                 policy=sac.policy,
-                n=n_eval_trajs,
+                n=inner_cfg["n_agent_eval_trajs"],
                 deterministic=False,
                 verbose=False,
             )

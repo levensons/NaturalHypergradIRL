@@ -282,9 +282,6 @@ def train_bilevel(config: dict, logger) -> dict:
     # sac.replay_buffer.extend_from_trajectories(expert_train_trajs)
     sac.replay_buffer.extend_from_trajectories(random_train_trajs)
 
-    # q1_state = torch.nn.utils.parameters_to_vector(sac.q1.parameters()).detach().clone()
-    # q2_state = torch.nn.utils.parameters_to_vector(sac.q2.parameters()).detach().clone()
-
     def inner_optimize(outer_step: int):
         policy.train()
         
@@ -292,18 +289,13 @@ def train_bilevel(config: dict, logger) -> dict:
         sac_train_env.custom_reward_fn = current_reward_fn
         sac.replay_buffer.recalc_rewards(current_reward_fn)
 
-        # torch.nn.utils.vector_to_parameters(q1_state.clone(), sac.q1.parameters())
-        # torch.nn.utils.vector_to_parameters(q2_state.clone(), sac.q2.parameters())
-        # sac.q1_target.load_state_dict(sac.q1.state_dict())
-        # sac.q2_target.load_state_dict(sac.q2.state_dict())
-
-        def validate(ts: int, n_eval_trajs: int = 10):
+        def validate(ts: int):
             sac.policy.eval()
 
             agent_valid_trajs = collect_trajectories(
                 env=sac_eval_env,
                 policy=sac.policy,
-                n=n_eval_trajs,
+                n=inner_cfg["n_agent_eval_trajs"],
                 deterministic=False,
                 verbose=True,
             )
@@ -495,15 +487,28 @@ def train_bilevel(config: dict, logger) -> dict:
 
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimize(outer_step)
-        agent_train_trajs = collect_trajectories(env, policy, n_agent_trajs, deterministic=False, desc="agent outer trajs", verbose=True)
+        agent_train_trajs = collect_trajectories(
+            env,
+            policy,
+            n_agent_trajs,
+            deterministic=False,
+            desc="agent outer trajs",
+            verbose=True
+        )
         log_and_checkpoint(outer_step, agent_train_trajs)
 
         if outer_step < n_outer_steps:
             # outer_optimizer.sweep_sketch_sizes(
             #     expert_train_trajs,
             #     agent_train_trajs,
-            #     [1, 2, 4, 6, 8, 16, 32, 64, 128, 256, 512],
+            #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
             #     compare_hypergradients=True
+            # )
+            # outer_optimizer.sweep_n_agent_trajs(
+            #     expert_train_trajs,
+            #     agent_train_trajs,
+            #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+            #     verbose=True
             # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
 
