@@ -297,25 +297,25 @@ def train_bilevel(config: dict, logger) -> dict:
         # sac.q1_target.load_state_dict(sac.q1.state_dict())
         # sac.q2_target.load_state_dict(sac.q2.state_dict())
 
-        def validate(ts: int, n_eval_traj: int = 10):
+        def validate(ts: int, n_eval_trajs: int = 10):
             sac.policy.eval()
 
             agent_valid_trajs = collect_trajectories(
                 env=sac_eval_env,
                 policy=sac.policy,
-                n=n_eval_traj,
+                n=n_eval_trajs,
                 deterministic=False,
-                verbose=False,
+                verbose=True,
             )
 
             l_inner = inner_loss(sac.policy, reward, agent_valid_trajs, sac.gamma, sac.alpha)
 
             l_outer = outer_loss(sac.policy, expert_valid_trajs, sac.gamma)
 
-            # l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
-            # grad_norm = l_inner_grad.norm()
-            # grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
-            # grad_abs_max = l_inner_grad.abs().max()
+            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=True)
+            grad_norm = l_inner_grad.norm()
+            grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
+            grad_abs_max = l_inner_grad.abs().max()
 
             mlflow.log_metrics(
                 {
@@ -323,9 +323,9 @@ def train_bilevel(config: dict, logger) -> dict:
                     f"sac_{outer_step}/l_outer": l_outer,
                     f"sac_{outer_step}/env_return": float(mean_trajectory_return(agent_valid_trajs)),
                     f"sac_{outer_step}/length": float(mean_trajectory_length(agent_valid_trajs)),
-                    # f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
-                    # f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
-                    # f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
+                    f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
+                    f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
+                    f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
                 },
                 step=ts,
             )
@@ -342,7 +342,7 @@ def train_bilevel(config: dict, logger) -> dict:
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
             # validate_fn=validate,
-            validate_every=1000,
+            validate_every=int(inner_cfg["validate_every"]),
         )
 
     history = {

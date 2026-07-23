@@ -40,6 +40,14 @@ class FisherNHD:
         self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
 
+    @property
+    def device(self) -> torch.device:
+        return next(self.reward.parameters()).device
+
+    @property
+    def lr(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
     def d_outer_d_policy(self, expert_trajs, verbose: bool = True) -> torch.Tensor:
         policy_dim = num_params(self.policy)
         device = next(self.policy.parameters()).device
@@ -69,50 +77,50 @@ class FisherNHD:
         out.neg_()
         return out
     
-    # def d_inner_d_policy(self, trajs, verbose: bool = True) -> torch.Tensor:
-    #     policy_params = list(self.policy.parameters())
-    #     policy_dim = num_params(self.policy)
-    #     device = next(self.policy.parameters()).device
+    def d_inner_d_policy(self, trajs, verbose: bool = True) -> torch.Tensor:
+        policy_dim = num_params(self.policy)
+        device = next(self.policy.parameters()).device
 
-    #     grad_inner = torch.zeros(policy_dim, dtype=torch.float32, device=device)
+        out = torch.zeros(policy_dim, dtype=torch.float32, device=device)
 
-    #     for traj in tqdm(trajs, desc="Inner gradient", leave=False, disable=not verbose):
-    #         states = to_device(traj["states"], device)
-    #         actions = to_device(traj["actions"], device)
-    #         T = states.size(0)
+        for traj in tqdm(trajs, desc="Inner gradient", leave=False, disable=not verbose):
+            states = to_device(traj["states"], device)
+            actions = to_device(traj["actions"], device)
 
-    #         weights = discount_weights(T, self.gamma, device, states.dtype)
-    #         log_probs = self.policy.log_prob(states, actions)
-    #         rewards = self.reward(states, actions).detach()
+            log_probs = self.policy.log_prob(states, actions)  # (T,)
+            rewards = self.reward(states, actions).detach()    # (T,)
 
-    #         trajectory_loss = torch.sum(weights * (self.alpha * log_probs - rewards)).detach()
+            T = log_probs.numel()
+            weights = discount_weights(T, self.gamma, device, log_probs.dtype)
 
-    #         score = torch.autograd.grad(
-    #             log_probs.sum(),
-    #             policy_params,
-    #             retain_graph=True,
-    #             create_graph=False,
-    #         )
-    #         score = flat_grad(score).detach()
+            per_step_loss = weights * (self.alpha * log_probs.detach() - rewards)
 
-    #         discounted_score = torch.autograd.grad(
-    #             (weights * log_probs).sum(),
-    #             policy_params,
-    #             retain_graph=False,
-    #             create_graph=False,
-    #         )
-    #         discounted_score = (
-    #             flat_grad(discounted_score)
-    #             .detach()
-    #         )
+            tail_losses = torch.flip(torch.cumsum(torch.flip(per_step_loss, dims=[0]), dim=0), dims=[0]).detach()
 
-    #         grad_inner.add_(
-    #             trajectory_loss * score
-    #             + self.alpha * discounted_score
-    #         )
+            # Score-function term:
+            # sum_t tail_loss_t * grad log pi_t
+            score_term = torch.autograd.grad(
+                outputs=(tail_losses * log_probs).sum(),
+                inputs=list(self.policy.parameters()),
+                retain_graph=True,
+                create_graph=False,
+            )
+            score_term = flat_grad(score_term).detach()
 
-    #     grad_inner.div_(len(trajs))
-    #     return grad_inner
+            # Explicit derivative of alpha * log pi
+            entropy_direct_term = torch.autograd.grad(
+                outputs=self.alpha * (weights * log_probs).sum(),
+                inputs=list(self.policy.parameters()),
+                retain_graph=False,
+                create_graph=False,
+            )
+            entropy_direct_term = flat_grad(entropy_direct_term).detach()
+
+            out.add_(score_term)
+            out.add_(entropy_direct_term)
+
+        out.div_(len(trajs))
+        return out
 
     # def explicit_hessian(self, trajs, verbose: bool = True) -> torch.Tensor:
     #     "DEPRECATED"
