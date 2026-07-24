@@ -63,7 +63,8 @@ class Environment:
             action_for_env = action.detach().cpu().numpy()
             action_for_env = np.asarray(action_for_env, dtype=np.float32).reshape(self.env.action_space.shape)
 
-        next_state, reward, done, _, _ = self.env.step(action_for_env)
+        next_state, reward, terminated, truncated, _ = self.env.step(action_for_env)
+        done = terminated or truncated
 
         if self.custom_reward_fn is not None:
             reward = self.custom_reward_fn(self.state, action)

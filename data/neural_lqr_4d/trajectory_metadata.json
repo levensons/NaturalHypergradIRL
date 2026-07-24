@@ -1,0 +1,152 @@
+{
+  "env_name": "neural_lqr_4d",
+  "env_id": "NeuralLQR4D-v0",
+  "expert_checkpoint": "models/neural_lqr_4d/expert.pt",
+  "stochastic_expert_actions": true,
+  "files": {
+    "expert_train": "data/neural_lqr_4d/expert_train_trajs.pt",
+    "expert_valid": "data/neural_lqr_4d/expert_valid_trajs.pt",
+    "expert_test": "data/neural_lqr_4d/expert_test_trajs.pt",
+    "random_valid": "data/neural_lqr_4d/random_valid_trajs.pt",
+    "random_test": "data/neural_lqr_4d/random_test_trajs.pt"
+  },
+  "lqr": {
+    "A": [
+      [
+        1.0,
+        0.1,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0,
+        0.02
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.1
+      ],
+      [
+        0.0,
+        0.02,
+        0.0,
+        1.0
+      ]
+    ],
+    "B": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.1,
+        0.0
+      ],
+      [
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.1
+      ]
+    ],
+    "Q": [
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.1,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.1
+      ]
+    ],
+    "R": [
+      [
+        0.1,
+        0.0
+      ],
+      [
+        0.0,
+        0.1
+      ]
+    ],
+    "process_cov": [
+      [
+        0.001,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.001,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.001,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.001
+      ]
+    ],
+    "initial_cov": [
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.25,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        0.25
+      ]
+    ],
+    "horizon": 100,
+    "action_limit": 5.0,
+    "observation_limit": 100.0,
+    "termination_state_norm": 50.0,
+    "reward_scale": 1.0
+  }
+}

@@ -13,6 +13,17 @@ def _check_policy(policy: Policy) -> None:
         raise TypeError("policy must have a callable method `sample(state)`")
 
 
+def _policy_device(policy: Policy) -> torch.device:
+    parameters = getattr(policy, "parameters", None)
+    if not callable(parameters):
+        return torch.device("cpu")
+
+    try:
+        return next(parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def collect_trajectories(
     env: Environment,
     policy: Policy,
@@ -23,6 +34,7 @@ def collect_trajectories(
 ):
     _check_policy(policy)
 
+    device = _policy_device(policy)
     trajs = []
 
     for _ in tqdm(range(n), desc=desc, leave=False, disable=not verbose):
@@ -34,12 +46,12 @@ def collect_trajectories(
 
         for _ in range(max_steps):
             with torch.no_grad():
-                action = policy.sample(state).detach()
+                action = policy.sample(state.to(device)).detach()
 
             next_state, reward, done = env.step(action)
 
-            states.append(state.detach())
-            actions.append(action.detach())
+            states.append(state.detach().cpu())
+            actions.append(action.detach().cpu())
             env_rewards.append(float(reward.item()))
 
             state = next_state
