@@ -1,3 +1,6 @@
+from typing import List
+from collections.abc import Sequence
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -82,6 +85,17 @@ def trajectory_summary(trajs) -> dict:
     }
 
 
-def discount_weights(T: int, gamma: float, device: str | torch.device = "cpu", dtype=torch.float32) -> torch.Tensor:
-    ts = torch.arange(T, dtype=dtype, device=device)
-    return torch.pow(torch.tensor(gamma, dtype=dtype, device=device), ts)
+def discount_weights(
+    trajectory_lengths: int | Sequence[int],
+    gamma: float,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32
+):
+    if isinstance(trajectory_lengths, int):
+        gamma = torch.tensor(gamma, dtype=dtype, device=device)
+        weights = torch.pow(gamma, torch.arange(trajectory_lengths, device=device))
+        return weights
+
+    gamma = torch.tensor(gamma, dtype=dtype, device=device)
+    weights = [torch.pow(gamma, torch.arange(ts, device=device)) for ts in trajectory_lengths]
+    return weights
