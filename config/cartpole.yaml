@@ -37,30 +37,29 @@ trajectory_collection:
 policy:
   hidden_dim: 16
   n_hidden_layers: 1
-  log_std_min: -5
-  log_std_max: 2
 
 reward:
   hidden_dim: 64
-  n_hidden_layers: 1
+  n_hidden_layers: 2
   clamp_magnitude: 10
 
 fisher:
   random_seed: 42
   env_seed: 42
 
-  n_outer_steps: 50
+  n_outer_steps: 100
   n_inner_steps: 500
-  n_agent_traj: 100
+
+  n_agent_trajs: 1000
 
   lr_reward: 1e-3
   scheduler_gamma: 1.0
   max_grad_norm: 1.0
 
-  discount: 0.99
-  alpha: 1.0
-  fisher_reg: 1e-12
-  fisher_sketch_size: 128
+  gamma: 0.99
+  alpha: 0.2
+  fisher_reg: 1e-6
+  fisher_sketch_size: 32
 
   inner:
     type: reinforce
@@ -68,31 +67,44 @@ fisher:
     train_env_seed: 100
     eval_env_seed: 101
 
-    lr_policy: 1e-4
-    scheduler_gamma: 1.0
-    max_grad_norm: 1.0
-    n_traj_per_update: 100
     validate_every: 10
+    n_agent_eval_trajs: 3
 
-ttsa:
+    params:
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20
+
+ml_irl:
   random_seed: 42
   env_seed: 42
 
-  n_iterations: 2000
-  n_traj_per_step: 20
-  metrics_every: 50
+  n_outer_steps: 1000
+  n_inner_steps: 100
 
-  lr_policy: 3e-3
-  lr_reward: 3e-4
+  n_agent_trajs: 1000
 
+  alpha: 0.2
   gamma: 0.99
-  n_cg_steps: 10
-  fisher_reg: 1e-2
 
-  inner_grad_max_norm: 5.0
-  outer_grad_max_norm: 1.0
+  lr_reward: 1e-3
+  max_grad_norm: 1.0
 
-  early_stop_len: 475
+  inner:
+    type: reinforce
+
+    train_env_seed: 100
+    eval_env_seed: 101
+
+    validate_every: 10
+    n_agent_eval_trajs: 3
+
+    params:
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20
 
 data:
   expert_train_trajs: data/cartpole/expert_train_trajs.pt
