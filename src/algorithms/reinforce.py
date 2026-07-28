@@ -3,7 +3,7 @@ from tqdm import tqdm
 
 from src.utils.policies import Policy
 from src.utils.env import Environment
-from src.utils.torch import flat_grad, assign_flat_gradients, to_device, num_params
+from src.utils.torch import flat_grad, assign_flat_gradients, to_device, num_params, set_optimizer_lr
 from src.utils.trajectories import collect_trajectories, discount_weights
 
 
@@ -22,6 +22,8 @@ class REINFORCE:
 
         self.gamma = gamma
         self.alpha = alpha
+
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters())
 
     def gradient(self, trajs) -> torch.Tensor:
         device = next(self.policy.parameters()).device
@@ -68,10 +70,8 @@ class REINFORCE:
         validate_fn=None,
         validate_every: int = 10,
     ):
-        policy_params = list(self.policy.parameters())
-
-        policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(policy_optimizer, gamma=scheduler_gamma)
+        set_optimizer_lr(self.policy_optimizer, actor_lr)
+        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, scheduler_gamma)
 
         for ts in tqdm(range(total_steps), desc="REINFORCE optimization", leave=False):
             trajs = collect_trajectories(
@@ -89,9 +89,9 @@ class REINFORCE:
                 gradient = gradient * (max_grad_norm / (self.raw_grad_norm + 1e-12))
             self.clipped_grad_norm = float(gradient.norm().item())
 
-            policy_optimizer.zero_grad()
+            self.policy_optimizer.zero_grad()
             assign_flat_gradients(self.policy, gradient)
-            policy_optimizer.step()
+            self.policy_optimizer.step()
             policy_scheduler.step()
 
             if validate_fn is not None and ts % validate_every == 0:
