@@ -1,11 +1,13 @@
 from tqdm import tqdm
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from src.utils.env import Environment
 from src.utils.policies import Policy
+from src.utils.torch import set_optimizer_lr
 
 
 class ReplayBuffer:
@@ -16,7 +18,7 @@ class ReplayBuffer:
         self.action_buf = torch.empty(capacity, action_dim, dtype=torch.float32)
         self.reward_buf = torch.empty(capacity, 1, dtype=torch.float32)
         self.next_state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
-        self.done_buf = torch.empty(capacity, 1, dtype=torch.float32)
+        self.terminated_buf = torch.empty(capacity, 1, dtype=torch.float32)
 
         self.ptr = 0
         self.size = 0
@@ -24,12 +26,12 @@ class ReplayBuffer:
     def __len__(self):
         return self.size
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action, reward, next_state, terminated):
         self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
         self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
         self.reward_buf[self.ptr] = torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1)
         self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
-        self.done_buf[self.ptr] = torch.as_tensor(done, dtype=torch.float32).detach().reshape(1)
+        self.terminated_buf[self.ptr] = torch.as_tensor(terminated, dtype=torch.float32).detach().reshape(1)
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -41,9 +43,40 @@ class ReplayBuffer:
         actions = self.action_buf[idxs]
         rewards = self.reward_buf[idxs].reshape(-1)
         next_states = self.next_state_buf[idxs]
-        dones = self.done_buf[idxs].reshape(-1)
+        terminateds = self.terminated_buf[idxs].reshape(-1)
 
-        return states, actions, rewards, next_states, dones
+        return states, actions, rewards, next_states, terminateds
+    
+    def extend_from_trajectories(self, trajs):
+        for trajectory in tqdm(trajs, desc="Load trajectories into replay buffer", leave=False):
+            states = trajectory["states"]
+            actions = trajectory["actions"]
+
+            if len(states) == 0:
+                continue
+
+            next_states = trajectory["next_states"]
+
+            rewards = trajectory.get("rewards")
+            if rewards is None:
+                rewards = torch.zeros(len(states), dtype=states.dtype, device=states.device)
+
+            terminateds = trajectory.get("terminateds")
+            if terminateds is None:
+                terminateds = torch.zeros(len(states),dtype=torch.bool, device=states.device)
+
+            if not (len(states) == len(actions) == len(rewards) == len(next_states) == len(terminateds)):
+                raise ValueError(
+                    "Trajectory fields must have equal lengths: "
+                    f"states={len(states)}, "
+                    f"actions={len(actions)}, "
+                    f"rewards={len(rewards)}, "
+                    f"next_states={len(next_states)}, "
+                    f"terminateds={len(terminateds)}"
+                )
+
+            for state, action, reward, next_state, terminated in zip(states, actions, rewards, next_states, terminateds):
+                self.push(state, action, reward, next_state, terminated)
 
     def recalc_rewards(self, reward_fn, batch_size: int = 4096):
         if self.size == 0:
@@ -57,19 +90,6 @@ class ReplayBuffer:
 
             rewards = reward_fn(states, actions)
             self.reward_buf[start:end, :] = torch.as_tensor(rewards, dtype=torch.float32).reshape(-1, 1)
-
-    def collect_random_transitions(self, env: Environment, n: int):
-        state = env.reset()
-        for _ in tqdm(range(n), desc="Collect random transitions", leave=False):
-            action = env.get_random_action()
-
-            next_state, reward, done = env.step(action)
-            self.push(state, action, reward, next_state, done)
-
-            if done:
-                state = env.reset()
-            else:
-                state = next_state
 
 
 class QFunction(nn.Module):
@@ -102,7 +122,7 @@ class QFunction(nn.Module):
 class SAC:
     def __init__(
         self,
-        policy: Policy,
+        policy: Policy | nn.Module,
         state_dim: int,
         action_dim: int,
         hidden_dim: int = 64,
@@ -128,9 +148,35 @@ class SAC:
 
         self.replay_buffer = ReplayBuffer(state_dim, action_dim, replay_buffer_capacity)
 
-        self.gamma = gamma
+        self.policy_params = list(self.policy.parameters())
+        self.critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
+
+        self.policy_optimizer = torch.optim.Adam(self.policy_params)
+        self.critic_optimizer = torch.optim.Adam(self.critic_params)
+
         self.alpha = alpha
+        self.gamma = gamma
         self.tau = tau
+
+        self.global_gradient_update_step = 0
+
+    def reset_optimizers(self):
+        self.policy_optimizer.state.clear()
+        self.critic_optimizer.state.clear()
+
+    def collect_random_rollout(self, env: Environment, n_steps: int):
+        state = env.reset()
+
+        for _ in tqdm(range(n_steps), desc="Collect random transitions", leave=False):
+            action = env.get_random_action()
+
+            next_state, reward, terminated, truncated = env.step(action)
+            self.replay_buffer.push(state, action, reward, next_state, terminated)
+
+            if terminated.item() or truncated.item():
+                state = env.reset()
+            else:
+                state = next_state
 
     @torch.no_grad()
     def soft_update(self):
@@ -146,7 +192,6 @@ class SAC:
         self,
         train_env: Environment,
         total_steps: int = 1_000_000,
-        learning_starts: int = 10_000,
         batch_size: int = 256,
         max_grad_norm: float = 1.0,
         gradient_update_steps: int = 1,
@@ -158,40 +203,29 @@ class SAC:
     ):
         state = train_env.reset()
 
-        policy_params = list(self.policy.parameters())
-        critic_params = list(self.q1.parameters()) + list(self.q2.parameters())
+        set_optimizer_lr(self.policy_optimizer, actor_lr)
+        set_optimizer_lr(self.critic_optimizer, critic_lr)
 
-        policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
-        critic_optimizer = torch.optim.Adam(critic_params, lr=critic_lr)
-
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(policy_optimizer, gamma=1.0)
-        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(critic_optimizer, gamma=1.0)
-
-        global_gradient_update_step = 0
+        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, gamma=1.0)
+        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=1.0)
 
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
-            # if ts < learning_starts:
-            #     action = train_env.get_random_action()
-            # else:
             with torch.no_grad():
                 action = self.policy.sample(state)
 
-            next_state, reward, done = train_env.step(action)
-            self.replay_buffer.push(state, action, reward, next_state, done)
+            next_state, reward, terminated, truncated = train_env.step(action)
+            self.replay_buffer.push(state, action, reward, next_state, terminated)
 
-            if done:
+            if terminated.item() or truncated.item():
                 state = train_env.reset()
             else:
                 state = next_state
 
-            if len(self.replay_buffer) < learning_starts:
-                continue
-
             # UPDATE
             for _ in range(gradient_update_steps):
                 # CRITIC
-                states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
+                states, actions, rewards, next_states, terminateds = self.replay_buffer.sample(batch_size)
 
                 with torch.no_grad():
                     next_actions, next_log_probs = self.policy.sample(next_states, return_log_probs=True)
@@ -199,7 +233,7 @@ class SAC:
                     next_q1 = self.q1_target(next_states, next_actions)
                     next_q2 = self.q2_target(next_states, next_actions)
                     next_q = torch.min(next_q1, next_q2)
-                    target_q = rewards + self.gamma * (1.0 - dones) * (next_q - self.alpha * next_log_probs)
+                    target_q = rewards + self.gamma * (1.0 - terminateds) * (next_q - self.alpha * next_log_probs)
 
                 current_q1 = self.q1(states, actions)
                 current_q2 = self.q2(states, actions)
@@ -209,11 +243,11 @@ class SAC:
 
                 critic_loss = 0.5 * (q1_loss + q2_loss)
 
-                critic_optimizer.zero_grad()
-                torch.autograd.backward(critic_loss, inputs=critic_params)
+                self.critic_optimizer.zero_grad()
+                torch.autograd.backward(critic_loss, inputs=self.critic_params)
                 if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(critic_params, max_grad_norm)
-                critic_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(self.critic_params, max_grad_norm)
+                self.critic_optimizer.step()
                 critic_scheduler.step()
 
                 # ACTOR
@@ -225,18 +259,18 @@ class SAC:
 
                 policy_loss = torch.mean(self.alpha * log_probs - q)
 
-                policy_optimizer.zero_grad()
-                torch.autograd.backward(policy_loss, inputs=policy_params)
+                self.policy_optimizer.zero_grad()
+                torch.autograd.backward(policy_loss, inputs=self.policy_params)
                 if max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(policy_params, max_grad_norm)
-                policy_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(self.policy_params, max_grad_norm)
+                self.policy_optimizer.step()
                 policy_scheduler.step()
 
                 # CRITIC-TARGET SOFT-UPDATE
-                global_gradient_update_step += 1
-                if global_gradient_update_step % target_update_interval == 0:
+                self.global_gradient_update_step += 1
+                if self.global_gradient_update_step % target_update_interval == 0:
                     self.soft_update()
 
             # VALIDATION
             if validate_fn is not None and ts % validate_every == 0:
-                validate_fn(ts=ts)
+                validate_fn(ts)

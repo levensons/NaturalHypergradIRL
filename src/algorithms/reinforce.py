@@ -3,7 +3,7 @@ from tqdm import tqdm
 
 from src.utils.policies import Policy
 from src.utils.env import Environment
-from src.utils.torch import flat_grad, assign_flat_gradients, to_device, num_params
+from src.utils.torch import flat_grad, assign_flat_gradients, to_device, num_params, set_optimizer_lr
 from src.utils.trajectories import collect_trajectories, discount_weights
 
 
@@ -23,26 +23,29 @@ class REINFORCE:
         self.gamma = gamma
         self.alpha = alpha
 
-    def grad(self, trajs) -> torch.Tensor:
+        self.policy_optimizer = torch.optim.Adam(self.policy.parameters())
+
+    def reset_policy_optimizer(self):
+        self.policy_optimizer.state.clear()
+
+    def gradient(self, trajs) -> torch.Tensor:
         device = next(self.policy.parameters()).device
         policy_params = list(self.policy.parameters())
 
-        grad = torch.zeros(num_params(self.policy), device=device, dtype=torch.float32)
+        gradient = torch.zeros(num_params(self.policy), device=device, dtype=torch.float32)
         for traj in trajs:
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
             rewards = to_device(traj["rewards"], device)
             T = states.size(0)
-
             weights = discount_weights(T, self.gamma, device, torch.float32)
+
             log_probs = self.policy.log_prob(states, actions)  # (T,)
             log_probs_sum = log_probs.sum()  # (1,)
             weighted_log_prob_sum = (weights * log_probs).sum()  # (1,)
             coef = (weights * (self.alpha * log_probs.detach() - rewards)).sum().detach()  # (1,)
 
-            grad_sum_log_probs = torch.autograd.grad(
-                log_probs_sum, policy_params, retain_graph=True, create_graph=False
-            )
+            grad_sum_log_probs = torch.autograd.grad(log_probs_sum, policy_params, retain_graph=True, create_graph=False)
             grad_sum_log_probs = flat_grad(grad_sum_log_probs).detach()
 
             grad_sum_weighted_log_probs = torch.autograd.grad(
@@ -54,48 +57,44 @@ class REINFORCE:
             grad_sum_weighted_log_probs = flat_grad(grad_sum_weighted_log_probs).detach()
 
             grad_traj = coef * grad_sum_log_probs + self.alpha * grad_sum_weighted_log_probs
-            grad += grad_traj
+            gradient += grad_traj
 
-        grad /= len(trajs)
-        return grad
+        gradient /= len(trajs)
+        return gradient
 
     def optimize(
         self,
         train_env: Environment,
         total_steps: int = 100,
         n_traj_per_update: int = 10,
-        max_steps: int = 500,
-        max_grad_norm: float = 1.0,
+        max_grad_norm: float = None,
         actor_lr: float = 1e-3,
         scheduler_gamma: float = 1.0,
         validate_fn=None,
         validate_every: int = 10,
     ):
-        policy_params = list(self.policy.parameters())
-
-        policy_optimizer = torch.optim.Adam(policy_params, lr=actor_lr)
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(policy_optimizer, gamma=scheduler_gamma)
+        set_optimizer_lr(self.policy_optimizer, actor_lr)
+        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, scheduler_gamma)
 
         for ts in tqdm(range(total_steps), desc="REINFORCE optimization", leave=False):
             trajs = collect_trajectories(
                 env=train_env,
                 policy=self.policy,
                 n=n_traj_per_update,
-                max_steps=max_steps,
-                desc="reinforce inner trajs",
+                deterministic=False,
                 verbose=False,
             )
 
-            grad = self.grad(trajs)
+            gradient = self.gradient(trajs)
 
-            self.raw_grad_norm = float(grad.norm().item())
+            self.raw_grad_norm = float(gradient.norm().item())
             if max_grad_norm is not None and self.raw_grad_norm > max_grad_norm:
-                grad = grad * (max_grad_norm / (self.raw_grad_norm + 1e-12))
-            self.clipped_grad_norm = float(grad.norm().item())
+                gradient = gradient * (max_grad_norm / (self.raw_grad_norm + 1e-12))
+            self.clipped_grad_norm = float(gradient.norm().item())
 
-            policy_optimizer.zero_grad()
-            assign_flat_gradients(self.policy, grad)
-            policy_optimizer.step()
+            self.policy_optimizer.zero_grad()
+            assign_flat_gradients(self.policy, gradient)
+            self.policy_optimizer.step()
             policy_scheduler.step()
 
             if validate_fn is not None and ts % validate_every == 0:

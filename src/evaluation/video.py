@@ -13,9 +13,8 @@ def record_policy_video(
     policy: Policy,
     video_dir: str | Path,
     name_prefix: str = "policy",
-    max_steps: int = 1000,
     deterministic: bool = False,
-    device: torch.device | str | None = None,
+    device: torch.device | str = None,
 ) -> dict:
     video_dir = Path(video_dir)
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -39,12 +38,8 @@ def record_policy_video(
 
     state, _ = video_env.reset()
 
-    for _ in range(max_steps):
-        state_tensor = torch.as_tensor(
-            state,
-            dtype=torch.float32,
-            device=device,
-        ).unsqueeze(0)
+    while True:
+        state_tensor = torch.as_tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         action = policy.sample(states=state_tensor, deterministic=deterministic)
         action = action.squeeze(0).detach().cpu().numpy()
 
