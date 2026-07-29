@@ -189,6 +189,10 @@ def train_ml_irl(config: dict, logger) -> dict:
     logger.info(f"Loaded {len(expert_valid_trajs)} expert valid trajectories " f"from {expert_valid_path}")
     logger.info(f"Loaded {len(random_valid_trajs)} random valid trajectories " f"from {random_valid_path}")
 
+    n_outer_steps = int(ml_irl_cfg["n_outer_steps"])
+    n_inner_steps = int(ml_irl_cfg["n_inner_steps"])
+    n_agent_trajs = int(ml_irl_cfg["n_agent_trajs"])
+
     reward = Reward(
         state_dim=env.state_dim,
         action_dim=env.action_dim,
@@ -204,14 +208,6 @@ def train_ml_irl(config: dict, logger) -> dict:
         n_hidden_layers=int(policy_cfg["n_hidden_layers"]),
     ).to(device)
 
-    reinforce = REINFORCE(
-        policy=policy,
-        state_dim=env.state_dim,
-        action_dim=env.action_dim,
-        gamma=float(ml_irl_cfg["gamma"]),
-        alpha=float(ml_irl_cfg["alpha"]),
-    )
-
     outer_optimizer = MLIRL(
         reward=reward,
         lr=float(ml_irl_cfg["lr_reward"]),
@@ -220,9 +216,89 @@ def train_ml_irl(config: dict, logger) -> dict:
         max_grad_norm=ml_irl_cfg["max_grad_norm"],
     )
 
-    n_outer_steps = int(ml_irl_cfg["n_outer_steps"])
-    n_inner_steps = int(ml_irl_cfg["n_inner_steps"])
-    n_agent_trajs = int(ml_irl_cfg["n_agent_trajs"])
+    reinforce = REINFORCE(
+        policy=policy,
+        state_dim=env.state_dim,
+        action_dim=env.action_dim,
+        gamma=float(ml_irl_cfg["gamma"]),
+        alpha=float(ml_irl_cfg["alpha"]),
+    )
+
+    train_env = Environment(env_cfg["id"], int(inner_cfg["train_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
+    eval_env = Environment(env_cfg["id"], int(inner_cfg["eval_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
+
+    def inner_optimize(outer_step: int):
+        policy.train()
+
+        current_reward_fn = reward.as_fn()
+        train_env.custom_reward_fn = current_reward_fn
+
+        def validate(ts):
+            policy.eval()
+
+            agent_eval_trajs = collect_trajectories(
+                env=eval_env,
+                policy=policy,
+                n=inner_cfg["n_agent_eval_trajs"],
+                deterministic=False,
+                verbose=False,
+            )
+
+            l_inner = inner_loss(
+                policy=policy,
+                reward=reward,
+                trajs=agent_eval_trajs,
+                gamma=reinforce.gamma,
+                alpha=reinforce.alpha,
+            )
+            l_outer_value = outer_loss(
+                policy=policy,
+                expert_trajs=expert_valid_trajs,
+                gamma=reinforce.gamma,
+            )
+
+            with torch.no_grad():
+                all_states = torch.cat([traj["states"].to(device=device, dtype=torch.float32) for traj in agent_eval_trajs], dim=0)
+
+                dist = policy.action_distribution(all_states)
+                probs = dist.probs  # (N_states, action_dim)
+
+                policy_entropy = dist.entropy().mean()
+                max_action_prob = probs.max(dim=-1).values.mean()
+
+                deterministic_fraction_95 = (probs.max(dim=-1).values > 0.95).float().mean()
+
+                deterministic_fraction_99 = (probs.max(dim=-1).values > 0.99).float().mean()
+
+                action_0_prob = probs[:, 0].mean()
+                action_1_prob = probs[:, 1].mean()
+
+            mlflow.log_metrics(
+                {
+                    f"reinforce_{outer_step}/l_inner": float(l_inner),
+                    f"reinforce_{outer_step}/l_outer": float(l_outer_value),
+                    f"reinforce_{outer_step}/env_return": float(mean_trajectory_return(agent_eval_trajs)),
+                    f"reinforce_{outer_step}/length": float(mean_trajectory_length(agent_eval_trajs)),
+                    f"reinforce_{outer_step}/policy_entropy": policy_entropy.item(),
+                    f"reinforce_{outer_step}/max_action_prob": max_action_prob.item(),
+                    f"reinforce_{outer_step}/deterministic_fraction_95": deterministic_fraction_95.item(),
+                    f"reinforce_{outer_step}/deterministic_fraction_99": deterministic_fraction_99.item(),
+                    f"reinforce_{outer_step}/action_0_prob": action_0_prob.item(),
+                    f"reinforce_{outer_step}/action_1_prob": action_1_prob.item(),
+                },
+                step=ts,
+            )
+
+        reinforce.optimize(
+            train_env=train_env,
+            total_steps=n_inner_steps,
+            n_traj_per_update=int(reinforce_cfg["n_traj_per_update"]),
+            max_grad_norm=reinforce_cfg["max_grad_norm"],
+            actor_lr=float(reinforce_cfg["lr_policy"]),
+            scheduler_gamma=float(reinforce_cfg["scheduler_gamma"]),
+            # validate_fn=validate,
+            validate_every=int(inner_cfg["validate_every"]),
+        )
 
     mlflow.log_params(
         {
@@ -396,7 +472,7 @@ def train_ml_irl(config: dict, logger) -> dict:
         #     device=device
         # )
 
-    header = (
+    logger.info(
         f"{'Step':>5} | "
         f"{'L_outer':>10} | "
         f"{'L_inner':>10} | "
@@ -409,83 +485,6 @@ def train_ml_irl(config: dict, logger) -> dict:
         f"{'grad_clip':>10} | "
         f"{'lr_reward':>12}"
     )
-    logger.info(header)
-
-    train_env = Environment(env_cfg["id"], int(inner_cfg["train_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
-    eval_env = Environment(env_cfg["id"], int(inner_cfg["eval_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
-
-    def inner_optimize(outer_step: int):
-        policy.train()
-
-        current_reward_fn = reward.as_fn()
-        train_env.custom_reward_fn = current_reward_fn
-
-        def validate(ts):
-            policy.eval()
-
-            agent_eval_trajs = collect_trajectories(
-                env=eval_env,
-                policy=policy,
-                n=inner_cfg["n_agent_eval_trajs"],
-                deterministic=False,
-                verbose=False,
-            )
-
-            l_inner = inner_loss(
-                policy=policy,
-                reward=reward,
-                trajs=agent_eval_trajs,
-                gamma=reinforce.gamma,
-                alpha=reinforce.alpha,
-            )
-            l_outer_value = outer_loss(
-                policy=policy,
-                expert_trajs=expert_valid_trajs,
-                gamma=reinforce.gamma,
-            )
-
-            with torch.no_grad():
-                all_states = torch.cat([traj["states"].to(device=device, dtype=torch.float32) for traj in agent_eval_trajs], dim=0)
-
-                dist = policy.action_distribution(all_states)
-                probs = dist.probs  # (N_states, action_dim)
-
-                policy_entropy = dist.entropy().mean()
-                max_action_prob = probs.max(dim=-1).values.mean()
-
-                deterministic_fraction_95 = (probs.max(dim=-1).values > 0.95).float().mean()
-
-                deterministic_fraction_99 = (probs.max(dim=-1).values > 0.99).float().mean()
-
-                action_0_prob = probs[:, 0].mean()
-                action_1_prob = probs[:, 1].mean()
-
-            mlflow.log_metrics(
-                {
-                    f"reinforce_{outer_step}/l_inner": float(l_inner),
-                    f"reinforce_{outer_step}/l_outer": float(l_outer_value),
-                    f"reinforce_{outer_step}/env_return": float(mean_trajectory_return(agent_eval_trajs)),
-                    f"reinforce_{outer_step}/length": float(mean_trajectory_length(agent_eval_trajs)),
-                    f"reinforce_{outer_step}/policy_entropy": policy_entropy.item(),
-                    f"reinforce_{outer_step}/max_action_prob": max_action_prob.item(),
-                    f"reinforce_{outer_step}/deterministic_fraction_95": deterministic_fraction_95.item(),
-                    f"reinforce_{outer_step}/deterministic_fraction_99": deterministic_fraction_99.item(),
-                    f"reinforce_{outer_step}/action_0_prob": action_0_prob.item(),
-                    f"reinforce_{outer_step}/action_1_prob": action_1_prob.item(),
-                },
-                step=ts,
-            )
-
-        reinforce.optimize(
-            train_env=train_env,
-            total_steps=n_inner_steps,
-            n_traj_per_update=int(reinforce_cfg["n_traj_per_update"]),
-            max_grad_norm=reinforce_cfg["max_grad_norm"],
-            actor_lr=float(reinforce_cfg["lr_policy"]),
-            scheduler_gamma=float(reinforce_cfg["scheduler_gamma"]),
-            # validate_fn=validate,
-            validate_every=int(inner_cfg["validate_every"]),
-        )
 
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimize(outer_step)

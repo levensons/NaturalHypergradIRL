@@ -21,7 +21,7 @@ class MLIRL:
         self.gamma = gamma
 
         self.max_grad_norm = max_grad_norm
-        self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.reward.parameters(), lr=lr)
 
         self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0

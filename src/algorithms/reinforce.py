@@ -25,6 +25,9 @@ class REINFORCE:
 
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters())
 
+    def reset_policy_optimizer(self):
+        self.policy_optimizer.state.clear()
+
     def gradient(self, trajs) -> torch.Tensor:
         device = next(self.policy.parameters()).device
         policy_params = list(self.policy.parameters())

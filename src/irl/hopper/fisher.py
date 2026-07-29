@@ -165,7 +165,7 @@ class Policy(nn.Module):
         return actions, log_probs
 
 
-def train_bilevel(config: dict, logger) -> dict:
+def train_fisher(config: dict, logger) -> dict:
     fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
     sac_cfg = inner_cfg["params"]
@@ -179,21 +179,6 @@ def train_bilevel(config: dict, logger) -> dict:
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
-
-    mlflow.log_params(
-        {
-            "gamma": fisher_cfg["gamma"],
-            "lr_reward": fisher_cfg["lr_reward"],
-            "fisher_reg": fisher_cfg["fisher_reg"],
-            "n_outer_steps": fisher_cfg["n_outer_steps"],
-            "n_inner_steps": fisher_cfg["n_inner_steps"],
-            "n_agent_trajs": fisher_cfg["n_agent_trajs"],
-            "reward_hidden": config["reward"]["hidden_dim"],
-            "policy_hidden": config["policy"]["hidden_dim"],
-            "alpha": fisher_cfg["alpha"],
-            "batch_size": sac_cfg["batch_size"],
-        }
-    )
 
     if inner_cfg["type"] != "sac":
         raise ValueError(f"Expected fisher.inner.type = sac, got {inner_cfg['type']}")
@@ -282,12 +267,22 @@ def train_bilevel(config: dict, logger) -> dict:
     # sac.replay_buffer.extend_from_trajectories(expert_train_trajs)
     sac.replay_buffer.extend_from_trajectories(random_train_trajs)
 
+    policy_state = torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone()
+    q1_state = torch.nn.utils.parameters_to_vector(sac.q1.parameters()).detach().clone()
+    q2_state = torch.nn.utils.parameters_to_vector(sac.q2.parameters()).detach().clone()
+
     def inner_optimize(outer_step: int):
         policy.train()
         
         current_reward_fn = reward.as_fn()
         sac_train_env.custom_reward_fn = current_reward_fn
         sac.replay_buffer.recalc_rewards(current_reward_fn)
+        sac.reset_optimizers()
+        torch.nn.utils.vector_to_parameters(policy_state.clone(), policy.parameters())
+        torch.nn.utils.vector_to_parameters(q1_state.clone(), sac.q1.parameters())
+        torch.nn.utils.vector_to_parameters(q2_state.clone(), sac.q2.parameters())
+        sac.q1_target.load_state_dict(sac.q1.state_dict())
+        sac.q2_target.load_state_dict(sac.q2.state_dict())
 
         def validate(ts: int):
             sac.policy.eval()
@@ -297,14 +292,14 @@ def train_bilevel(config: dict, logger) -> dict:
                 policy=sac.policy,
                 n=inner_cfg["n_agent_eval_trajs"],
                 deterministic=False,
-                verbose=True,
+                verbose=False,
             )
 
             l_inner = inner_loss(sac.policy, reward, agent_valid_trajs, sac.gamma, sac.alpha)
 
             l_outer = outer_loss(sac.policy, expert_valid_trajs, sac.gamma)
 
-            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=True)
+            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
             grad_norm = l_inner_grad.norm()
             grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
             grad_abs_max = l_inner_grad.abs().max()
@@ -333,32 +328,30 @@ def train_bilevel(config: dict, logger) -> dict:
             target_update_interval=int(sac_cfg["target_update_interval"]),
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
-            # validate_fn=validate,
+            validate_fn=validate,
             validate_every=int(inner_cfg["validate_every"]),
         )
-
-    history = {
-        "l_outer": [],
-        "agent_len": [],
-        "expert_len": [],
-        "agent_return": [],
-        "expert_return": [],
-        "rank_corr": [],
-        "policy_nll": [],
-        "raw_hypgrad_norm": [],
-        "clipped_hypgrad_norm": [],
-        "lr_outer": [],
-        "expert_learned_return": [],
-        "random_learned_return": [],
-        "expert_learned_step_mean": [],
-        "random_learned_step_mean": [],
-    }
 
     ckpt_dir = Path(ckpt_cfg["dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     best_checkpoint_path = str(ckpt_dir / "fisher.pt")
     best_env_reward = float("-inf")
+
+    mlflow.log_params(
+        {
+            "gamma": fisher_cfg["gamma"],
+            "lr_reward": fisher_cfg["lr_reward"],
+            "fisher_reg": fisher_cfg["fisher_reg"],
+            "n_outer_steps": fisher_cfg["n_outer_steps"],
+            "n_inner_steps": fisher_cfg["n_inner_steps"],
+            "n_agent_trajs": fisher_cfg["n_agent_trajs"],
+            "reward_hidden": config["reward"]["hidden_dim"],
+            "policy_hidden": config["policy"]["hidden_dim"],
+            "alpha": fisher_cfg["alpha"],
+            "batch_size": sac_cfg["batch_size"],
+        }
+    )
 
     arch = {
         "state_dim": env.state_dim,
@@ -377,6 +370,23 @@ def train_bilevel(config: dict, logger) -> dict:
         "env_name": config["env"]["name"],
         "env_id": config["env"]["id"],
         "action_type": config["env"]["action_type"],
+    }
+
+    history = {
+        "l_outer": [],
+        "agent_len": [],
+        "expert_len": [],
+        "agent_return": [],
+        "expert_return": [],
+        "rank_corr": [],
+        "policy_nll": [],
+        "raw_hypgrad_norm": [],
+        "clipped_hypgrad_norm": [],
+        "lr_outer": [],
+        "expert_learned_return": [],
+        "random_learned_return": [],
+        "expert_learned_step_mean": [],
+        "random_learned_step_mean": [],
     }
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
@@ -431,15 +441,13 @@ def train_bilevel(config: dict, logger) -> dict:
                 best_env_reward=best_env_reward,
             )
 
-        row = (
+        logger.info(
             f"{outer_step:>5} | {l_outer:>10.3f} | {agent_len:>10.1f} | "
             f"{expert_len:>10.1f} | {agent_ret:>10.1f} | {expert_ret:>10.1f} | "
             f"{rank_corr_val:>9.3f} | {policy_nll_val:>10.3f} | "
             f"{raw_hypgrad_norm:>10.3f} | {clipped_hypgrad_norm:>10.3f} | "
             f"{lr_outer_current:>12.2e}"
         )
-
-        logger.info(row)
 
         logger.info(
             "   [reward] "
@@ -482,7 +490,6 @@ def train_bilevel(config: dict, logger) -> dict:
         f"{'RankCorr':>9} | {'PolicyNLL':>10} | {'hyp_raw':>10} | "
         f"{'hyp_clip':>10} | {'lr_outer':>12}"
     )
-
     logger.info(header)
 
     for outer_step in range(1, n_outer_steps + 1):
@@ -492,22 +499,28 @@ def train_bilevel(config: dict, logger) -> dict:
             policy,
             n_agent_trajs,
             deterministic=False,
-            desc="agent outer trajs",
+            desc="agent train trajs",
             verbose=True
         )
         log_and_checkpoint(outer_step, agent_train_trajs)
 
         if outer_step < n_outer_steps:
-            # outer_optimizer.sweep_sketch_sizes(
-            #     expert_train_trajs,
-            #     agent_train_trajs,
-            #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024],
-            #     compare_hypergradients=True
-            # )
+            outer_optimizer.sweep_sketch_sizes(
+                expert_train_trajs,
+                agent_train_trajs,
+                [16, 32, 64, 128, 256, 512],
+                compare_hypergradients=True
+            )
             # outer_optimizer.sweep_n_agent_trajs(
             #     expert_train_trajs,
             #     agent_train_trajs,
-            #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+            #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+            #     verbose=True
+            # )
+            # outer_optimizer.compare_agent_trajectory_sets(
+            #     expert_train_trajs,
+            #     agent_train_trajs[:n_agent_trajs//2],
+            #     agent_train_trajs[n_agent_trajs//2:],
             #     verbose=True
             # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
@@ -539,7 +552,7 @@ def main() -> None:
 
     mlflow.set_experiment("fisher")
     with mlflow.start_run(run_name="hopper"):
-        history = train_bilevel(config, logger)
+        history = train_fisher(config, logger)
 
     report_path = Path(log_cfg["report_dir"]) / "fisher_sac_hopper_history.json"
     save_history(history, str(report_path))

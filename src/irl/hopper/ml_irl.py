@@ -166,23 +166,6 @@ class Policy(nn.Module):
         return actions, log_probs
 
 
-def sample_trajectories(trajectories: list[dict], n: int) -> list[dict]:
-    """
-    Sample trajectories without replacement.
-    """
-    if n <= 0:
-        raise ValueError("The number of trajectories must be positive.")
-
-    if len(trajectories) == 0:
-        raise ValueError("The trajectory dataset is empty.")
-
-    if n >= len(trajectories):
-        return trajectories
-
-    indices = np.random.choice(len(trajectories), size=n, replace=False)
-    return [trajectories[int(index)] for index in indices]
-
-
 def train_ml_irl(config: dict, logger) -> dict:
     ml_irl_cfg = config["ml_irl"]
     inner_cfg = ml_irl_cfg["inner"]
@@ -321,34 +304,11 @@ def train_ml_irl(config: dict, logger) -> dict:
             # validate_fn=validate,
             validate_every=int(inner_cfg["validate_every"]),
         )
-    
-    history = {
-        "l_outer": [],
-        "l_inner": [],
-        "agent_len": [],
-        "expert_len": [],
-        "agent_return": [],
-        "expert_return": [],
-        "rank_corr": [],
-        "policy_nll": [],
-        "reward_loss": [],
-        "expert_mean_reward": [],
-        "agent_mean_reward": [],
-        "raw_reward_grad_norm": [],
-        "clipped_reward_grad_norm": [],
-        "lr_reward": [],
-        "expert_learned_return": [],
-        "random_learned_return": [],
-        "expert_learned_step_mean": [],
-        "random_learned_step_mean": [],
-    }
 
     checkpoint_dir = Path(checkpoint_cfg["dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    latest_checkpoint_path = str(checkpoint_dir / "ml_irl.pt")
-    best_checkpoint_path = str(checkpoint_dir / "ml_irl_best_env_reward.pt")
-
+    best_checkpoint_path = str(checkpoint_dir / "ml_irl.pt")
     best_env_reward = float("-inf")
 
     arch = {
@@ -396,7 +356,28 @@ def train_ml_irl(config: dict, logger) -> dict:
         }
     )
 
-    def log_and_checkpoint(outer_step: int, agent_trajs, reward_updated: bool) -> None:
+    history = {
+        "l_outer": [],
+        "l_inner": [],
+        "agent_len": [],
+        "expert_len": [],
+        "agent_return": [],
+        "expert_return": [],
+        "rank_corr": [],
+        "policy_nll": [],
+        "reward_loss": [],
+        "expert_mean_reward": [],
+        "agent_mean_reward": [],
+        "raw_reward_grad_norm": [],
+        "clipped_reward_grad_norm": [],
+        "lr_reward": [],
+        "expert_learned_return": [],
+        "random_learned_return": [],
+        "expert_learned_step_mean": [],
+        "random_learned_step_mean": [],
+    }
+
+    def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_env_reward
 
         l_outer_value = float(outer_loss(policy, expert_valid_trajs, sac.gamma))
@@ -421,20 +402,12 @@ def train_ml_irl(config: dict, logger) -> dict:
         expert_step_mean = float(expert_reward_stats["step_mean"])
         random_step_mean = float(random_reward_stats["step_mean"])
 
-        if reward_updated:
-            reward_stats = outer_optimizer.stats()
-
-            reward_loss = float(reward_stats["reward_loss"])
-            expert_mean_reward = float(reward_stats["expert_learned_return"])
-            agent_mean_reward = float(reward_stats["agent_learned_return"])
-            raw_grad_norm = float(reward_stats["reward_grad_raw"])
-            clipped_grad_norm = float(reward_stats["reward_grad_clipped"])
-        else:
-            reward_loss = float("nan")
-            expert_mean_reward = float("nan")
-            agent_mean_reward = float("nan")
-            raw_grad_norm = 0.0
-            clipped_grad_norm = 0.0
+        reward_stats = outer_optimizer.stats()
+        reward_loss = float(reward_stats["reward_loss"])
+        expert_mean_reward = float(reward_stats["expert_learned_return"])
+        agent_mean_reward = float(reward_stats["agent_learned_return"])
+        raw_grad_norm = float(reward_stats["reward_grad_raw"])
+        clipped_grad_norm = float(reward_stats["reward_grad_clipped"])
 
         lr_reward = float(outer_optimizer.lr)
 
@@ -457,11 +430,16 @@ def train_ml_irl(config: dict, logger) -> dict:
         history["expert_learned_step_mean"].append(expert_step_mean)
         history["random_learned_step_mean"].append(random_step_mean)
 
-        save_checkpoint(path=latest_checkpoint_path, policy=policy, reward=reward, arch=arch, outer_step=outer_step, agent_return=agent_return, l_outer=l_outer_value)
-
         if agent_return > best_env_reward:
             best_env_reward = agent_return
-            save_checkpoint(path=best_checkpoint_path, policy=policy, reward=reward, arch=arch, outer_step=outer_step, best_env_reward=best_env_reward)
+            save_checkpoint(
+                path=best_checkpoint_path,
+                policy=policy,
+                reward=reward,
+                arch=arch,
+                outer_step=outer_step,
+                best_env_reward=best_env_reward
+            )
 
         logger.info(
             f"{outer_step:>5} | "
@@ -501,21 +479,21 @@ def train_ml_irl(config: dict, logger) -> dict:
             "reward/random_return": random_learned_return_valid,
             "reward/expert_step_mean": expert_step_mean,
             "reward/random_step_mean": random_step_mean,
+            "reward_loss": (reward_loss),
+            "expert_mean_reward": (expert_mean_reward),
+            "agent_mean_reward": (agent_mean_reward),
+            "expert_agent_reward_diff": (expert_mean_reward - agent_mean_reward),
         }
-
-        if reward_updated:
-            metrics.update(
-                {
-                    "reward_loss": (reward_loss),
-                    "expert_mean_reward": (expert_mean_reward),
-                    "agent_mean_reward": (agent_mean_reward),
-                    "expert_agent_reward_diff": (expert_mean_reward - agent_mean_reward),
-                }
-            )
-
         mlflow.log_metrics(metrics, step=outer_step)
 
-        # record_policy_video(env, policy, "videos/hopper/ml_irl/", name_prefix=f"outer_{outer_step}", deterministic=False, device=device)
+        # record_policy_video(
+        #     env,
+        #     policy,
+        #     "videos/hopper/ml_irl/",
+        #     name_prefix=f"outer_{outer_step}",
+        #     deterministic=False,
+        #     device=device
+        # )
 
     header = (
         f"{'Step':>5} | "
@@ -542,7 +520,7 @@ def train_ml_irl(config: dict, logger) -> dict:
             desc="agent trajectories",
             verbose=True
         )
-        log_and_checkpoint(outer_step, agent_train_trajs, reward_updated=True)
+        log_and_checkpoint(outer_step, agent_train_trajs)
 
         if outer_step < n_outer_steps:
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)

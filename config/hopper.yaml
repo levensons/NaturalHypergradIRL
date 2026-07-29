@@ -55,15 +55,15 @@ fisher:
   n_outer_steps: 1000
   n_inner_steps: 100000
 
-  n_agent_trajs: 20000
+  n_agent_trajs: 5000
 
   alpha: 0.2
   gamma: 0.99
 
-  fisher_reg: 1.0
-  fisher_sketch_size: 32
+  fisher_reg: 1e-6
+  fisher_sketch_size: 64
 
-  lr_reward: 1.0
+  lr_reward: 1e-3
   max_grad_norm: null
   scheduler_gamma: 1.0
 

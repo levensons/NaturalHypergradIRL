@@ -160,6 +160,10 @@ class SAC:
 
         self.global_gradient_update_step = 0
 
+    def reset_optimizers(self):
+        self.policy_optimizer.state.clear()
+        self.critic_optimizer.state.clear()
+
     def collect_random_rollout(self, env: Environment, n_steps: int):
         state = env.reset()
 
