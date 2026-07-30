@@ -21,7 +21,30 @@ from src.utils.sb3 import load_sb3_model, normalize_sb3_load_path
 from src.utils.trajectories import mean_trajectory_length, mean_trajectory_return
 from src.utils.policies import Policy, RandomPolicy, SB3PolicyWrapper
 from src.utils.env import Environment
+from src.irl.lqr.env import LQR
 
+
+def create_expert_env(env_cfg: dict, seed: int):
+    env_name = env_cfg["name"].lower()
+
+    if env_name == "lqr":
+        lqr = LQR(
+            A=env_cfg["A"],
+            B=env_cfg["B"],
+            Q=env_cfg["Q"],
+            R=env_cfg["R"],
+            process_cov=env_cfg["process_cov"],
+            initial_cov=env_cfg["initial_cov"],
+            max_episode_steps=int(env_cfg["max_steps"]),
+            action_limit=float(env_cfg["action_limit"]),
+            observation_limit=env_cfg["observation_limit"],
+            termination_state_norm=env_cfg["termination_state_norm"],
+            reward_scale=float(env_cfg["reward_scale"]),
+            seed=seed,
+        )
+        return lqr
+
+    return Environment(env_cfg["id"], seed, int(env_cfg["max_steps"]))
 
 def save_trajectories(path: Path, trajectories) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +58,7 @@ def save_trajectories(path: Path, trajectories) -> None:
 
 
 def collect_and_save(
-    env: Environment,
+    env: Environment | LQR,
     policy: Policy,
     output_path: Path,
     n_trajectories: int,
@@ -75,7 +98,7 @@ def collect_all_from_config(config: dict, overwrite: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     set_random_seed(split_cfg["random_seed"])
-    env = Environment(env_id, split_cfg["env_seed"], max_steps)
+    env = create_expert_env(env_cfg, split_cfg["env_seed"])
 
     expert_algo = expert_cfg["algo"].lower()
     expert_path = normalize_sb3_load_path(expert_cfg["save_path"])
@@ -173,7 +196,7 @@ def parse():
     parser.add_argument(
         "--env",
         type=str,
-        choices=["hopper", "cartpole", "pendulum"],
+        choices=["hopper", "cartpole", "lqr"],
         default=None,
         help="Environment name. Used to load config/<env>.yaml.",
     )
