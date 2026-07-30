@@ -1,16 +1,15 @@
 """
-ML-IRL with SAC inner agent for Hopper.
+ML-IRL with SAC inner agent for LQR.
 
 Usage:
-    python -m src.irl.hopper.ml_irl
-    python -m src.irl.hopper.ml_irl --config configs/hopper.yaml
+    python -m src.irl.lqr.ml_irl
+    python -m src.irl.lqr.ml_irl --config configs/lqr.yaml
 """
 
 import argparse
 from pathlib import Path
 
 import mlflow
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -21,7 +20,7 @@ from src.evaluation.video import record_policy_video
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
-from src.utils.env import Environment
+from src.irl.lqr.env import LQR
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
@@ -181,11 +180,20 @@ def train_ml_irl(config: dict, logger) -> dict:
         raise ValueError("Expected ml_irl.inner.type = sac, " f"got {inner_cfg['type']}.")
 
     set_random_seed(int(ml_irl_cfg["random_seed"]))
-    env = Environment(
-        env_cfg["id"],
-        ml_irl_cfg["env_seed"],
-        env_cfg["max_steps"],
-        render_mode="rgb_array"
+    env = LQR(
+        A=env_cfg["A"],
+        B=env_cfg["B"],
+        Q=env_cfg["Q"],
+        R=env_cfg["R"],
+        process_cov=env_cfg["process_cov"],
+        initial_cov=env_cfg["initial_cov"],
+        max_episode_steps=int(env_cfg["max_steps"]),
+        action_limit=float(env_cfg["action_limit"]),
+        observation_limit=env_cfg["observation_limit"],
+        termination_state_norm=env_cfg["termination_state_norm"],
+        reward_scale=float(env_cfg["reward_scale"]),
+        seed=int(ml_irl_cfg["env_seed"]),
+        custom_reward_fn=None,
     )
 
     device = torch.device("cpu")
@@ -257,8 +265,36 @@ def train_ml_irl(config: dict, logger) -> dict:
         replay_buffer_capacity=int(sac_cfg["replay_buffer_capacity"]),
     )
 
-    sac_train_env = Environment(env_cfg["id"], int(inner_cfg["train_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
-    sac_eval_env = Environment(env_cfg["id"], int(inner_cfg["eval_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
+    sac_train_env = LQR(
+        A=env_cfg["A"],
+        B=env_cfg["B"],
+        Q=env_cfg["Q"],
+        R=env_cfg["R"],
+        process_cov=env_cfg["process_cov"],
+        initial_cov=env_cfg["initial_cov"],
+        max_episode_steps=int(env_cfg["max_steps"]),
+        action_limit=float(env_cfg["action_limit"]),
+        observation_limit=env_cfg["observation_limit"],
+        termination_state_norm=env_cfg["termination_state_norm"],
+        reward_scale=float(env_cfg["reward_scale"]),
+        seed=int(inner_cfg["train_env_seed"]),
+        custom_reward_fn=None,
+    )
+    sac_eval_env = LQR(
+        A=env_cfg["A"],
+        B=env_cfg["B"],
+        Q=env_cfg["Q"],
+        R=env_cfg["R"],
+        process_cov=env_cfg["process_cov"],
+        initial_cov=env_cfg["initial_cov"],
+        max_episode_steps=int(env_cfg["max_steps"]),
+        action_limit=float(env_cfg["action_limit"]),
+        observation_limit=env_cfg["observation_limit"],
+        termination_state_norm=env_cfg["termination_state_norm"],
+        reward_scale=float(env_cfg["reward_scale"]),
+        seed=int(inner_cfg["eval_env_seed"]),
+        custom_reward_fn=None,
+    )
 
     # sac.replay_buffer.extend_from_trajectories(expert_train_trajs)
     sac.replay_buffer.extend_from_trajectories(random_train_trajs)
@@ -305,7 +341,7 @@ def train_ml_irl(config: dict, logger) -> dict:
             target_update_interval=int(sac_cfg["target_update_interval"]),
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
-            # validate_fn=validate,
+            validate_fn=validate,
             validate_every=int(inner_cfg["validate_every"]),
         )
 
@@ -493,7 +529,7 @@ def train_ml_irl(config: dict, logger) -> dict:
         # record_policy_video(
         #     env,
         #     policy,
-        #     "videos/hopper/ml_irl/",
+        #     "videos/lqr/ml_irl/",
         #     name_prefix=f"outer_{outer_step}",
         #     deterministic=False,
         #     device=device
@@ -536,7 +572,7 @@ def train_ml_irl(config: dict, logger) -> dict:
 
 
 def parse() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=("ML-IRL with SAC — Hopper"))
+    parser = argparse.ArgumentParser(description=("ML-IRL with SAC — LQR"))
     parser.add_argument("--config", default=None)
     return parser.parse_args()
 
@@ -544,20 +580,20 @@ def parse() -> argparse.Namespace:
 def main() -> None:
     args = parse()
 
-    config_path = resolve_config_path("hopper", args.config)
+    config_path = resolve_config_path("lqr", args.config)
     config = load_config(config_path)
 
     log_cfg = config["logging"]
 
-    logger = get_logger("ml_irl_hopper", log_dir=log_cfg["log_dir"])
-    logger.info("=== ML-IRL Hopper SAC ===")
+    logger = get_logger("ml_irl_lqr", log_dir=log_cfg["log_dir"])
+    logger.info("=== ML-IRL LQR SAC ===")
 
     mlflow.set_experiment("ml_irl")
 
-    with mlflow.start_run(run_name="hopper"):
+    with mlflow.start_run(run_name="lqr"):
         history = train_ml_irl(config, logger)
 
-    report_path = Path(log_cfg["report_dir"]) / "ml_irl_sac_hopper_history.json"
+    report_path = Path(log_cfg["report_dir"]) / "ml_irl_sac_lqr_history.json"
 
     save_history(history, str(report_path))
 
