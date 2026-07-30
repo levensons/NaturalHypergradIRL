@@ -267,18 +267,18 @@ def train_fisher(config: dict, logger) -> dict:
     # sac.replay_buffer.extend_from_trajectories(expert_train_trajs)
     sac.replay_buffer.extend_from_trajectories(random_train_trajs)
 
-    policy_state = torch.nn.utils.parameters_to_vector(policy.parameters()).detach().clone()
+    policy_state = torch.nn.utils.parameters_to_vector(sac.policy.parameters()).detach().clone()
     q1_state = torch.nn.utils.parameters_to_vector(sac.q1.parameters()).detach().clone()
     q2_state = torch.nn.utils.parameters_to_vector(sac.q2.parameters()).detach().clone()
 
     def inner_optimize(outer_step: int):
-        policy.train()
+        sac.policy.train()
         
         current_reward_fn = reward.as_fn()
         sac_train_env.custom_reward_fn = current_reward_fn
         sac.replay_buffer.recalc_rewards(current_reward_fn)
         sac.reset_optimizers()
-        torch.nn.utils.vector_to_parameters(policy_state.clone(), policy.parameters())
+        torch.nn.utils.vector_to_parameters(policy_state.clone(), sac.policy.parameters())
         torch.nn.utils.vector_to_parameters(q1_state.clone(), sac.q1.parameters())
         torch.nn.utils.vector_to_parameters(q2_state.clone(), sac.q2.parameters())
         sac.q1_target.load_state_dict(sac.q1.state_dict())
@@ -505,12 +505,12 @@ def train_fisher(config: dict, logger) -> dict:
         log_and_checkpoint(outer_step, agent_train_trajs)
 
         if outer_step < n_outer_steps:
-            outer_optimizer.sweep_sketch_sizes(
-                expert_train_trajs,
-                agent_train_trajs,
-                [16, 32, 64, 128, 256, 512],
-                compare_hypergradients=True
-            )
+            # outer_optimizer.sweep_sketch_sizes(
+            #     expert_train_trajs,
+            #     agent_train_trajs,
+            #     [16, 32, 64, 128, 256, 512],
+            #     compare_hypergradients=True
+            # )
             # outer_optimizer.sweep_n_agent_trajs(
             #     expert_train_trajs,
             #     agent_train_trajs,
@@ -518,6 +518,12 @@ def train_fisher(config: dict, logger) -> dict:
             #     verbose=True
             # )
             # outer_optimizer.compare_agent_trajectory_sets(
+            #     expert_train_trajs,
+            #     agent_train_trajs[:n_agent_trajs//2],
+            #     agent_train_trajs[n_agent_trajs//2:],
+            #     verbose=True
+            # )
+            # outer_optimizer.compare_agent_trajectory_sets_with_sketching(
             #     expert_train_trajs,
             #     agent_train_trajs[:n_agent_trajs//2],
             #     agent_train_trajs[n_agent_trajs//2:],

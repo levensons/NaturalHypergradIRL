@@ -63,7 +63,7 @@ fisher:
   fisher_reg: 1e-6
   fisher_sketch_size: 64
 
-  lr_reward: 1e-3
+  lr_reward: 1e-6
   max_grad_norm: null
   scheduler_gamma: 1.0
 
@@ -73,8 +73,8 @@ fisher:
     train_env_seed: 100
     eval_env_seed: 101
 
-    validate_every: 1000
-    n_agent_eval_trajs: 3
+    validate_every: 10000
+    n_agent_eval_trajs: 10
 
     params:
       gradient_update_steps: 1
@@ -82,7 +82,7 @@ fisher:
       q_hidden_dim: 256
       q_n_hidden_layers: 2
       max_grad_norm: null
-      critic_lr: 1e-3
+      critic_lr: 1e-4
       actor_lr: 1e-4
       batch_size: 256
       replay_buffer_capacity: 1000000
