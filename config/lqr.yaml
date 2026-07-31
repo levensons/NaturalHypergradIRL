@@ -132,7 +132,7 @@ ml_irl:
   random_seed: 42
   env_seed: 42
 
-  n_outer_steps: 500
+  n_outer_steps: 1000
   n_inner_steps: 5000
 
   n_agent_trajs: 1000
@@ -140,7 +140,7 @@ ml_irl:
   alpha: 0.1
   gamma: 0.99
 
-  lr_reward: 1e-3
+  lr_reward: 1e-4
   max_grad_norm: 1.0
 
   inner:
