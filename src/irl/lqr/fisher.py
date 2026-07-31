@@ -13,10 +13,9 @@ import mlflow
 import torch
 import torch.nn as nn
 
-from src.algorithms.sac import SAC
 from src.algorithms.fisher_nhd import FisherNHD
+from src.algorithms.sac import SAC
 from src.evaluation.metrics import outer_loss, policy_nll, rank_corr, inner_loss, learned_reward_stats
-from src.evaluation.video import record_policy_video
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
@@ -86,9 +85,9 @@ class Policy(nn.Module):
         action_low: float,
         action_high: float,
         hidden_dim: int = 64,
-        n_hidden_layers: int = 1,
-        log_std_min: float = -20,
-        log_std_max: float = 2,
+        n_hidden_layers: int = 2,
+        log_std_min: float = -10,
+        log_std_max: float = 1,
     ):
         super().__init__()
 
@@ -251,6 +250,7 @@ def train_fisher(config: dict, logger) -> dict:
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
         sketch_size=int(fisher_cfg["fisher_sketch_size"]),
+        fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
     )
 
     sac = SAC(
@@ -342,6 +342,7 @@ def train_fisher(config: dict, logger) -> dict:
                     f"sac_{outer_step}/l_outer": l_outer,
                     f"sac_{outer_step}/env_return": float(mean_trajectory_return(agent_valid_trajs)),
                     f"sac_{outer_step}/length": float(mean_trajectory_length(agent_valid_trajs)),
+                    f"sac_{outer_step}/learned_return": float(learned_reward_stats(reward, agent_valid_trajs)["return_mean"]),
                     f"sac_{outer_step}/inner_grad_norm": grad_norm.item(),
                     f"sac_{outer_step}/inner_grad_rms": grad_rms.item(),
                     f"sac_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
@@ -508,14 +509,6 @@ def train_fisher(config: dict, logger) -> dict:
             step=outer_step,
         )
 
-        # record_policy_video(
-        #     env,
-        #     policy,
-        #     video_dir=f"videos/lqr/fisher/",
-        #     name_prefix=f"outer_{outer_step}",
-        #     deterministic=False,
-        # )
-
     header = (
         f"{'Step':>5} | {'L_outer':>10} | {'agent_len':>10} | "
         f"{'expert_len':>10} | {'agent_ret':>10} | {'expert_ret':>10} | "
@@ -540,10 +533,16 @@ def train_fisher(config: dict, logger) -> dict:
             # outer_optimizer.sweep_sketch_sizes(
             #     expert_train_trajs,
             #     agent_train_trajs,
-            #     [16, 32, 64, 128, 256, 512],
+            #     [4, 8, 16, 32, 64, 128, 256, 512],
             #     compare_hypergradients=True
             # )
             # outer_optimizer.sweep_n_agent_trajs(
+            #     expert_train_trajs,
+            #     agent_train_trajs,
+            #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+            #     verbose=True,
+            # )
+            # outer_optimizer.sweep_n_agent_trajs_with_sketching(
             #     expert_train_trajs,
             #     agent_train_trajs,
             #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],

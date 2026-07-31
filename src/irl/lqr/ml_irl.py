@@ -16,7 +16,6 @@ import torch.nn as nn
 from src.algorithms.ml_irl import MLIRL
 from src.algorithms.sac import SAC
 from src.evaluation.metrics import inner_loss, learned_reward_stats, outer_loss, policy_nll, rank_corr
-from src.evaluation.video import record_policy_video
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
@@ -86,9 +85,9 @@ class Policy(nn.Module):
         action_low: float,
         action_high: float,
         hidden_dim: int = 64,
-        n_hidden_layers: int = 1,
-        log_std_min: float = -20,
-        log_std_max: float = 2,
+        n_hidden_layers: int = 2,
+        log_std_min: float = -10,
+        log_std_max: float = 1,
     ):
         super().__init__()
 
@@ -525,15 +524,6 @@ def train_ml_irl(config: dict, logger) -> dict:
             "expert_agent_reward_diff": (expert_mean_reward - agent_mean_reward),
         }
         mlflow.log_metrics(metrics, step=outer_step)
-
-        # record_policy_video(
-        #     env,
-        #     policy,
-        #     "videos/lqr/ml_irl/",
-        #     name_prefix=f"outer_{outer_step}",
-        #     deterministic=False,
-        #     device=device
-        # )
 
     header = (
         f"{'Step':>5} | "
