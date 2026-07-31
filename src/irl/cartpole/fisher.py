@@ -11,153 +11,19 @@ from pathlib import Path
 
 import mlflow
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions import Categorical
 
+from src.utils.env import Environment
+from src.irl.cartpole.models import Reward, Policy
 from src.algorithms.reinforce import REINFORCE
 from src.algorithms.fisher_nhd import FisherNHD
-from src.evaluation.metrics import (
-    inner_loss,
-    outer_loss,
-    policy_nll,
-    rank_corr,
-    learned_reward_stats,
-)
+from src.evaluation.metrics import inner_loss, learned_reward_stats, outer_loss, policy_nll, rank_corr
 from src.utils.checkpoint import save_checkpoint
 from src.utils.config import load_config, resolve_config_path
 from src.utils.data import load_trajectories
-from src.utils.env import Environment
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed
-from src.utils.trajectories import (
-    collect_trajectories,
-    mean_trajectory_length,
-    mean_trajectory_return,
-)
+from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 from src.evaluation.video import record_policy_video
-
-
-class Reward(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        n_hidden_layers: int = 2,
-        hidden_dim: int = 64,
-        clamp_magnitude: float = 10.0,
-    ):
-        super().__init__()
-
-        self.action_dim = int(action_dim)
-        self.clamp_magnitude = float(clamp_magnitude)
-
-        layers = []
-        in_dim = state_dim + action_dim
-
-        for _ in range(n_hidden_layers):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            in_dim = hidden_dim
-
-        layers.append(nn.Linear(in_dim, 1))
-        self.net = nn.Sequential(*layers)
-
-    def _prepare_actions(self, actions: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        actions = torch.as_tensor(actions, device=actions.device)
-
-        if actions.ndim > 0 and actions.shape[-1] == 1:
-            actions = actions.squeeze(-1)
-
-        actions = actions.long()
-        return F.one_hot(actions, num_classes=self.action_dim).to(dtype=dtype)
-
-    def forward(self,states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        actions_one_hot = self._prepare_actions(actions, states.dtype)
-        out = torch.cat([states, actions_one_hot], dim=-1)
-        out = self.net(out)
-        out = torch.clamp(out, -self.clamp_magnitude, self.clamp_magnitude)
-        out = out.squeeze(-1)
-        return out  # (B,)
-
-    def rewards(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.forward(states, actions)
-
-    def trajectory_return(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        return self.forward(states, actions).sum()
-
-    def as_fn(self):
-        def reward_fn(states: torch.Tensor, actions: torch.Tensor):
-            device = next(self.parameters()).device
-            was_training = self.training
-
-            if was_training:
-                self.eval()
-
-            with torch.no_grad():
-                states_device = torch.as_tensor(
-                    states,
-                    dtype=torch.float32,
-                    device=device,
-                )
-                actions_device = torch.as_tensor(actions, device=device)
-                out = self.rewards(states_device, actions_device)
-                return out
-
-            if was_training:
-                self.train()
-
-        return reward_fn
-
-
-class Policy(nn.Module):
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dim: int = 64,
-        n_hidden_layers: int = 1,
-    ):
-        super().__init__()
-
-        layers = []
-        in_dim = state_dim
-
-        for _ in range(n_hidden_layers):
-            layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            in_dim = hidden_dim
-
-        layers.append(nn.Linear(in_dim, action_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
-        return self.net(states)
-
-    def action_distribution(self, states: torch.Tensor) -> Categorical:
-        return Categorical(logits=self.forward(states))
-
-    def log_prob(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        if actions.ndim > 0 and actions.shape[-1] == 1:
-            actions = actions.squeeze(-1)
-
-        dist = self.action_distribution(states)
-        log_probs = dist.log_prob(actions.long())
-        return log_probs
-
-    def sample(
-        self,
-        states: torch.Tensor,
-        deterministic: bool = False,
-        return_log_probs: bool = False,
-    ):
-        dist = self.action_distribution(states)
-        actions = torch.argmax(dist.logits, dim=-1) if deterministic else dist.sample()
-
-        if not return_log_probs:
-            return actions
-
-        return actions, dist.log_prob(actions)
 
 
 def train_fisher(config: dict, logger) -> dict:
@@ -238,94 +104,62 @@ def train_fisher(config: dict, logger) -> dict:
         alpha=float(fisher_cfg["alpha"]),
     )
 
-    train_env = Environment(env_cfg["id"], int(inner_cfg["train_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
-    eval_env = Environment(env_cfg["id"], int(inner_cfg["eval_env_seed"]), int(env_cfg["max_steps"]), custom_reward_fn=None)
-
-    policy_state = torch.nn.utils.parameters_to_vector(policy.parameters()).clone().detach()
+    reinforce_train_env = Environment(
+        env_cfg["id"],
+        int(inner_cfg["train_env_seed"]),
+        int(env_cfg["max_steps"]),
+        custom_reward_fn=None,
+    )
+    reinforce_eval_env = Environment(
+        env_cfg["id"],
+        int(inner_cfg["eval_env_seed"]),
+        int(env_cfg["max_steps"]),
+        custom_reward_fn=None,
+    )
 
     def inner_optimize(outer_step: int):
         policy.train()
 
         current_reward_fn = reward.as_fn()
-        train_env.custom_reward_fn = current_reward_fn
-
-        torch.nn.utils.vector_to_parameters(policy_state.clone().detach(), policy.parameters())
-        reinforce.reset_policy_optimizer()
+        reinforce_train_env.custom_reward_fn = current_reward_fn
+        reinforce.reset_policy()
 
         def validate(ts):
             policy.eval()
 
-            agent_eval_trajs = collect_trajectories(
-                env=eval_env,
+            agent_valid_trajs = collect_trajectories(
+                env=reinforce_eval_env,
                 policy=policy,
                 n=inner_cfg["n_agent_eval_trajs"],
                 deterministic=False,
                 verbose=False,
             )
 
-            l_inner = inner_loss(
-                policy=policy,
-                reward=reward,
-                trajs=agent_eval_trajs,
-                gamma=reinforce.gamma,
-                alpha=reinforce.alpha,
-            )
-            l_outer_value = outer_loss(
-                policy=policy,
-                expert_trajs=expert_valid_trajs,
-                gamma=reinforce.gamma,
-            )
+            l_inner = inner_loss(reinforce.policy, reward, agent_valid_trajs, reinforce.gamma, reinforce.alpha)
 
-            inner_grad = outer_optimizer.d_inner_d_policy(
-                agent_eval_trajs,
-                verbose=False,
-            )
+            l_outer_value = outer_loss(policy, expert_valid_trajs, reinforce.gamma)
 
-            grad_norm = inner_grad.norm()
-            grad_rms = grad_norm / inner_grad.numel() ** 0.5
-            grad_abs_max = inner_grad.abs().max()
-            policy_vector = torch.nn.utils.parameters_to_vector(policy.parameters()).detach()
-
-            grad_relative = (grad_norm / policy_vector.norm().clamp_min(1e-12))
-
-            with torch.no_grad():
-                all_states = torch.cat([traj["states"].to(device=device, dtype=torch.float32) for traj in agent_eval_trajs], dim=0)
-
-                dist = policy.action_distribution(all_states)
-                probs = dist.probs  # (N_states, action_dim)
-
-                policy_entropy = dist.entropy().mean()
-                max_action_prob = probs.max(dim=-1).values.mean()
-
-                deterministic_fraction_95 = (probs.max(dim=-1).values > 0.95).float().mean()
-
-                deterministic_fraction_99 = (probs.max(dim=-1).values > 0.99).float().mean()
-
-                action_0_prob = probs[:, 0].mean()
-                action_1_prob = probs[:, 1].mean()
+            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
+            grad_norm = l_inner_grad.norm()
+            grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
+            grad_abs_max = l_inner_grad.abs().max()
 
             mlflow.log_metrics(
                 {
                     f"reinforce_{outer_step}/l_inner": float(l_inner),
                     f"reinforce_{outer_step}/l_outer": float(l_outer_value),
-                    f"reinforce_{outer_step}/env_return": float(mean_trajectory_return(agent_eval_trajs)),
-                    f"reinforce_{outer_step}/length": float(mean_trajectory_length(agent_eval_trajs)),
+                    f"reinforce_{outer_step}/env_return": float(mean_trajectory_return(agent_valid_trajs)),
+                    f"reinforce_{outer_step}/length": float(mean_trajectory_length(agent_valid_trajs)),
+                    f"reinforce_{outer_step}/learned_return": float(learned_reward_stats(reward, agent_valid_trajs)["return_mean"]),
                     f"reinforce_{outer_step}/inner_grad_norm": grad_norm.item(),
                     f"reinforce_{outer_step}/inner_grad_rms": grad_rms.item(),
                     f"reinforce_{outer_step}/inner_grad_abs_max": grad_abs_max.item(),
-                    f"reinforce_{outer_step}/inner_grad_relative": grad_relative.item(),
-                    f"reinforce_{outer_step}/policy_entropy": policy_entropy.item(),
-                    f"reinforce_{outer_step}/max_action_prob": max_action_prob.item(),
-                    f"reinforce_{outer_step}/deterministic_fraction_95": deterministic_fraction_95.item(),
-                    f"reinforce_{outer_step}/deterministic_fraction_99": deterministic_fraction_99.item(),
-                    f"reinforce_{outer_step}/action_0_prob": action_0_prob.item(),
-                    f"reinforce_{outer_step}/action_1_prob": action_1_prob.item(),
                 },
                 step=ts,
             )
 
         reinforce.optimize(
-            train_env=train_env,
+            train_env=reinforce_train_env,
             total_steps=n_inner_steps,
             n_traj_per_update=int(reinforce_cfg["n_traj_per_update"]),
             max_grad_norm=reinforce_cfg["max_grad_norm"],
@@ -349,8 +183,7 @@ def train_fisher(config: dict, logger) -> dict:
             "lr_reward": fisher_cfg["lr_reward"],
             "lr_policy": reinforce_cfg["lr_policy"],
             "fisher_reg": fisher_cfg["fisher_reg"],
-            "use_sketch": fisher_cfg.get("use_sketch", True),
-            "sketch_size": fisher_cfg.get("sketch_size", 64),
+            "sketch_size": fisher_cfg["sketch_size"],
             "n_outer_steps": n_outer_steps,
             "n_inner_steps": n_inner_steps,
             "n_agent_trajs": n_agent_trajs,
@@ -514,23 +347,11 @@ def train_fisher(config: dict, logger) -> dict:
             #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
             #     compare_hypergradients=True
             # )
-            # outer_optimizer.sweep_n_agent_trajs(
-            #     expert_train_trajs,
-            #     agent_train_trajs,
-            #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
-            #     verbose=True
-            # )
-            # outer_optimizer.compare_agent_trajectory_sets(
-            #     expert_train_trajs,
-            #     agent_train_trajs[:n_agent_trajs//2],
-            #     agent_train_trajs[n_agent_trajs//2:],
-            #     verbose=True
-            # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
 
     env.close()
-    train_env.close()
-    eval_env.close()
+    reinforce_train_env.close()
+    reinforce_eval_env.close()
     return history
 
 
