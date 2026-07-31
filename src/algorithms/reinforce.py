@@ -25,10 +25,19 @@ class REINFORCE:
 
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters())
 
-    def reset_policy_optimizer(self):
+    def reset_policy(self):
+        if not hasattr(self.policy, "reset_parameters"):
+            raise TypeError("Policy must implement reset_parameters().")
+
+        self.policy.reset_parameters()
+        self.policy_optimizer.zero_grad()
         self.policy_optimizer.state.clear()
 
-    def gradient(self, trajs) -> torch.Tensor:
+    def reset_policy_optimizer(self):
+        self.policy_optimizer.zero_grad()
+        self.policy_optimizer.state.clear()
+
+    def policy_gradient(self, trajs) -> torch.Tensor:
         device = next(self.policy.parameters()).device
         policy_params = list(self.policy.parameters())
 
@@ -85,7 +94,7 @@ class REINFORCE:
                 verbose=False,
             )
 
-            gradient = self.gradient(trajs)
+            gradient = self.policy_gradient(trajs)
 
             self.raw_grad_norm = float(gradient.norm().item())
             if max_grad_norm is not None and self.raw_grad_norm > max_grad_norm:
