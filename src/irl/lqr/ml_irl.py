@@ -340,7 +340,7 @@ def train_ml_irl(config: dict, logger) -> dict:
             target_update_interval=int(sac_cfg["target_update_interval"]),
             critic_lr=float(sac_cfg["critic_lr"]),
             actor_lr=float(sac_cfg["actor_lr"]),
-            validate_fn=validate,
+            # validate_fn=validate,
             validate_every=int(inner_cfg["validate_every"]),
         )
 

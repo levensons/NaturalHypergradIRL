@@ -110,6 +110,11 @@ class Policy(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
+    def reset_parameters(self):
+        for layer in self.modules():
+            if layer is not self and hasattr(layer, "reset_parameters"):
+                layer.reset_parameters()
+
     def forward(self, states: torch.Tensor):
         x = self.backbone(states)
         mean = self.mean_head(x)  # (B, action_dim)
@@ -299,22 +304,15 @@ def train_fisher(config: dict, logger) -> dict:
     # sac.replay_buffer.extend_from_trajectories(expert_train_trajs)
     sac.replay_buffer.extend_from_trajectories(random_train_trajs)
 
-    policy_state = torch.nn.utils.parameters_to_vector(sac.policy.parameters()).detach().clone()
-    q1_state = torch.nn.utils.parameters_to_vector(sac.q1.parameters()).detach().clone()
-    q2_state = torch.nn.utils.parameters_to_vector(sac.q2.parameters()).detach().clone()
-
     def inner_optimize(outer_step: int):
         sac.policy.train()
         
         current_reward_fn = reward.as_fn()
         sac_train_env.custom_reward_fn = current_reward_fn
         sac.replay_buffer.recalc_rewards(current_reward_fn)
+        sac.reset_policy()
+        sac.reset_critics()
         sac.reset_optimizers()
-        torch.nn.utils.vector_to_parameters(policy_state.clone(), sac.policy.parameters())
-        torch.nn.utils.vector_to_parameters(q1_state.clone(), sac.q1.parameters())
-        torch.nn.utils.vector_to_parameters(q2_state.clone(), sac.q2.parameters())
-        sac.q1_target.load_state_dict(sac.q1.state_dict())
-        sac.q2_target.load_state_dict(sac.q2.state_dict())
 
         def validate(ts: int):
             sac.policy.eval()
@@ -535,30 +533,6 @@ def train_fisher(config: dict, logger) -> dict:
             #     agent_train_trajs,
             #     [4, 8, 16, 32, 64, 128, 256, 512],
             #     compare_hypergradients=True
-            # )
-            # outer_optimizer.sweep_n_agent_trajs(
-            #     expert_train_trajs,
-            #     agent_train_trajs,
-            #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
-            #     verbose=True,
-            # )
-            # outer_optimizer.sweep_n_agent_trajs_with_sketching(
-            #     expert_train_trajs,
-            #     agent_train_trajs,
-            #     [4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
-            #     verbose=True
-            # )
-            # outer_optimizer.compare_agent_trajectory_sets(
-            #     expert_train_trajs,
-            #     agent_train_trajs[:n_agent_trajs//2],
-            #     agent_train_trajs[n_agent_trajs//2:],
-            #     verbose=True
-            # )
-            # outer_optimizer.compare_agent_trajectory_sets_with_sketching(
-            #     expert_train_trajs,
-            #     agent_train_trajs[:n_agent_trajs//2],
-            #     agent_train_trajs[n_agent_trajs//2:],
-            #     verbose=True
             # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
 
