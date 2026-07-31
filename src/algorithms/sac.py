@@ -1,6 +1,5 @@
 from tqdm import tqdm
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +11,8 @@ from src.utils.torch import set_optimizer_lr
 
 class ReplayBuffer:
     def __init__(self, state_dim: int, action_dim: int, capacity: int = 1_000_000):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
         self.capacity = capacity
 
         self.state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
@@ -20,6 +21,10 @@ class ReplayBuffer:
         self.next_state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
         self.terminated_buf = torch.empty(capacity, 1, dtype=torch.float32)
 
+        self.ptr = 0
+        self.size = 0
+
+    def reset(self):
         self.ptr = 0
         self.size = 0
 
@@ -111,6 +116,11 @@ class QFunction(nn.Module):
 
         self.backbone = nn.Sequential(*layers)
 
+    def reset_parameters(self):
+        for layer in self.modules():
+            if layer is not self and hasattr(layer, "reset_parameters"):
+                layer.reset_parameters()
+
     def forward(self, states: torch.Tensor, actions: torch.Tensor):
         # states: (B, state_dim)
         # actions: (B, action_dim)
@@ -132,10 +142,11 @@ class SAC:
         tau: float = 0.005,
         replay_buffer_capacity: int = 1_000_000,
     ):
-        self.policy = policy
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.replay_buffer_capacity = replay_buffer_capacity
+
+        self.policy = policy
 
         self.q1 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
         self.q2 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
@@ -161,8 +172,34 @@ class SAC:
         self.global_gradient_update_step = 0
 
     def reset_optimizers(self):
+        self.policy_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
+
         self.policy_optimizer.state.clear()
         self.critic_optimizer.state.clear()
+        self.global_gradient_update_step = 0
+
+    def reset_policy(self):
+        if not hasattr(self.policy, "reset_parameters"):
+            raise TypeError("Policy must implement reset_parameters().")
+
+        self.policy.reset_parameters()
+        self.policy_optimizer.zero_grad()
+        self.policy_optimizer.state.clear()
+
+    def reset_critics(self):
+        self.q1.reset_parameters()
+        self.q2.reset_parameters()
+
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.critic_optimizer.zero_grad()
+        self.critic_optimizer.state.clear()
+        self.global_gradient_update_step = 0
+
+    def reset_replay_buffer(self):
+        self.replay_buffer.reset()
 
     def collect_random_rollout(self, env: Environment, n_steps: int):
         state = env.reset()
