@@ -3,7 +3,7 @@ Fisher-NHD IRL with REINFORCE inner agent for CartPole.
 
 Usage:
     python -m src.irl.cartpole.fisher
-    python -m src.irl.cartpole.fisher --config configs/cartpole.yaml
+    python -m src.irl.cartpole.fisher --config config/cartpole.yaml
 """
 
 import argparse
@@ -24,6 +24,7 @@ from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 from src.evaluation.video import record_policy_video
+from src.utils.resources import PeakRAMMonitor
 
 
 def train_fisher(config: dict, logger) -> dict:
@@ -41,7 +42,7 @@ def train_fisher(config: dict, logger) -> dict:
 
     set_random_seed(int(fisher_cfg["random_seed"]))
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     env = Environment(
@@ -93,7 +94,9 @@ def train_fisher(config: dict, logger) -> dict:
         alpha=float(fisher_cfg["alpha"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
-        sketch_size=int(fisher_cfg["fisher_sketch_size"]),
+        use_sketch=bool(fisher_cfg["use_sketch"]),
+        sketch_size=fisher_cfg["fisher_sketch_size"],
+        fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
     )
 
     reinforce = REINFORCE(
@@ -165,7 +168,7 @@ def train_fisher(config: dict, logger) -> dict:
             max_grad_norm=reinforce_cfg["max_grad_norm"],
             actor_lr=float(reinforce_cfg["lr_policy"]),
             scheduler_gamma=float(reinforce_cfg["scheduler_gamma"]),
-            validate_fn=validate,
+            # validate_fn=validate,
             validate_every=int(inner_cfg["validate_every"]),
         )
 
@@ -173,25 +176,7 @@ def train_fisher(config: dict, logger) -> dict:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     best_checkpoint_path = str(ckpt_dir / "fisher.pt")
-    best_env_reward = float("-inf")
-
-    mlflow.log_params(
-        {
-            "env_id": env_cfg["id"],
-            "gamma": fisher_cfg["gamma"],
-            "alpha": fisher_cfg["alpha"],
-            "lr_reward": fisher_cfg["lr_reward"],
-            "lr_policy": reinforce_cfg["lr_policy"],
-            "fisher_reg": fisher_cfg["fisher_reg"],
-            "sketch_size": fisher_cfg["sketch_size"],
-            "n_outer_steps": n_outer_steps,
-            "n_inner_steps": n_inner_steps,
-            "n_agent_trajs": n_agent_trajs,
-            "n_traj_per_update": reinforce_cfg["n_traj_per_update"],
-            "policy_hidden_dim": policy_cfg["hidden_dim"],
-            "reward_hidden_dim": reward_cfg["hidden_dim"],
-        }
-    )
+    best_l_outer = float("inf")
 
     arch = {
         "state_dim": env.state_dim,
@@ -207,6 +192,26 @@ def train_fisher(config: dict, logger) -> dict:
         "env_id": env_cfg["id"],
         "action_type": env_cfg["action_type"],
     }
+
+    mlflow.log_params(
+        {
+            "env_id": env_cfg["id"],
+            "gamma": fisher_cfg["gamma"],
+            "alpha": fisher_cfg["alpha"],
+            "lr_reward": fisher_cfg["lr_reward"],
+            "lr_policy": reinforce_cfg["lr_policy"],
+            "fisher_reg": fisher_cfg["fisher_reg"],
+            "fisher_sketch_size": fisher_cfg["fisher_sketch_size"],
+            "fisher_batch_size": fisher_cfg["fisher_batch_size"],
+            "n_outer_steps": n_outer_steps,
+            "n_inner_steps": n_inner_steps,
+            "n_agent_trajs": n_agent_trajs,
+            "n_traj_per_update": reinforce_cfg["n_traj_per_update"],
+            "policy_hidden_dim": policy_cfg["hidden_dim"],
+            "reward_hidden_dim": reward_cfg["hidden_dim"],
+        }
+    )
+    mlflow.log_params(arch)
 
     history = {
         "l_outer": [],
@@ -226,7 +231,7 @@ def train_fisher(config: dict, logger) -> dict:
     }
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
-        nonlocal best_env_reward
+        nonlocal best_l_outer
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
@@ -265,8 +270,8 @@ def train_fisher(config: dict, logger) -> dict:
         history["expert_learned_step_mean"].append(expert_step_mean)
         history["random_learned_step_mean"].append(random_step_mean)
 
-        if agent_ret > best_env_reward:
-            best_env_reward = agent_ret
+        if l_outer < best_l_outer:
+            best_l_outer = l_outer
 
             save_checkpoint(
                 path=best_checkpoint_path,
@@ -274,7 +279,7 @@ def train_fisher(config: dict, logger) -> dict:
                 reward=reward,
                 arch=arch,
                 outer_step=outer_step,
-                best_env_reward=best_env_reward,
+                best_l_outer=best_l_outer,
             )
 
         logger.info(
@@ -328,6 +333,16 @@ def train_fisher(config: dict, logger) -> dict:
         f"{'hyp_clip':>10} | {'lr_outer':>12}"
     )
 
+    # TRAINING LOOP
+
+    ram_monitor = PeakRAMMonitor(
+        output_path="reports/resources/cartpole/fisher.json",
+        interval=0.05,
+        persist_every=30,
+        log_to_mlflow=True,
+    )
+    ram_monitor.start()
+
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimize(outer_step)
         agent_train_trajs = collect_trajectories(
@@ -344,10 +359,27 @@ def train_fisher(config: dict, logger) -> dict:
             # outer_optimizer.sweep_sketch_sizes(
             #     expert_train_trajs,
             #     agent_train_trajs,
-            #     [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+            #     [1, 2, 4, 8, 16, 32, 64, 128],
             #     compare_hypergradients=True
             # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+    ram_metrics = ram_monitor.stop()
+
+    mlflow.log_metrics(
+        {
+            "resources/training_start_rss_mb": ram_metrics["start_rss_mb"],
+            "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+            "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+        }
+    )
+
+    logger.info(
+        "Training memory | "
+        f"start RSS={ram_metrics['start_rss_mb']:.2f} MB | "
+        f"peak RSS={ram_metrics['peak_rss_mb']:.2f} MB | "
+        f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
+    )
 
     env.close()
     reinforce_train_env.close()

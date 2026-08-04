@@ -3,7 +3,7 @@ ML-IRL with SAC inner agent for LQR.
 
 Usage:
     python -m src.irl.lqr.ml_irl
-    python -m src.irl.lqr.ml_irl --config configs/lqr.yaml
+    python -m src.irl.lqr.ml_irl --config config/lqr.yaml
 """
 
 import argparse
@@ -23,6 +23,7 @@ from src.utils.data import load_trajectories
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
+from src.utils.resources import PeakRAMMonitor
 
 
 def train_ml_irl(config: dict, logger) -> dict:
@@ -208,7 +209,7 @@ def train_ml_irl(config: dict, logger) -> dict:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     best_checkpoint_path = str(checkpoint_dir / "ml_irl.pt")
-    best_env_reward = float("-inf")
+    best_l_outer = float("inf")
 
     arch = {
         "state_dim": env.state_dim,
@@ -254,6 +255,7 @@ def train_ml_irl(config: dict, logger) -> dict:
             "batch_size": sac_cfg["batch_size"],
         }
     )
+    mlflow.log_params(arch)
 
     history = {
         "l_outer": [],
@@ -277,10 +279,10 @@ def train_ml_irl(config: dict, logger) -> dict:
     }
 
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
-        nonlocal best_env_reward
+        nonlocal best_l_outer
 
-        l_outer_value = float(outer_loss(policy, expert_valid_trajs, sac.gamma))
-        l_inner_value = float(inner_loss(policy, reward, agent_trajs, sac.gamma, sac.alpha))
+        l_outer = float(outer_loss(policy, expert_valid_trajs, sac.gamma))
+        l_inner = float(inner_loss(policy, reward, agent_trajs, sac.gamma, sac.alpha))
 
         agent_length = float(mean_trajectory_length(agent_trajs))
         expert_length = float(mean_trajectory_length(expert_valid_trajs))
@@ -288,9 +290,8 @@ def train_ml_irl(config: dict, logger) -> dict:
         agent_return = float(mean_trajectory_return(agent_trajs))
         expert_return = float(mean_trajectory_return(expert_valid_trajs))
 
-        rank_corr_value = float(rank_corr(reward, expert_valid_trajs + random_valid_trajs))
-
-        policy_nll_value = float(policy_nll(policy, expert_valid_trajs))
+        rank_corr_val = float(rank_corr(reward, expert_valid_trajs + random_valid_trajs))
+        policy_nll_val = float(policy_nll(policy, expert_valid_trajs))
 
         expert_reward_stats = learned_reward_stats(reward, expert_valid_trajs)
         random_reward_stats = learned_reward_stats(reward, random_valid_trajs)
@@ -310,14 +311,14 @@ def train_ml_irl(config: dict, logger) -> dict:
 
         lr_reward = float(outer_optimizer.lr)
 
-        history["l_outer"].append(l_outer_value)
-        history["l_inner"].append(l_inner_value)
+        history["l_outer"].append(l_outer)
+        history["l_inner"].append(l_inner)
         history["agent_len"].append(agent_length)
         history["expert_len"].append(expert_length)
         history["agent_return"].append(agent_return)
         history["expert_return"].append(expert_return)
-        history["rank_corr"].append(rank_corr_value)
-        history["policy_nll"].append(policy_nll_value)
+        history["rank_corr"].append(rank_corr_val)
+        history["policy_nll"].append(policy_nll_val)
         history["reward_loss"].append(reward_loss)
         history["expert_mean_reward"].append(expert_mean_reward)
         history["agent_mean_reward"].append(agent_mean_reward)
@@ -329,25 +330,26 @@ def train_ml_irl(config: dict, logger) -> dict:
         history["expert_learned_step_mean"].append(expert_step_mean)
         history["random_learned_step_mean"].append(random_step_mean)
 
-        if agent_return > best_env_reward:
-            best_env_reward = agent_return
+        if l_outer < best_l_outer:
+            best_l_outer = l_outer
+
             save_checkpoint(
                 path=best_checkpoint_path,
                 policy=policy,
                 reward=reward,
                 arch=arch,
                 outer_step=outer_step,
-                best_env_reward=best_env_reward
+                best_l_outer=best_l_outer,
             )
 
         logger.info(
             f"{outer_step:>5} | "
-            f"{l_outer_value:>10.3f} | "
-            f"{l_inner_value:>10.3f} | "
+            f"{l_outer:>10.3f} | "
+            f"{l_inner:>10.3f} | "
             f"{agent_length:>10.1f} | "
             f"{agent_return:>10.1f} | "
-            f"{rank_corr_value:>9.3f} | "
-            f"{policy_nll_value:>10.3f} | "
+            f"{rank_corr_val:>9.3f} | "
+            f"{policy_nll_val:>10.3f} | "
             f"{reward_loss:>10.3f} | "
             f"{raw_grad_norm:>10.3f} | "
             f"{clipped_grad_norm:>10.3f} | "
@@ -363,14 +365,14 @@ def train_ml_irl(config: dict, logger) -> dict:
         )
 
         metrics = {
-            "outer_loss": l_outer_value,
-            "inner_loss": l_inner_value,
+            "outer_loss": l_outer,
+            "inner_loss": l_inner,
             "agent_return": agent_return,
             "expert_return": expert_return,
             "agent_length": agent_length,
             "expert_length": expert_length,
-            "rank_corr": rank_corr_value,
-            "policy_nll": policy_nll_value,
+            "rank_corr": rank_corr_val,
+            "policy_nll": policy_nll_val,
             "reward_grad_norm": (raw_grad_norm),
             "reward_grad_norm_clipped": (clipped_grad_norm),
             "lr_reward": lr_reward,
@@ -400,6 +402,16 @@ def train_ml_irl(config: dict, logger) -> dict:
     )
     logger.info(header)
 
+    # TRAINING LOOP
+
+    ram_monitor = PeakRAMMonitor(
+        output_path="reports/resources/lqr/ml_irl.json",
+        interval=0.05,
+        persist_every=30,
+        log_to_mlflow=True,
+    )
+    ram_monitor.start()
+
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimize(outer_step=outer_step)
         agent_train_trajs = collect_trajectories(
@@ -414,6 +426,23 @@ def train_ml_irl(config: dict, logger) -> dict:
 
         if outer_step < n_outer_steps:
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+    ram_metrics = ram_monitor.stop()
+    
+    logger.info(
+        "Training memory | "
+        f"start RSS={ram_metrics['start_rss_mb']:.2f} MB | "
+        f"peak RSS={ram_metrics['peak_rss_mb']:.2f} MB | "
+        f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
+    )
+
+    mlflow.log_metrics(
+        {
+            "resources/final_training_start_rss_mb": ram_metrics["start_rss_mb"],
+            "resources/final_training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+            "resources/final_training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+        }
+    )
 
     env.close()
     sac_train_env.close()

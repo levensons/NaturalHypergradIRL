@@ -23,6 +23,7 @@ from src.utils.data import load_trajectories
 from src.utils.logging import get_logger, save_history
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
+from src.utils.resources import PeakRAMMonitor
 
 
 def train_fisher(config: dict, logger) -> dict:
@@ -52,7 +53,7 @@ def train_fisher(config: dict, logger) -> dict:
         custom_reward_fn=None,
     )
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
     if inner_cfg["type"] != "sac":
@@ -109,7 +110,8 @@ def train_fisher(config: dict, logger) -> dict:
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
-        sketch_size=int(fisher_cfg["fisher_sketch_size"]),
+        use_sketch=bool(fisher_cfg["use_sketch"]),
+        sketch_size=fisher_cfg["fisher_sketch_size"],
         fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
     )
 
@@ -222,22 +224,7 @@ def train_fisher(config: dict, logger) -> dict:
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     best_checkpoint_path = str(ckpt_dir / "fisher.pt")
-    best_env_reward = float("-inf")
-
-    mlflow.log_params(
-        {
-            "gamma": fisher_cfg["gamma"],
-            "lr_reward": fisher_cfg["lr_reward"],
-            "fisher_reg": fisher_cfg["fisher_reg"],
-            "n_outer_steps": fisher_cfg["n_outer_steps"],
-            "n_inner_steps": fisher_cfg["n_inner_steps"],
-            "n_agent_trajs": fisher_cfg["n_agent_trajs"],
-            "reward_hidden": config["reward"]["hidden_dim"],
-            "policy_hidden": config["policy"]["hidden_dim"],
-            "alpha": fisher_cfg["alpha"],
-            "batch_size": sac_cfg["batch_size"],
-        }
-    )
+    best_l_outer = float("inf")
 
     arch = {
         "state_dim": env.state_dim,
@@ -258,6 +245,24 @@ def train_fisher(config: dict, logger) -> dict:
         "action_type": config["env"]["action_type"],
     }
 
+    mlflow.log_params(
+        {
+            "n_outer_steps": fisher_cfg["n_outer_steps"],
+            "n_inner_steps": fisher_cfg["n_inner_steps"],
+            "n_agent_trajs": fisher_cfg["n_agent_trajs"],
+            "alpha": fisher_cfg["alpha"],
+            "gamma": fisher_cfg["gamma"],
+            "fisher_reg": fisher_cfg["fisher_reg"],
+            "fisher_sketch_size": fisher_cfg["fisher_sketch_size"],
+            "fisher_batch_size": fisher_cfg["fisher_batch_size"],
+            "use_sketch": fisher_cfg["use_sketch"],
+            "lr_reward": fisher_cfg["lr_reward"],
+            "max_grad_norm": fisher_cfg["max_grad_norm"],
+            "scheduler_gamma": fisher_cfg["scheduler_gamma"],
+        }
+    )
+    mlflow.log_params(arch)
+
     history = {
         "l_outer": [],
         "agent_len": [],
@@ -276,7 +281,7 @@ def train_fisher(config: dict, logger) -> dict:
     }
 
     def log_and_checkpoint(outer_step: int, agent_trajs):
-        nonlocal best_env_reward
+        nonlocal best_l_outer
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
@@ -315,8 +320,8 @@ def train_fisher(config: dict, logger) -> dict:
         history["expert_learned_step_mean"].append(expert_step_mean)
         history["random_learned_step_mean"].append(random_step_mean)
 
-        if agent_ret > best_env_reward:
-            best_env_reward = agent_ret
+        if l_outer < best_l_outer:
+            best_l_outer = l_outer
 
             save_checkpoint(
                 path=best_checkpoint_path,
@@ -324,7 +329,7 @@ def train_fisher(config: dict, logger) -> dict:
                 reward=reward,
                 arch=arch,
                 outer_step=outer_step,
-                best_env_reward=best_env_reward,
+                best_l_outer=best_l_outer,
             )
 
         logger.info(
@@ -370,6 +375,16 @@ def train_fisher(config: dict, logger) -> dict:
     )
     logger.info(header)
 
+    # TRAINING LOOP
+
+    ram_monitor = PeakRAMMonitor(
+        output_path="reports/resources/lqr/fisher.json",
+        interval=0.05,
+        persist_every=30,
+        log_to_mlflow=True,
+    )
+    ram_monitor.start()
+
     for outer_step in range(1, n_outer_steps + 1):
         inner_optimize(outer_step)
         agent_train_trajs = collect_trajectories(
@@ -390,6 +405,23 @@ def train_fisher(config: dict, logger) -> dict:
             #     compare_hypergradients=True
             # )
             outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+    ram_metrics = ram_monitor.stop()
+    
+    logger.info(
+        "Training memory | "
+        f"start RSS={ram_metrics['start_rss_mb']:.2f} MB | "
+        f"peak RSS={ram_metrics['peak_rss_mb']:.2f} MB | "
+        f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
+    )
+
+    mlflow.log_metrics(
+        {
+            "resources/final_training_start_rss_mb": ram_metrics["start_rss_mb"],
+            "resources/final_training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+            "resources/final_training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+        }
+    )
 
     env.close()
     sac_train_env.close()

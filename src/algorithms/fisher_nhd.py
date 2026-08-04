@@ -26,6 +26,12 @@ class FisherNHD:
         sketch_size: int = 32,
         fisher_batch_size: int = 256,
     ):
+        if use_sketch and sketch_size is None:
+            raise ValueError("sketch_size must be specified when use_sketch=True.")
+
+        if sketch_size is not None and sketch_size <= 0:
+            raise ValueError("sketch_size must be a positive integer.")
+        
         self.reward = reward
         self.policy = policy
         self.fisher_reg = fisher_reg
