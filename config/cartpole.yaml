@@ -34,32 +34,35 @@ trajectory_collection:
   test:
     n: 100
 
-policy:
+reward:
   hidden_dim: 16
   n_hidden_layers: 1
-
-reward:
-  hidden_dim: 64
-  n_hidden_layers: 2
   clamp_magnitude: 10
+
+policy:
+  hidden_dim: 32
+  n_hidden_layers: 2
 
 fisher:
   random_seed: 42
   env_seed: 42
 
   n_outer_steps: 100
-  n_inner_steps: 1000
+  n_inner_steps: 500
 
   n_agent_trajs: 1000
 
-  lr_reward: 1e-4
-  scheduler_gamma: 1.0
-  max_grad_norm: null
-
+  alpha: 0.1
   gamma: 0.99
-  alpha: 0.2
-  fisher_reg: 1e-12
-  fisher_sketch_size: 32
+
+  fisher_reg: 1e-3
+  fisher_sketch_size: 8
+  fisher_batch_size: 64
+  use_sketch: true
+
+  lr_reward: 1e-1
+  max_grad_norm: 1.0
+  scheduler_gamma: 1.0
 
   inner:
     type: reinforce
@@ -68,28 +71,29 @@ fisher:
     eval_env_seed: 101
 
     validate_every: 50
-    n_agent_eval_trajs: 10
+    n_agent_eval_trajs: 3
 
     params:
       lr_policy: 1e-3
       scheduler_gamma: 1.0
-      max_grad_norm: 1.0
+      max_grad_norm: null
       n_traj_per_update: 20
 
 ml_irl:
   random_seed: 42
   env_seed: 42
 
-  n_outer_steps: 1000
+  n_outer_steps: 500
   n_inner_steps: 100
 
-  n_agent_trajs: 100
+  n_agent_trajs: 1000
 
-  alpha: 0.2
+  alpha: 0.1
   gamma: 0.99
 
-  lr_reward: 1e-3
+  lr_reward: 1e-4
   max_grad_norm: 1.0
+  scheduler_gamma: 1.0
 
   inner:
     type: reinforce
@@ -97,7 +101,7 @@ ml_irl:
     train_env_seed: 100
     eval_env_seed: 101
 
-    validate_every: 10
+    validate_every: 50
     n_agent_eval_trajs: 3
 
     params:
@@ -131,3 +135,23 @@ evaluation:
     enabled: true
     n_samples: 1000
     seed: 42
+
+policy_final_training:
+    type: reinforce
+
+    alpha: 0.1
+    gamma: 0.99
+
+    random_seed: 123
+    train_env_seed: 123
+    eval_env_seed: 124
+
+    validate_every: 50
+    n_agent_eval_trajs: 3
+
+    params:
+      total_steps: 2000
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20
