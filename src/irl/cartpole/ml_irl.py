@@ -99,6 +99,8 @@ def train_ml_irl(config: dict, logger) -> dict:
         action_dim=env.action_dim,
         gamma=float(ml_irl_cfg["gamma"]),
         alpha=float(ml_irl_cfg["alpha"]),
+        use_baseline=bool(inner_cfg["use_baseline"]),
+        baseline_momentum=inner_cfg["baseline_momentum"],
     )
 
     reinforce_train_env = Environment(

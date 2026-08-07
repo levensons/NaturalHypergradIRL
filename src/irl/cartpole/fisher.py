@@ -105,6 +105,8 @@ def train_fisher(config: dict, logger) -> dict:
         action_dim=env.action_dim,
         gamma=float(fisher_cfg["gamma"]),
         alpha=float(fisher_cfg["alpha"]),
+        use_baseline=bool(inner_cfg["use_baseline"]),
+        baseline_momentum=inner_cfg["baseline_momentum"],
     )
 
     reinforce_train_env = Environment(

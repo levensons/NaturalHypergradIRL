@@ -59,6 +59,8 @@ def build_agent(policy, env, final_cfg: dict):
             action_dim=env.action_dim,
             gamma=float(final_cfg["gamma"]),
             alpha=float(final_cfg["alpha"]),
+            use_baseline=bool(final_cfg["use_baseline"]),
+            baseline_momentum=final_cfg["baseline_momentum"],
         )
 
     raise ValueError(f"Unsupported agent: {agent_type}. Available: {sorted(SUPPORTED_AGENTS)}")
@@ -271,7 +273,6 @@ def main() -> None:
     checkpoint = load_checkpoint(args.checkpoint)
 
     method = checkpoint["arch"]["method"]
-    irl_agent = checkpoint["arch"].get("agent")
     agent_type = config["policy_final_training"]["type"]
     final_cfg = config["policy_final_training"]
 
@@ -285,7 +286,6 @@ def main() -> None:
     logger.info("=== Final policy training ===")
     logger.info(f"Environment: {args.env}")
     logger.info(f"IRL method: {method}")
-    logger.info(f"IRL agent: {irl_agent}")
     logger.info(f"Final-training agent: {agent_type}")
     logger.info(f"Config: {config_path}")
     logger.info(f"Checkpoint: {args.checkpoint}")
