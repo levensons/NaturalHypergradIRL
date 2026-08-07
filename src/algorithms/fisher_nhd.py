@@ -66,9 +66,7 @@ class FisherNHD:
         return num_params(self.policy)
 
     def d_outer_d_policy(self, expert_trajs, verbose: bool = True) -> torch.Tensor:
-        policy_dim = num_params(self.policy)
-
-        g = torch.zeros(policy_dim, dtype=torch.float32, device=self.device)
+        g = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
 
         for traj in tqdm(expert_trajs, desc="Outer grad", leave=False, disable=not verbose):
             states = to_device(traj["states"], self.device)
@@ -225,8 +223,9 @@ class FisherNHD:
 
     def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         """
-            Compute (∇²_{θφ} L_inner)^T v,
-            using reverse derivation.
+        Compute (∂²L_inner / ∂φ∂θ) @ v,
+        equivalently (∇²_{θφ} L_inner)^T @ v,
+        without forming the mixed-derivative matrix.
         """
 
         if v.numel() != self.policy_num_params:
