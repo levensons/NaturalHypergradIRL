@@ -18,7 +18,7 @@ from src.utils.config import load_config, resolve_config_path
 from src.utils.seeding import set_random_seed
 from src.utils.sb3 import init_sb3_model, normalize_sb3_load_path, normalize_sb3_save_path
 from src.utils.env import Environment
-from src.irl.lqr.env import LQR, GymLQR
+from envs.lqr.env import LQR, GymLQR
 
 def create_expert_env(env_cfg: dict, seed: int):
     env_name = env_cfg["name"].lower()

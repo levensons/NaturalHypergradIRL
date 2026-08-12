@@ -56,11 +56,11 @@ fisher:
   gamma: 0.99
 
   fisher_reg: 1e-3
-  fisher_sketch_size: 8
+  fisher_sketch_size: null
   fisher_batch_size: 64
-  use_sketch: true
+  use_sketch: false
 
-  lr_reward: 1e-1
+  lr_reward: 1e-2
   max_grad_norm: 1.0
   scheduler_gamma: 1.0
 
@@ -73,8 +73,8 @@ fisher:
     validate_every: 50
     n_agent_eval_trajs: 3
 
-    use_baseline: true
-    baseline_momentum: 0.9
+    use_baseline: false
+    baseline_momentum: null
 
     params:
       lr_policy: 1e-3
@@ -107,8 +107,8 @@ ml_irl:
     validate_every: 50
     n_agent_eval_trajs: 3
 
-    use_baseline: true
-    baseline_momentum: 0.9
+    use_baseline: false
+    baseline_momentum: null
 
     params:
       lr_policy: 1e-3

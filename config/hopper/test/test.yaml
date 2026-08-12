@@ -53,15 +53,17 @@ fisher:
   env_seed: 42
   
   n_outer_steps: 1000
-  n_inner_steps: 100000
+  n_inner_steps: 10000
 
-  n_agent_trajs: 5000
+  n_agent_trajs: 1000
 
   alpha: 0.2
   gamma: 0.99
 
-  fisher_reg: 1e-6
-  fisher_sketch_size: 64
+  fisher_reg: 1e-3
+  fisher_sketch_size: 32
+  fisher_batch_size: 256
+  use_sketch: true
 
   lr_reward: 1e-6
   max_grad_norm: null
@@ -123,51 +125,6 @@ ml_irl:
       replay_buffer_capacity: 1000000
       tau: 0.005
 
-ttsa:
-  random_seed: 42
-  env_seed: 42
-
-  n_outer_steps: 200
-  sac_steps_per_iter: 5000
-
-  agent_train_trajs: 10
-  expert_resample_trajs: 10
-  n_expert_train_trajs: 1000
-
-  eval_trajs: 10
-  metrics_every: 1
-  ema_beta: 0.95
-
-  discount: 0.99
-
-  reward_lr: 3e-4
-  reward_max_grad_norm: 1.0
-  reward_weight_decay: 0.0
-  reward_scheduler_gamma: 1.0
-
-  sac_train_env_seed: 100
-  eval_env_seed: 101
-  reward_agent_env_seed: 102
-
-  critic_refresh_steps: 0
-  critic_refresh_log_every: 500
-  learning_starts_after_first: 0
-
-  sac:
-    q_hidden_dim: 256
-    q_n_hidden_layers: 2
-    gamma: 0.99
-    alpha: 1.0
-    tau: 0.005
-    replay_buffer_capacity: 1000000
-    batch_size: 256
-    learning_starts: 10000
-    gradient_update_steps: 50
-    target_update_interval: 50
-    critic_lr: 3e-4
-    actor_lr: 3e-4
-    max_grad_norm: 1.0
-
 data:
   expert_train_trajs: data/hopper/expert_train_trajs.pt
   expert_valid_trajs: data/hopper/expert_valid_trajs.pt
@@ -176,13 +133,31 @@ data:
   random_valid_trajs: data/hopper/random_valid_trajs.pt
   random_test_trajs:  data/hopper/random_test_trajs.pt
 
-checkpoint:
-  dir: checkpoints/hopper
+policy_final_training:
+    type: sac
 
-logging:
-  log_dir: logs
-  report_dir: reports
-  log_every: 1
+    random_seed: 123
+    train_env_seed: 123
+    eval_env_seed: 124
+
+    validate_every: 1000
+    n_agent_eval_trajs: 10
+
+    alpha: 0.1
+    gamma: 0.99
+
+    params:
+      total_timesteps: 1000000
+      gradient_update_steps: 1
+      target_update_interval: 1
+      q_hidden_dim: 256
+      q_n_hidden_layers: 2
+      max_grad_norm: null
+      critic_lr: 1e-4
+      actor_lr: 1e-4
+      batch_size: 256
+      replay_buffer_capacity: 1000000
+      tau: 0.005
 
 evaluation:
   random_seed: 42

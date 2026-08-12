@@ -1,39 +1,38 @@
-import json
 import os
 import threading
 import time
-from pathlib import Path
-import mlflow
+
 import psutil
+from mlflow.tracking import MlflowClient
 
 
 class PeakRAMMonitor:
     def __init__(
         self,
-        output_path: str | Path,
         interval: float = 0.05,
-        persist_every: float = 30.0,
-        log_to_mlflow: bool = True,
+        log_every: float = 30.0,
+        run_id: str | None = None,
     ):
         if interval <= 0:
             raise ValueError(f"`interval` must be positive, got {interval}.")
 
-        if persist_every <= 0:
-            raise ValueError(f"`persist_every` must be positive, got {persist_every}.")
+        if log_every <= 0:
+            raise ValueError(f"`log_every` must be positive, got {log_every}.")
 
-        self.output_path = Path(output_path)
         self.interval = interval
-        self.persist_every = persist_every
-        self.log_to_mlflow = log_to_mlflow
+        self.log_every = log_every
+        self.run_id = run_id
 
         self.process = psutil.Process(os.getpid())
+        self.mlflow_client = MlflowClient() if run_id is not None else None
 
         self.start_rss = 0
         self.peak_rss = 0
         self.elapsed_seconds = 0.0
 
         self._started_at = 0.0
-        self._last_persisted_at = 0.0
+        self._last_logged_at = 0.0
+
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -51,37 +50,39 @@ class PeakRAMMonitor:
             "elapsed_seconds": elapsed_seconds,
         }
 
-    def _persist(self) -> None:
+    def _log_to_mlflow(self) -> None:
+        if self.mlflow_client is None or self.run_id is None:
+            return
+
         metrics = self._current_metrics()
+        timestamp = int(time.time() * 1000)
+        step = int(metrics["elapsed_seconds"])
 
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        temporary_path = self.output_path.with_suffix(
-            self.output_path.suffix + ".tmp"
-        )
-
-        with temporary_path.open("w", encoding="utf-8") as file:
-            json.dump(metrics, file, indent=2)
-
-        # Atomic replacement: the output file is never partially written.
-        os.replace(temporary_path, self.output_path)
-
-        if self.log_to_mlflow and mlflow.active_run() is not None:
-            try:
-                mlflow.log_metrics(
-                    {
-                        "resources/training_peak_rss_mb":
-                            metrics["peak_rss_mb"],
-                        "resources/training_peak_rss_increase_mb":
-                            metrics["peak_rss_increase_mb"],
-                        "resources/training_elapsed_seconds":
-                            metrics["elapsed_seconds"],
-                    },
-                    step=int(metrics["elapsed_seconds"]),
-                )
-            except Exception:
-                # The local JSON remains the reliable fallback.
-                pass
+        try:
+            self.mlflow_client.log_metric(
+                run_id=self.run_id,
+                key="resources/training_peak_rss_mb",
+                value=metrics["peak_rss_mb"],
+                timestamp=timestamp,
+                step=step,
+            )
+            self.mlflow_client.log_metric(
+                run_id=self.run_id,
+                key="resources/training_peak_rss_increase_mb",
+                value=metrics["peak_rss_increase_mb"],
+                timestamp=timestamp,
+                step=step,
+            )
+            self.mlflow_client.log_metric(
+                run_id=self.run_id,
+                key="resources/training_elapsed_seconds",
+                value=metrics["elapsed_seconds"],
+                timestamp=timestamp,
+                step=step,
+            )
+        except Exception:
+            # Resource monitoring must never kill the training process.
+            pass
 
     def _monitor(self) -> None:
         while not self._stop_event.wait(self.interval):
@@ -92,9 +93,9 @@ class PeakRAMMonitor:
                 self.peak_rss = max(self.peak_rss, rss)
                 self.elapsed_seconds = now - self._started_at
 
-            if now - self._last_persisted_at >= self.persist_every:
-                self._persist()
-                self._last_persisted_at = now
+            if now - self._last_logged_at >= self.log_every:
+                self._log_to_mlflow()
+                self._last_logged_at = now
 
     def start(self) -> None:
         if self._thread is not None:
@@ -109,9 +110,10 @@ class PeakRAMMonitor:
             self.elapsed_seconds = 0.0
 
         self._started_at = now
-        self._last_persisted_at = now
+        self._last_logged_at = now
 
         self._stop_event.clear()
+
         self._thread = threading.Thread(
             target=self._monitor,
             name="peak-ram-monitor",
@@ -119,8 +121,7 @@ class PeakRAMMonitor:
         )
         self._thread.start()
 
-        # Create the file immediately.
-        self._persist()
+        self._log_to_mlflow()
 
     def snapshot(self) -> dict[str, float]:
         rss = self.process.memory_info().rss
@@ -130,7 +131,8 @@ class PeakRAMMonitor:
             self.peak_rss = max(self.peak_rss, rss)
             self.elapsed_seconds = now - self._started_at
 
-        self._persist()
+        self._log_to_mlflow()
+
         return self._current_metrics()
 
     def stop(self) -> dict[str, float]:
@@ -142,4 +144,5 @@ class PeakRAMMonitor:
 
         metrics = self.snapshot()
         self._thread = None
+
         return metrics

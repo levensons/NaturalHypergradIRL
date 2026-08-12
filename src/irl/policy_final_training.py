@@ -5,25 +5,20 @@ Usage:
     python -m src.irl.policy_final_training \
         --env lqr \
         --config config/lqr_final_fisher.yaml \
-        --checkpoint checkpoints/lqr/fisher.pt
-
-The learned reward is restored from the checkpoint, while the policy is
-initialized from scratch and optimized according to `policy_final_training`.
-
-The resulting checkpoint preserves the learned reward and replaces the original
-policy with the final trained policy.
+        --checkpoint checkpoints/lqr/fisher.pt \
+        --run-name final_fisher \
+        --log-dir logs/lqr/exp1/final_policy_training
 """
 
 import argparse
 from pathlib import Path
+from datetime import datetime
 
 import mlflow
 import torch
 
-from src.algorithms.reinforce import REINFORCE
-from src.algorithms.sac import SAC
-from src.evaluation.evaluate import SUPPORTED_ENVS, build_env, build_policy, build_reward, import_models_module
 from src.evaluation.metrics import inner_loss, learned_reward_stats
+from src.irl.builders import SUPPORTED_AGENTS, SUPPORTED_ENVS, build_agent, import_env_builders
 from src.utils.checkpoint import load_checkpoint
 from src.utils.config import load_config
 from src.utils.data import load_trajectories
@@ -32,41 +27,13 @@ from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
 
-SUPPORTED_AGENTS = {"reinforce", "sac"}
-
-
-def build_agent(policy, env, final_cfg: dict):
-    agent_type = final_cfg["type"]
-    params = final_cfg["params"]
-
-    if agent_type == "sac":
-        return SAC(
-            policy=policy,
-            state_dim=env.state_dim,
-            action_dim=env.action_dim,
-            hidden_dim=int(params["q_hidden_dim"]),
-            n_hidden_layers=int(params["q_n_hidden_layers"]),
-            gamma=float(final_cfg["gamma"]),
-            alpha=float(final_cfg["alpha"]),
-            tau=float(params["tau"]),
-            replay_buffer_capacity=int(params["replay_buffer_capacity"]),
-        )
-
-    if agent_type == "reinforce":
-        return REINFORCE(
-            policy=policy,
-            state_dim=env.state_dim,
-            action_dim=env.action_dim,
-            gamma=float(final_cfg["gamma"]),
-            alpha=float(final_cfg["alpha"]),
-            use_baseline=bool(final_cfg["use_baseline"]),
-            baseline_momentum=final_cfg["baseline_momentum"],
-        )
-
-    raise ValueError(f"Unsupported agent: {agent_type}. Available: {sorted(SUPPORTED_AGENTS)}")
-
-
-def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, logger) -> Path:
+def train_policy(
+    config: dict,
+    checkpoint: dict,
+    checkpoint_path: str | Path,
+    env_builders,
+    logger,
+) -> Path:
     final_cfg = config["policy_final_training"]
     params = final_cfg["params"]
     env_cfg = config["env"]
@@ -85,37 +52,24 @@ def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, lo
 
     arch = checkpoint["arch"]
     irl_method = arch["method"]
-    irl_agent = arch.get("agent")
 
-    env_name = env_cfg["name"]
-    models_module, module_path = import_models_module(env_name)
-
-    logger.info(f"Environment: {env_name}")
     logger.info(f"IRL method: {irl_method}")
-    logger.info(f"IRL agent: {irl_agent}")
     logger.info(f"Final-training agent: {agent_type}")
-    logger.info(f"Checkpoint: {checkpoint_path}")
-    logger.info(f"Models module: {module_path}")
 
-    train_env = build_env(env_cfg, train_env_seed)
-    eval_env = build_env(env_cfg, eval_env_seed)
+    train_env = env_builders.build_env(env_cfg=env_cfg, seed=train_env_seed)
+    eval_env = env_builders.build_env(env_cfg=env_cfg, seed=eval_env_seed)
 
     try:
-        reward = build_reward(
-            models_module=models_module,
-            arch=arch,
+        reward = env_builders.build_reward(
+            env=train_env,
+            reward_cfg=config["reward"],
         )
         reward.load_state_dict(checkpoint["reward_state_dict"])
         reward.eval()
 
         logger.info("Learned reward loaded.")
 
-        policy = build_policy(
-            models_module=models_module,
-            arch=arch,
-            env=train_env,
-            env_cfg=env_cfg,
-        )
+        policy = env_builders.build_policy(env=train_env, policy_cfg=config["policy"])
         policy.train()
 
         logger.info("Fresh policy initialized.")
@@ -126,15 +80,14 @@ def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, lo
         agent = build_agent(
             policy=policy,
             env=train_env,
-            final_cfg=final_cfg,
+            agent_cfg=final_cfg,
+            gamma=float(final_cfg["gamma"]),
+            alpha=float(final_cfg["alpha"]),
         )
 
         if agent_type == "sac":
             random_train_path = Path(data_cfg["random_train_trajs"])
-            random_train_trajs = load_trajectories(
-                random_train_path,
-                map_location="cpu",
-            )
+            random_train_trajs = load_trajectories(random_train_path, map_location="cpu")
 
             logger.info(f"Loaded {len(random_train_trajs)} random train trajectories from {random_train_path}")
 
@@ -152,16 +105,7 @@ def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, lo
                 verbose=False,
             )
 
-            l_inner = float(
-                inner_loss(
-                    agent.policy,
-                    reward,
-                    trajectories,
-                    agent.gamma,
-                    agent.alpha,
-                )
-            )
-
+            l_inner = float(inner_loss(agent.policy, reward, trajectories, agent.gamma, agent.alpha))
             env_return = float(mean_trajectory_return(trajectories))
             length = float(mean_trajectory_length(trajectories))
 
@@ -220,7 +164,7 @@ def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, lo
             "eval_env_seed": eval_env_seed,
             "gamma": float(final_cfg["gamma"]),
             "alpha": float(final_cfg["alpha"]),
-            "params": params,
+            "params": dict(params),
         }
 
         torch.save(checkpoint, checkpoint_path)
@@ -234,7 +178,7 @@ def train_policy(config: dict, checkpoint: dict, checkpoint_path: str | Path, lo
         eval_env.close()
 
 
-def parse() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a fresh policy against a learned reward from an IRL checkpoint.",
     )
@@ -248,56 +192,78 @@ def parse() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         required=True,
-        help="Path to the training config YAML.",
+        help="Path to the final-policy training config.",
     )
     parser.add_argument(
         "--checkpoint",
         required=True,
-        help="Path to the source IRL checkpoint.",
+        help="Path to the IRL checkpoint.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="MLflow run name. Defaults to <env>_<method>_<agent>.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default="logs",
+        help="Directory where a timestamped training log will be saved.",
     )
 
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse()
+    args = parse_args()
 
     config_path = Path(args.config)
+    checkpoint_path = Path(args.checkpoint)
+
     config = load_config(config_path)
+    checkpoint = load_checkpoint(checkpoint_path)
 
     env_name = config["env"]["name"]
 
     if env_name != args.env:
         raise ValueError(f"Environment mismatch: --env={args.env}, but config contains env.name={env_name}.")
 
-    checkpoint = load_checkpoint(args.checkpoint)
-
     method = checkpoint["arch"]["method"]
-    agent_type = config["policy_final_training"]["type"]
     final_cfg = config["policy_final_training"]
+    agent_type = final_cfg["type"]
 
-    log_cfg = config["logging"]
+    run_name = args.run_name or f"final_{method}_{agent_type}"
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = log_dir / f"{timestamp}.log"
 
     logger = get_logger(
-        f"policy_final_training_{args.env}",
-        log_dir=log_cfg["log_dir"],
+        f"policy_final_training_{env_name}",
+        log_path=log_path,
     )
 
+    env_builders = import_env_builders(env_name)
+
     logger.info("=== Final policy training ===")
-    logger.info(f"Environment: {args.env}")
+    logger.info(f"Environment: {env_name}")
     logger.info(f"IRL method: {method}")
     logger.info(f"Final-training agent: {agent_type}")
+    logger.info(f"Run name: {run_name}")
     logger.info(f"Config: {config_path}")
-    logger.info(f"Checkpoint: {args.checkpoint}")
+    logger.info(f"Checkpoint: {checkpoint_path}")
+    logger.info(f"Log path: {log_path}")
 
-    mlflow.set_experiment("policy_final_training")
+    mlflow.set_experiment(env_name)
 
-    with mlflow.start_run(run_name=f"{args.env}_{method}_{agent_type}"):
+    with mlflow.start_run(run_name=run_name):
         mlflow.set_tags(
             {
-                "env": args.env,
-                "irl_method": method,
+                "method": method,
                 "agent": agent_type,
+                "stage": "policy_final_training",
             }
         )
 
@@ -310,20 +276,20 @@ def main() -> None:
                 "eval_env_seed": final_cfg["eval_env_seed"],
                 "validate_every": final_cfg["validate_every"],
                 "n_agent_eval_trajs": final_cfg["n_agent_eval_trajs"],
+                "checkpoint": str(checkpoint_path),
+                "config": str(config_path),
             }
         )
 
         mlflow.log_params(
-            {
-                f"agent/{key}": "None" if value is None else value
-                for key, value in final_cfg["params"].items()
-            }
+            {f"agent/{key}": "None" if value is None else value for key, value in final_cfg["params"].items()}
         )
 
         train_policy(
             config=config,
             checkpoint=checkpoint,
-            checkpoint_path=args.checkpoint,
+            checkpoint_path=checkpoint_path,
+            env_builders=env_builders,
             logger=logger,
         )
 

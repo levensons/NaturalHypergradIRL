@@ -21,7 +21,7 @@ from src.utils.sb3 import load_sb3_model, normalize_sb3_load_path
 from src.utils.trajectories import mean_trajectory_length, mean_trajectory_return
 from src.utils.policies import Policy, RandomPolicy, SB3PolicyWrapper
 from src.utils.env import Environment
-from src.irl.lqr.env import LQR
+from envs.lqr.env import LQR
 
 
 def create_expert_env(env_cfg: dict, seed: int):

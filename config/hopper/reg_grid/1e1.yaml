@@ -1,0 +1,102 @@
+env:
+  name: hopper
+  id: Hopper-v5
+  action_type: continuous
+  max_steps: 1000
+
+reward:
+  hidden_dim: 64
+  n_hidden_layers: 2
+  clamp_magnitude: 10
+
+policy:
+  hidden_dim: 64
+  n_hidden_layers: 2
+  log_std_min: -20
+  log_std_max: 2
+
+fisher:
+  random_seed: 42
+  env_seed: 42
+  
+  n_outer_steps: 20
+  n_inner_steps: 100000
+
+  n_agent_trajs: 1000
+
+  alpha: 0.2
+  gamma: 0.99
+
+  fisher_reg: 1e1
+  fisher_sketch_size: null
+  fisher_batch_size: 256
+  use_sketch: false
+
+  lr_reward: 5e-2
+  max_grad_norm: 1.0
+  scheduler_gamma: 1.0
+
+  inner:
+    type: sac
+
+    train_env_seed: 100
+    eval_env_seed: 101
+
+    validate_every: 10000
+    n_agent_eval_trajs: 10
+
+    params:
+      gradient_update_steps: 1
+      target_update_interval: 1
+      q_hidden_dim: 256
+      q_n_hidden_layers: 2
+      max_grad_norm: null
+      critic_lr: 1e-4
+      actor_lr: 1e-4
+      batch_size: 256
+      replay_buffer_capacity: 1000000
+      tau: 0.005
+
+data:
+  expert_train_trajs: data/hopper/expert_train_trajs.pt
+  expert_valid_trajs: data/hopper/expert_valid_trajs.pt
+  expert_test_trajs:  data/hopper/expert_test_trajs.pt
+  random_train_trajs: data/hopper/random_train_trajs.pt
+  random_valid_trajs: data/hopper/random_valid_trajs.pt
+  random_test_trajs:  data/hopper/random_test_trajs.pt
+
+policy_final_training:
+    type: sac
+
+    random_seed: 123
+    train_env_seed: 123
+    eval_env_seed: 124
+
+    validate_every: 1000
+    n_agent_eval_trajs: 10
+
+    alpha: 0.1
+    gamma: 0.99
+
+    params:
+      total_timesteps: 1000000
+      gradient_update_steps: 1
+      target_update_interval: 1
+      q_hidden_dim: 256
+      q_n_hidden_layers: 2
+      max_grad_norm: null
+      critic_lr: 1e-4
+      actor_lr: 1e-4
+      batch_size: 256
+      replay_buffer_capacity: 1000000
+      tau: 0.005
+
+evaluation:
+  random_seed: 42
+  env_seed: 42
+  n_agent_traj: 100
+
+  bootstrap:
+    enabled: true
+    n_samples: 1000
+    seed: 42
