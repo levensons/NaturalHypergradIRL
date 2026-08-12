@@ -32,11 +32,11 @@ class ReplayBuffer:
         return self.size
 
     def push(self, state, action, reward, next_state, terminated):
-        self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
-        self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
-        self.reward_buf[self.ptr] = torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1)
-        self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
-        self.terminated_buf[self.ptr] = torch.as_tensor(terminated, dtype=torch.float32).detach().reshape(1)
+        self.state_buf[self.ptr].copy_(state.detach())
+        self.action_buf[self.ptr].copy_(action.detach())
+        self.reward_buf[self.ptr, 0] = reward.detach()
+        self.next_state_buf[self.ptr].copy_(next_state.detach())
+        self.terminated_buf[self.ptr, 0] = terminated.detach()
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -171,6 +171,11 @@ class SAC:
 
         self.global_gradient_update_step = 0
 
+        self.q1.compile()
+        self.q2.compile()
+        self.q1_target.compile()
+        self.q2_target.compile()
+
     def reset_optimizers(self):
         self.policy_optimizer.zero_grad()
         self.critic_optimizer.zero_grad()
@@ -243,9 +248,6 @@ class SAC:
         set_optimizer_lr(self.policy_optimizer, actor_lr)
         set_optimizer_lr(self.critic_optimizer, critic_lr)
 
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, gamma=1.0)
-        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=1.0)
-
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
             with torch.no_grad():
@@ -285,7 +287,6 @@ class SAC:
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.critic_params, max_grad_norm)
                 self.critic_optimizer.step()
-                critic_scheduler.step()
 
                 # ACTOR
                 new_actions, log_probs = self.policy.sample(states, return_log_probs=True)
@@ -301,7 +302,6 @@ class SAC:
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.policy_params, max_grad_norm)
                 self.policy_optimizer.step()
-                policy_scheduler.step()
 
                 # CRITIC-TARGET SOFT-UPDATE
                 self.global_gradient_update_step += 1
