@@ -23,8 +23,8 @@ import os
 import mlflow
 
 from src.irl.builders import import_env_builders
-from src.irl.trainers.fisher import train_fisher
-from src.irl.trainers.ml_irl import train_ml_irl
+from src.irl.methods.fisher import train_fisher
+from src.irl.methods.ml_irl import train_ml_irl
 from src.utils.config import load_config
 from src.utils.logging import get_logger
 

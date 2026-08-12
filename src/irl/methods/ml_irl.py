@@ -80,6 +80,8 @@ def train_ml_irl(
 
     policy = env_builders.build_policy(env=env, policy_cfg=policy_cfg).to(device)
     reward = env_builders.build_reward(env=env, reward_cfg=reward_cfg).to(device)
+    policy.compile()
+    reward.compile()
 
     outer_optimizer = MLIRL(
         reward=reward,
