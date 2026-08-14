@@ -51,12 +51,12 @@ def train_fisher(
     device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
-    # env = env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]))
-    rollout_envs = [
-        env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]) + worker_id)
-        for worker_id in range(n_jobs)
-    ]
-    reference_env = rollout_envs[0]
+    env = env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]))
+    # rollout_envs = [
+    #     env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]) + worker_id)
+    #     for worker_id in range(n_jobs)
+    # ]
+    # reference_env = rollout_envs[0]
     
     train_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["train_env_seed"]))
     eval_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["eval_env_seed"]))
@@ -76,8 +76,8 @@ def train_fisher(
     logger.info(f"Loaded {len(expert_valid_trajs)} expert valid trajectories from {expert_valid_path}")
     logger.info(f"Loaded {len(random_valid_trajs)} random valid trajectories from {random_valid_path}")
 
-    policy = env_builders.build_policy(env=reference_env, policy_cfg=policy_cfg).to(device)
-    reward = env_builders.build_reward(env=reference_env, reward_cfg=reward_cfg).to(device)
+    policy = env_builders.build_policy(env=env, policy_cfg=policy_cfg).to(device)
+    reward = env_builders.build_reward(env=env, reward_cfg=reward_cfg).to(device)
     policy.compile()
     reward.compile()
 
@@ -90,14 +90,14 @@ def train_fisher(
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
-        use_sketch=bool(fisher_cfg["use_sketch"]),
+        mode=str(fisher_cfg["mode"]),
         sketch_size=fisher_cfg["fisher_sketch_size"],
         fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
     )
 
     agent = build_agent(
         policy=policy,
-        env=reference_env,
+        env=env,
         agent_cfg=inner_cfg,
         gamma=float(fisher_cfg["gamma"]),
         alpha=float(fisher_cfg["alpha"]),
@@ -194,7 +194,7 @@ def train_fisher(
     best_l_outer = float("inf")
 
     arch = build_arch(
-        env=reference_env,
+        env=env,
         env_cfg=env_cfg,
         policy_cfg=policy_cfg,
         reward_cfg=reward_cfg,
@@ -210,9 +210,9 @@ def train_fisher(
             "alpha": fisher_cfg["alpha"],
             "gamma": fisher_cfg["gamma"],
             "fisher_reg": fisher_cfg["fisher_reg"],
+            "mode": fisher_cfg["mode"],
             "fisher_sketch_size": fisher_cfg["fisher_sketch_size"],
             "fisher_batch_size": fisher_cfg["fisher_batch_size"],
-            "use_sketch": fisher_cfg["use_sketch"],
             "lr_reward": fisher_cfg["lr_reward"],
             "max_grad_norm": fisher_cfg["max_grad_norm"],
             "scheduler_gamma": fisher_cfg["scheduler_gamma"],
@@ -231,8 +231,13 @@ def train_fisher(
         }
     )
 
+    ram_monitor = PeakRAMMonitor(interval=0.05)
+    ram_monitor.start()
+
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
+
+        ram_metrics = ram_monitor.snapshot()
 
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
@@ -303,6 +308,9 @@ def train_fisher(
                 "reward/random_return": random_learned_return,
                 "reward/expert_step_mean": expert_step_mean,
                 "reward/random_step_mean": random_step_mean,
+                "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
             },
             step=outer_step,
         )
@@ -313,19 +321,12 @@ def train_fisher(
         f"{'hyp_raw':>10} | {'hyp_clip':>10} | {'lr_outer':>12}"
     )
 
-    ram_monitor = PeakRAMMonitor(
-        interval=0.05,
-        log_every=30.0,
-        run_id=mlflow_run_id,
-    )
-    ram_monitor.start()
-
     try:
         for outer_step in range(1, n_outer_steps + 1):
             inner_optimize(outer_step)
 
-            agent_train_trajs = collect_trajectories_parallel(
-                envs=rollout_envs,
+            agent_train_trajs = collect_trajectories(
+                env=env,
                 policy=policy,
                 n=n_agent_trajs,
                 deterministic=False,
@@ -348,9 +349,21 @@ def train_fisher(
             f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
         )
 
-    # env.close()
-    for rollout_env in rollout_envs:
-        rollout_env.close()
+        try:
+            mlflow.log_metrics(
+                {
+                    "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                    "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                    "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
+                }
+            )
+
+        except Exception as error:
+            logger.warning(f"Failed to log memory metrics to MLflow: {error}")
+
+    env.close()
+    # for rollout_env in rollout_envs:
+    #     rollout_env.close()
 
     train_env.close()
     eval_env.close()

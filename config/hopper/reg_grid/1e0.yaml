@@ -28,11 +28,11 @@ fisher:
   gamma: 0.99
 
   fisher_reg: 1e0
-  fisher_sketch_size: null
   fisher_batch_size: 256
-  use_sketch: false
+  mode: explicit
+  fisher_sketch_size: null
 
-  lr_reward: 5e-2
+  lr_reward: 1e-2
   max_grad_norm: 1.0
   scheduler_gamma: 1.0
 
