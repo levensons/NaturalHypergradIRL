@@ -15,6 +15,8 @@ class REINFORCE:
         action_dim: int,
         gamma: float = 0.99,
         alpha: float = 1.0,
+        use_baseline: bool = False,
+        baseline_momentum: float = 0.9,
     ):
         self.policy = policy
         self.state_dim = state_dim
@@ -23,16 +25,35 @@ class REINFORCE:
         self.gamma = gamma
         self.alpha = alpha
 
+        self.use_baseline = use_baseline
+        self.baseline_momentum = baseline_momentum
+        self.baseline = None
+
         self.policy_optimizer = torch.optim.Adam(self.policy.parameters())
 
-    def reset_policy_optimizer(self):
+    def reset_policy(self):
+        if not hasattr(self.policy, "reset_parameters"):
+            raise TypeError("Policy must implement reset_parameters().")
+
+        self.policy.reset_parameters()
+        self.policy_optimizer.zero_grad()
         self.policy_optimizer.state.clear()
 
-    def gradient(self, trajs) -> torch.Tensor:
+        self.baseline = None
+
+    def reset_policy_optimizer(self):
+        self.policy_optimizer.zero_grad()
+        self.policy_optimizer.state.clear()
+
+    def policy_gradient(self, trajs) -> torch.Tensor:
         device = next(self.policy.parameters()).device
         policy_params = list(self.policy.parameters())
 
         gradient = torch.zeros(num_params(self.policy), device=device, dtype=torch.float32)
+
+        baseline = self.baseline
+        coefs = []
+
         for traj in trajs:
             states = to_device(traj["states"], device)
             actions = to_device(traj["actions"], device)
@@ -44,6 +65,11 @@ class REINFORCE:
             log_probs_sum = log_probs.sum()  # (1,)
             weighted_log_prob_sum = (weights * log_probs).sum()  # (1,)
             coef = (weights * (self.alpha * log_probs.detach() - rewards)).sum().detach()  # (1,)
+
+            if self.use_baseline:
+                coefs.append(coef)
+                if baseline is not None:
+                    coef = coef - baseline
 
             grad_sum_log_probs = torch.autograd.grad(log_probs_sum, policy_params, retain_graph=True, create_graph=False)
             grad_sum_log_probs = flat_grad(grad_sum_log_probs).detach()
@@ -57,9 +83,15 @@ class REINFORCE:
             grad_sum_weighted_log_probs = flat_grad(grad_sum_weighted_log_probs).detach()
 
             grad_traj = coef * grad_sum_log_probs + self.alpha * grad_sum_weighted_log_probs
-            gradient += grad_traj
+            gradient += grad_traj / len(trajs)
 
-        gradient /= len(trajs)
+        if self.use_baseline:
+            cur_baseline = torch.stack(coefs).mean().item()
+            if self.baseline is None:
+                self.baseline = cur_baseline
+            else:
+                self.baseline = self.baseline_momentum * self.baseline + (1.0 - self.baseline_momentum) * cur_baseline
+
         return gradient
 
     def optimize(
@@ -85,7 +117,7 @@ class REINFORCE:
                 verbose=False,
             )
 
-            gradient = self.gradient(trajs)
+            gradient = self.policy_gradient(trajs)
 
             self.raw_grad_norm = float(gradient.norm().item())
             if max_grad_norm is not None and self.raw_grad_norm > max_grad_norm:

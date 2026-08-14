@@ -1,0 +1,34 @@
+{
+  "env_name": "lqr",
+  "env_id": "NeuralLQR-v0",
+  "max_steps": 100,
+  "expert_algo": "sac",
+  "expert_path": "models/lqr/expert.zip",
+  "output_dir": "data/lqr",
+  "splits": {
+    "train": {
+      "n": 1000
+    },
+    "valid": {
+      "n": 100
+    },
+    "test": {
+      "n": 100
+    }
+  },
+  "files": {
+    "expert_train": "data/lqr/expert_train_trajs.pt",
+    "expert_valid": "data/lqr/expert_valid_trajs.pt",
+    "expert_test": "data/lqr/expert_test_trajs.pt",
+    "random_train": "data/lqr/random_train_trajs.pt",
+    "random_valid": "data/lqr/random_valid_trajs.pt",
+    "random_test": "data/lqr/random_test_trajs.pt"
+  },
+  "trajectory_format": {
+    "states": "[T, state_dim], torch.float32",
+    "actions": "[T] for discrete or [T, action_dim] for continuous",
+    "rewards": "[T], torch.float32",
+    "next_states": "[T, state_dim], torch.float32",
+    "terminateds": "[T], torch.bool"
+  }
+}

@@ -18,7 +18,29 @@ from src.utils.config import load_config, resolve_config_path
 from src.utils.seeding import set_random_seed
 from src.utils.sb3 import init_sb3_model, normalize_sb3_load_path, normalize_sb3_save_path
 from src.utils.env import Environment
+from envs.lqr.env import LQR, GymLQR
 
+def create_expert_env(env_cfg: dict, seed: int):
+    env_name = env_cfg["name"].lower()
+
+    if env_name == "lqr":
+        lqr = LQR(
+            A=env_cfg["A"],
+            B=env_cfg["B"],
+            Q=env_cfg["Q"],
+            R=env_cfg["R"],
+            process_cov=env_cfg["process_cov"],
+            initial_cov=env_cfg["initial_cov"],
+            max_episode_steps=int(env_cfg["max_steps"]),
+            action_limit=float(env_cfg["action_limit"]),
+            observation_limit=env_cfg["observation_limit"],
+            termination_state_norm=env_cfg["termination_state_norm"],
+            reward_scale=float(env_cfg["reward_scale"]),
+            seed=seed,
+        )
+        return GymLQR(lqr)
+
+    return Environment(env_cfg["id"], seed, int(env_cfg["max_steps"]))
 
 def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
     env_cfg = config["env"]
@@ -46,7 +68,7 @@ def train_expert_from_config(config: dict, verbose: int, overwrite: bool):
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     set_random_seed(random_seed)
-    env = Environment(env_id, env_seed)
+    env = create_expert_env(env_cfg, env_seed)
 
     save_path = normalize_sb3_save_path(expert_cfg["save_path"])
     zip_path = normalize_sb3_load_path(save_path)
@@ -66,7 +88,7 @@ def parse():
     parser.add_argument(
         "--env",
         type=str,
-        choices=["hopper", "cartpole", "pendulum"],
+        choices=["hopper", "cartpole", "lqr"],
         default=None,
         help="Environment name. Used to load config/<env>.yaml.",
     )

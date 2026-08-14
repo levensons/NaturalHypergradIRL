@@ -1,6 +1,5 @@
 from tqdm import tqdm
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +11,8 @@ from src.utils.torch import set_optimizer_lr
 
 class ReplayBuffer:
     def __init__(self, state_dim: int, action_dim: int, capacity: int = 1_000_000):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
         self.capacity = capacity
 
         self.state_buf = torch.empty(capacity, state_dim, dtype=torch.float32)
@@ -23,15 +24,19 @@ class ReplayBuffer:
         self.ptr = 0
         self.size = 0
 
+    def reset(self):
+        self.ptr = 0
+        self.size = 0
+
     def __len__(self):
         return self.size
 
     def push(self, state, action, reward, next_state, terminated):
-        self.state_buf[self.ptr] = torch.as_tensor(state, dtype=torch.float32).detach()
-        self.action_buf[self.ptr] = torch.as_tensor(action, dtype=torch.float32).detach()
-        self.reward_buf[self.ptr] = torch.as_tensor(reward, dtype=torch.float32).detach().reshape(1)
-        self.next_state_buf[self.ptr] = torch.as_tensor(next_state, dtype=torch.float32).detach()
-        self.terminated_buf[self.ptr] = torch.as_tensor(terminated, dtype=torch.float32).detach().reshape(1)
+        self.state_buf[self.ptr].copy_(state.detach())
+        self.action_buf[self.ptr].copy_(action.detach())
+        self.reward_buf[self.ptr, 0] = reward.detach()
+        self.next_state_buf[self.ptr].copy_(next_state.detach())
+        self.terminated_buf[self.ptr, 0] = terminated.detach()
 
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -111,6 +116,11 @@ class QFunction(nn.Module):
 
         self.backbone = nn.Sequential(*layers)
 
+    def reset_parameters(self):
+        for layer in self.modules():
+            if layer is not self and hasattr(layer, "reset_parameters"):
+                layer.reset_parameters()
+
     def forward(self, states: torch.Tensor, actions: torch.Tensor):
         # states: (B, state_dim)
         # actions: (B, action_dim)
@@ -132,10 +142,11 @@ class SAC:
         tau: float = 0.005,
         replay_buffer_capacity: int = 1_000_000,
     ):
-        self.policy = policy
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.replay_buffer_capacity = replay_buffer_capacity
+
+        self.policy = policy
 
         self.q1 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
         self.q2 = QFunction(state_dim, action_dim, hidden_dim, n_hidden_layers)
@@ -160,9 +171,40 @@ class SAC:
 
         self.global_gradient_update_step = 0
 
+        self.q1.compile()
+        self.q2.compile()
+        self.q1_target.compile()
+        self.q2_target.compile()
+
     def reset_optimizers(self):
+        self.policy_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
+
         self.policy_optimizer.state.clear()
         self.critic_optimizer.state.clear()
+        self.global_gradient_update_step = 0
+
+    def reset_policy(self):
+        if not hasattr(self.policy, "reset_parameters"):
+            raise TypeError("Policy must implement reset_parameters().")
+
+        self.policy.reset_parameters()
+        self.policy_optimizer.zero_grad()
+        self.policy_optimizer.state.clear()
+
+    def reset_critics(self):
+        self.q1.reset_parameters()
+        self.q2.reset_parameters()
+
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.critic_optimizer.zero_grad()
+        self.critic_optimizer.state.clear()
+        self.global_gradient_update_step = 0
+
+    def reset_replay_buffer(self):
+        self.replay_buffer.reset()
 
     def collect_random_rollout(self, env: Environment, n_steps: int):
         state = env.reset()
@@ -206,9 +248,6 @@ class SAC:
         set_optimizer_lr(self.policy_optimizer, actor_lr)
         set_optimizer_lr(self.critic_optimizer, critic_lr)
 
-        policy_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.policy_optimizer, gamma=1.0)
-        critic_scheduler = torch.optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=1.0)
-
         for ts in tqdm(range(total_steps), desc="SAC inner optimization", leave=False):
             # COLLECTING
             with torch.no_grad():
@@ -248,7 +287,6 @@ class SAC:
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.critic_params, max_grad_norm)
                 self.critic_optimizer.step()
-                critic_scheduler.step()
 
                 # ACTOR
                 new_actions, log_probs = self.policy.sample(states, return_log_probs=True)
@@ -264,7 +302,6 @@ class SAC:
                 if max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.policy_params, max_grad_norm)
                 self.policy_optimizer.step()
-                policy_scheduler.step()
 
                 # CRITIC-TARGET SOFT-UPDATE
                 self.global_gradient_update_step += 1
