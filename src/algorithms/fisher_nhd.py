@@ -1,3 +1,4 @@
+from typing import Literal
 from tqdm import tqdm
 import time
 
@@ -22,15 +23,15 @@ class FisherNHD:
         fisher_reg: float,
         max_grad_norm: float | None = None,
         scheduler_gamma: float = 1.0,
-        use_sketch: bool = True,
-        sketch_size: int = 32,
+        mode: Literal["explicit", "cg", "sketch"] = "explicit",
+        sketch_size: int | None = None,
         fisher_batch_size: int = 256,
     ):
-        if use_sketch and sketch_size is None:
-            raise ValueError("sketch_size must be specified when use_sketch=True.")
+        if mode not in {"explicit", "cg", "sketch"}:
+            raise ValueError(f"Unknown Fisher solve mode: {mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
 
-        if sketch_size is not None and sketch_size <= 0:
-            raise ValueError("sketch_size must be a positive integer.")
+        if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
+            raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
         
         self.reward = reward
         self.policy = policy
@@ -39,7 +40,7 @@ class FisherNHD:
         self.alpha = alpha
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
-        self.use_sketch = use_sketch
+        self.mode = mode
         self.sketch_size = sketch_size
         self.fisher_batch_size = fisher_batch_size
 
@@ -137,8 +138,11 @@ class FisherNHD:
             batch_weights = torch.cat(weights_buffer, dim=0)
 
             grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
-            row_scale = torch.sqrt((self.alpha / len(trajs)) * batch_weights)  # (B,)
-            X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (B, policy_dim)
+
+            with torch.no_grad():
+                row_scale = torch.sqrt((self.alpha / len(trajs)) * batch_weights)  # (B,)
+                X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (B, policy_dim)
+
             sketch.extend(X_rows)
 
             states_buffer.clear()
@@ -170,6 +174,123 @@ class FisherNHD:
             flush()
 
         return sketch.solve(g)
+
+    def _fisher_vector_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
+        v = v.detach()
+
+        with torch.no_grad():
+            out = self.fisher_reg * v.clone()
+
+        states_buffer = []
+        actions_buffer = []
+        weights_buffer = []
+        buffer_size = 0
+
+        policy_params = list(self.policy.parameters())
+
+        def flush():
+            nonlocal buffer_size
+
+            batch_states = torch.cat(states_buffer, dim=0)
+            batch_actions = torch.cat(actions_buffer, dim=0)
+            batch_weights = torch.cat(weights_buffer, dim=0)
+
+            log_pi_a_s = self.policy.log_prob(batch_states, batch_actions)  # (B,)
+
+            u = torch.zeros_like(log_pi_a_s, requires_grad=True)
+            jt_u = torch.autograd.grad(
+                outputs=log_pi_a_s,
+                inputs=policy_params,
+                grad_outputs=u,
+                create_graph=True,
+                retain_graph=True,
+            )
+            jt_u_flat = flat_grad(jt_u)  # (policy_dim,)
+
+            scalar = torch.dot(jt_u_flat, v)
+            jv = torch.autograd.grad(
+                outputs=scalar,
+                inputs=u,
+                retain_graph=True,
+                create_graph=False,
+            )[0].detach()  # (B,)
+
+            scaled_weights = (self.alpha * batch_weights / len(trajs))  # (B,)
+
+            x = scaled_weights * jv  # (B,)
+            jt_x = torch.autograd.grad(
+                outputs=log_pi_a_s,
+                inputs=policy_params,
+                grad_outputs=x,
+                retain_graph=False,
+                create_graph=False,
+            )
+            jt_x_flat = flat_grad(jt_x).detach()  # (policy_dim,)
+
+            with torch.no_grad():
+                out.add_(jt_x_flat)
+
+            states_buffer.clear()
+            actions_buffer.clear()
+            weights_buffer.clear()
+            buffer_size = 0
+
+        for traj in tqdm(trajs, desc="Fisher vector product", leave=False, disable=not verbose):
+            states = to_device(traj["states"], self.device)
+            actions = to_device(traj["actions"], self.device)
+            T = states.size(0)
+            weights = discount_weights(T, self.gamma, self.device, torch.float32)
+
+            start = 0
+            while start < T:
+                take = min(self.fisher_batch_size - buffer_size, T - start)
+
+                states_buffer.append(states[start : start + take])
+                actions_buffer.append(actions[start : start + take])
+                weights_buffer.append(weights[start : start + take])
+
+                buffer_size += take
+                start += take
+
+                if buffer_size == self.fisher_batch_size:
+                    flush()
+
+        if buffer_size > 0:
+            flush()
+
+        return out
+
+    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 1000, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
+        x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
+        r = g.detach().clone()
+        p = r.clone()
+
+        with torch.no_grad():
+            r_dot_r = torch.dot(r, r)
+            g_norm = torch.linalg.vector_norm(g)
+
+        for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
+            Fp = self._fisher_vector_product(trajs, p, verbose=False)
+
+            with torch.no_grad():
+                p_dot_Fp = torch.dot(p, Fp)
+                if p_dot_Fp <= 0:
+                    raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
+
+                alpha = r_dot_r / torch.dot(p, Fp)
+
+                x.add_(p, alpha=alpha)
+                r.add_(Fp, alpha=-alpha)
+
+                r_new_dot_r_new = torch.dot(r, r)
+                if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
+                    break
+
+                beta = r_new_dot_r_new / r_dot_r
+                p.mul_(beta).add_(r)
+                r_dot_r = r_new_dot_r_new
+
+        return x
 
     def exact_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
         F = torch.zeros(self.policy_num_params, self.policy_num_params, dtype=torch.float32, device=self.device)
@@ -279,6 +400,22 @@ class FisherNHD:
 
         return hypergrad
 
+    def hypergradient_with_conjugate_gradients(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
+        fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
+        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+
+        with torch.no_grad():
+            tqdm.write(
+                f"Fisher stats | "
+                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
+                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
+                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
+                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
+            )
+
+        return hypergrad
+
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
         d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
         fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
@@ -296,10 +433,14 @@ class FisherNHD:
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        if self.use_sketch:
+        if self.mode == "explicit":
+            hypergradient = self.hypergradient_with_exact_fisher(expert_trajs, agent_trajs)
+        elif self.mode == "cg":
+            hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
+        elif self.mode == "sketch":
             hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
         else:
-            hypergradient = self.hypergradient_with_exact_fisher(expert_trajs, agent_trajs)
+            raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
 
         if not torch.isfinite(hypergradient).all():
             raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")
