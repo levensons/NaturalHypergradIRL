@@ -5,6 +5,7 @@ Environment-specific objects are constructed through `env_builders`.
 The trainer itself is independent of a particular environment.
 """
 
+import os
 from pathlib import Path
 from types import ModuleType
 
@@ -118,9 +119,46 @@ def train_fisher(
 
         if agent_type == "sac":
             agent.replay_buffer.recalc_rewards(current_reward_fn)
-            agent.reset_policy()
-            agent.reset_critics()
-            agent.reset_optimizers()
+
+            reset_mode = os.getenv("SAC_RESET_MODE", "nothing")
+
+            if reset_mode == "nothing":
+                agent.reset_optimizers()
+
+            elif reset_mode == "policy":
+                agent.reset_policy()
+                agent.reset_optimizers()
+
+            elif reset_mode == "critics":
+                agent.reset_critics()
+                agent.reset_optimizers()
+
+            elif reset_mode == "replay_buffer":
+                agent.replay_buffer.reset()
+
+            elif reset_mode == "critics_replay_buffer":
+                agent.reset_critics()
+                agent.reset_optimizers()
+                agent.replay_buffer.reset()
+
+            elif reset_mode == "policy_critics":
+                agent.reset_policy()
+                agent.reset_critics()
+                agent.reset_optimizers()
+
+            elif reset_mode == "policy_replay_buffer":
+                agent.reset_policy()
+                agent.reset_optimizers()
+                agent.replay_buffer.reset()
+
+            elif reset_mode == "policy_critics_replay_buffer":
+                agent.reset_policy()
+                agent.reset_critics()
+                agent.reset_optimizers()
+                agent.replay_buffer.reset()
+
+            else:
+                raise ValueError(f"Unknown SAC_RESET_MODE: {reset_mode}")
 
         elif agent_type == "reinforce":
             agent.reset_policy()
