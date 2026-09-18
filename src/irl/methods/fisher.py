@@ -11,13 +11,14 @@ from types import ModuleType
 
 import mlflow
 import torch
+import numpy as np
 
 from src.algorithms.fisher_nhd import FisherNHD
 from src.evaluation.metrics import inner_loss, learned_reward_stats, outer_loss, policy_nll, rank_corr
 from src.irl.builders import SUPPORTED_AGENTS, build_agent, build_arch
 from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
-from src.utils.resources import PeakRAMMonitor
+from src.utils.resources import PeakRAMMonitor, RecordTime
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
@@ -248,20 +249,16 @@ def train_fisher(
         }
     )
 
-    mlflow.log_params(
-        {f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()}
-    )
+    mlflow.log_params({f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()})
 
-    mlflow.log_params(
-        {
-            f"arch/{key}": value
-            for key, value in arch.items()
-            if not isinstance(value, (list, dict))
-        }
-    )
+    mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
 
     ram_monitor = PeakRAMMonitor(interval=0.05)
     ram_monitor.start()
+
+    total_optimization_time = 0.0
+    outer_step_times = []
+    hypergradient_times = []
 
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
@@ -271,6 +268,7 @@ def train_fisher(
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
+        hypergradient_time = outer_optimizer.hypergradient_time
 
         l_outer_value = outer_loss(policy, expert_valid_trajs, agent.gamma)
 
@@ -340,6 +338,7 @@ def train_fisher(
                 "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
                 "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
                 "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
+                "timing/hypergradient_seconds": float(hypergradient_time),
             },
             step=outer_step,
         )
@@ -352,24 +351,39 @@ def train_fisher(
 
     try:
         for outer_step in range(1, n_outer_steps + 1):
-            inner_optimize(outer_step)
+            with RecordTime() as r:
+                inner_optimize(outer_step)
 
-            agent_train_trajs = collect_trajectories(
-                env=env,
-                policy=policy,
-                n=n_agent_trajs,
-                deterministic=False,
-                desc="agent train trajs",
-                verbose=True,
-            )
+                agent_train_trajs = collect_trajectories(
+                    env=env,
+                    policy=policy,
+                    n=n_agent_trajs,
+                    deterministic=False,
+                    desc="agent train trajs",
+                    verbose=True,
+                )
+
+            total_optimization_time += r.elapsed
 
             log_and_checkpoint(outer_step, agent_train_trajs)
 
             if outer_step < n_outer_steps:
-                outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+                with RecordTime() as r:
+                    outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+                total_optimization_time += r.elapsed
+                outer_step_times.append(r.elapsed)
+                hypergradient_times.append(outer_optimizer.hypergradient_time)
+
 
     finally:
         ram_metrics = ram_monitor.stop()
+
+        outer_step_time_mean = np.mean(outer_step_times)
+        outer_step_time_std = np.std(outer_step_times, ddof=1)
+
+        hypergradient_time_mean = np.mean(hypergradient_times)
+        hypergradient_time_std = np.std(hypergradient_times, ddof=1)
 
         logger.info(
             "Training memory | "
@@ -378,12 +392,24 @@ def train_fisher(
             f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
         )
 
+        logger.info(
+            "Training time | "
+            f"total optimization={total_optimization_time:.2f} s | "
+            f"outer step={outer_step_time_mean:.2f} ± {outer_step_time_std:.2f} s | "
+            f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s"
+        )
+
         try:
             mlflow.log_metrics(
                 {
                     "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
                     "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
                     "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
+                    "timing/total_optimization_seconds": total_optimization_time,
+                    "timing/outer_step_seconds_mean": float(outer_step_time_mean),
+                    "timing/outer_step_seconds_std": float(outer_step_time_std),
+                    "timing/hypergradient_seconds_mean": float(hypergradient_time_mean),
+                    "timing/hypergradient_seconds_std": float(hypergradient_time_std),
                 }
             )
 

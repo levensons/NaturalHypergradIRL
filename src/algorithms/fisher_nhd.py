@@ -8,6 +8,7 @@ from torch import nn
 
 from src.algorithms.approximations import CBSCFD
 from src.utils.policies import Policy
+from src.utils.resources import RecordTime
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
 
@@ -44,11 +45,12 @@ class FisherNHD:
         self.sketch_size = sketch_size
         self.fisher_batch_size = fisher_batch_size
 
-        self.raw_grad_norm = 0.0
-        self.clipped_grad_norm = 0.0
-
         self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
         self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
+
+        self.raw_grad_norm = 0.0
+        self.clipped_grad_norm = 0.0
+        self.hypergradient_time = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -440,14 +442,15 @@ class FisherNHD:
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        if self.mode == "explicit":
-            hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
-        elif self.mode == "cg":
-            hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
-        elif self.mode == "sketch":
-            hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
-        else:
-            raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+        with RecordTime(self, "hypergradient_time"):
+            if self.mode == "explicit":
+                hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
+            elif self.mode == "cg":
+                hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
+            elif self.mode == "sketch":
+                hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
+            else:
+                raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
 
         if not torch.isfinite(hypergradient).all():
             raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")

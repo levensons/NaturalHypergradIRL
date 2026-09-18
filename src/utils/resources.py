@@ -88,3 +88,24 @@ class PeakRAMMonitor:
 
         self._thread = None
         return metrics
+
+
+class RecordTime:
+    def __init__(self, obj=None, attr=None):
+        if obj is None and attr is not None:
+            raise ValueError("attr cannot be specified without obj.")
+
+        self.obj = obj
+        self.attr = attr
+        self.elapsed = None
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.elapsed = time.perf_counter() - self._start
+
+        if self.obj is not None:
+            setattr(self.obj, self.attr, self.elapsed)
+    
