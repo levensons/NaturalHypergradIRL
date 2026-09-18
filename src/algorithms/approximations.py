@@ -1,4 +1,5 @@
 import torch
+from memory_profiler import profile
 
 
 class CBSCFD:
@@ -14,6 +15,7 @@ class CBSCFD:
         self.ptr = m
 
     @torch.no_grad()
+    @profile
     def extend(self, rows: torch.Tensor):
         if rows.ndim == 1:
             rows = rows.unsqueeze(0)
@@ -88,6 +90,7 @@ class CBSCFD:
         return H_new
 
     @torch.no_grad()
+    @profile
     def solve(self, g: torch.Tensor, cholesky: bool = True):
         if g.ndim != 1 or g.shape[0] != self.dim:
             raise ValueError(f"g must have shape [{self.dim}], got {g.shape}.")
