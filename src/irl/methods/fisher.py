@@ -257,6 +257,7 @@ def train_fisher(
     ram_monitor.start()
 
     total_optimization_time = 0.0
+    inner_step_times = []
     outer_step_times = []
     hypergradient_times = []
 
@@ -268,7 +269,6 @@ def train_fisher(
         lr_outer_current = outer_optimizer.optimizer.param_groups[0]["lr"]
         raw_hypgrad_norm = outer_optimizer.raw_grad_norm
         clipped_hypgrad_norm = outer_optimizer.clipped_grad_norm
-        hypergradient_time = outer_optimizer.hypergradient_time
 
         l_outer_value = outer_loss(policy, expert_valid_trajs, agent.gamma)
 
@@ -338,7 +338,6 @@ def train_fisher(
                 "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
                 "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
                 "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
-                "timing/hypergradient_seconds": float(hypergradient_time),
             },
             step=outer_step,
         )
@@ -351,7 +350,7 @@ def train_fisher(
 
     try:
         for outer_step in range(1, n_outer_steps + 1):
-            with RecordTime() as r:
+            with RecordTime() as timer:
                 inner_optimize(outer_step)
 
                 agent_train_trajs = collect_trajectories(
@@ -363,21 +362,33 @@ def train_fisher(
                     verbose=True,
                 )
 
-            total_optimization_time += r.elapsed
+            total_optimization_time += timer.elapsed
+            inner_step_times.append(timer.elapsed)
+            mlflow.log_metric("timing/inner_step_seconds", float(timer.elapsed), step=outer_step)
 
             log_and_checkpoint(outer_step, agent_train_trajs)
 
             if outer_step < n_outer_steps:
-                with RecordTime() as r:
+                with RecordTime() as timer:
                     outer_optimizer.step(expert_train_trajs, agent_train_trajs)
 
-                total_optimization_time += r.elapsed
-                outer_step_times.append(r.elapsed)
+                total_optimization_time += timer.elapsed
+                outer_step_times.append(timer.elapsed)
                 hypergradient_times.append(outer_optimizer.hypergradient_time)
 
+                mlflow.log_metrics(
+                    {
+                        "timing/outer_step_seconds": float(outer_step_times[-1]),
+                        "timing/hypergradient_seconds": float(hypergradient_times[-1]),
+                    },
+                    step=outer_step,
+                )
 
     finally:
         ram_metrics = ram_monitor.stop()
+
+        inner_step_time_mean = np.mean(inner_step_times)
+        inner_step_time_std = np.std(inner_step_times, ddof=1)
 
         outer_step_time_mean = np.mean(outer_step_times)
         outer_step_time_std = np.std(outer_step_times, ddof=1)
@@ -395,6 +406,7 @@ def train_fisher(
         logger.info(
             "Training time | "
             f"total optimization={total_optimization_time:.2f} s | "
+            f"inner step={inner_step_time_mean:.2f} ± {inner_step_time_std:.2f} s | "
             f"outer step={outer_step_time_mean:.2f} ± {outer_step_time_std:.2f} s | "
             f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s"
         )
@@ -405,7 +417,9 @@ def train_fisher(
                     "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
                     "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
                     "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
-                    "timing/total_optimization_seconds": total_optimization_time,
+                    "timing/total_optimization_seconds": float(total_optimization_time),
+                    "timing/inner_step_seconds_mean": float(inner_step_time_mean),
+                    "timing/inner_step_seconds_std": float(inner_step_time_std),
                     "timing/outer_step_seconds_mean": float(outer_step_time_mean),
                     "timing/outer_step_seconds_std": float(outer_step_time_std),
                     "timing/hypergradient_seconds_mean": float(hypergradient_time_mean),
@@ -414,7 +428,7 @@ def train_fisher(
             )
 
         except Exception as error:
-            logger.warning(f"Failed to log memory metrics to MLflow: {error}")
+            logger.warning(f"Failed to log final metrics to MLflow: {error}")
 
     env.close()
 
