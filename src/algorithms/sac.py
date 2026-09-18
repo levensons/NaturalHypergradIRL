@@ -171,11 +171,6 @@ class SAC:
 
         self.global_gradient_update_step = 0
 
-        self.q1.compile()
-        self.q2.compile()
-        self.q1_target.compile()
-        self.q2_target.compile()
-
     def reset_optimizers(self):
         self.policy_optimizer.zero_grad()
         self.critic_optimizer.zero_grad()

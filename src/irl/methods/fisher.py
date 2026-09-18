@@ -19,7 +19,7 @@ from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
 from src.utils.resources import PeakRAMMonitor
 from src.utils.seeding import set_random_seed
-from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return, collect_trajectories_parallel
+from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
 
 def train_fisher(
@@ -27,9 +27,7 @@ def train_fisher(
     env_builders: ModuleType,
     checkpoint_path: str | Path,
     log_every: int,
-    mlflow_run_id: str,
     logger,
-    n_jobs: int = -1,
 ) -> None:
     fisher_cfg = config["fisher"]
     inner_cfg = fisher_cfg["inner"]
@@ -53,11 +51,6 @@ def train_fisher(
     logger.info(f"Using device: {device}")
 
     env = env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]))
-    # rollout_envs = [
-    #     env_builders.build_env(env_cfg=env_cfg, seed=int(fisher_cfg["env_seed"]) + worker_id)
-    #     for worker_id in range(n_jobs)
-    # ]
-    # reference_env = rollout_envs[0]
     
     train_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["train_env_seed"]))
     eval_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["eval_env_seed"]))
@@ -79,8 +72,6 @@ def train_fisher(
 
     policy = env_builders.build_policy(env=env, policy_cfg=policy_cfg).to(device)
     reward = env_builders.build_reward(env=env, reward_cfg=reward_cfg).to(device)
-    policy.compile()
-    reward.compile()
 
     outer_optimizer = FisherNHD(
         reward=reward,
@@ -400,8 +391,6 @@ def train_fisher(
             logger.warning(f"Failed to log memory metrics to MLflow: {error}")
 
     env.close()
-    # for rollout_env in rollout_envs:
-    #     rollout_env.close()
 
     train_env.close()
     eval_env.close()

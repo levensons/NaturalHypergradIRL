@@ -178,9 +178,7 @@ def main() -> None:
             env_builders=env_builders,
             checkpoint_path=checkpoint_path,
             log_every=args.log_every,
-            mlflow_run_id=run.info.run_id,
             logger=logger,
-            n_jobs=args.n_jobs,
         )
 
 

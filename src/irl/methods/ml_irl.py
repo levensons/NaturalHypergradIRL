@@ -26,7 +26,6 @@ def train_ml_irl(
     env_builders: ModuleType,
     checkpoint_path: str | Path,
     log_every: int,
-    mlflow_run_id: str,
     logger,
 ) -> None:
     ml_irl_cfg = config["ml_irl"]
@@ -200,8 +199,13 @@ def train_ml_irl(
         {f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()}
     )
 
+    ram_monitor = PeakRAMMonitor(interval=0.05)
+    ram_monitor.start()
+
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
+
+        ram_metrics = ram_monitor.snapshot()
 
         l_outer_value = float(outer_loss(policy, expert_valid_trajs, agent.gamma))
         l_inner_value = float(inner_loss(policy, reward, agent_trajs, agent.gamma, agent.alpha))
@@ -283,6 +287,9 @@ def train_ml_irl(
                 "expert_mean_reward": expert_mean_reward,
                 "agent_mean_reward": agent_mean_reward,
                 "expert_agent_reward_diff": expert_mean_reward - agent_mean_reward,
+                "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
             },
             step=outer_step,
         )
@@ -292,13 +299,6 @@ def train_ml_irl(
         f"{'agent_ret':>10} | {'RankCorr':>9} | {'PolicyNLL':>10} | {'R_loss':>10} | "
         f"{'grad_raw':>10} | {'grad_clip':>10} | {'lr_reward':>12}"
     )
-
-    ram_monitor = PeakRAMMonitor(
-        interval=0.05,
-        log_every=30.0,
-        run_id=mlflow_run_id,
-    )
-    ram_monitor.start()
 
     try:
         for outer_step in range(1, n_outer_steps + 1):
@@ -328,6 +328,19 @@ def train_ml_irl(
             f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
         )
 
+        try:
+            mlflow.log_metrics(
+                {
+                    "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                    "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                    "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
+                }
+            )
+
+        except Exception as error:
+            logger.warning(f"Failed to log memory metrics to MLflow: {error}")
+
     env.close()
+
     train_env.close()
     eval_env.close()
