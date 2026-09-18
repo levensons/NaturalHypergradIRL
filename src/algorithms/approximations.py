@@ -4,6 +4,12 @@ from memory_profiler import profile
 
 class CBSCFD:
     def __init__(self, dim: int, m: int, reg: float, dtype: torch.dtype = torch.float32):
+        if m <= 0:
+            raise ValueError(f"`m` must be positive, got m={m}.")
+
+        if 2 * m > dim:
+            raise ValueError(f"`m` must satisfy 2 * m <= dim, got m={m}, dim={dim}.")
+
         self.dim = dim
         self.m = m
         self.dtype = dtype
