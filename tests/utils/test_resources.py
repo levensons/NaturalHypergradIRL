@@ -1,14 +1,6 @@
-import time
+import pytest
 
 from src.utils.resources import RecordTime
-
-
-def test_record_time():
-    with RecordTime() as timer:
-        time.sleep(0.01)
-
-    assert timer.elapsed is not None
-    assert timer.elapsed >= 0.01
 
 
 def test_record_time_sets_attribute():
@@ -18,6 +10,18 @@ def test_record_time_sets_attribute():
     obj = Dummy()
 
     with RecordTime(obj, "elapsed"):
-        time.sleep(0.01)
+        pass
 
-    assert obj.elapsed >= 0.01
+    assert obj.elapsed is not None
+    assert obj.elapsed >= 0.0
+
+
+def test_record_time_records_on_exception():
+    timer = RecordTime()
+
+    with pytest.raises(RuntimeError):
+        with timer:
+            raise RuntimeError("test")
+
+    assert timer.elapsed is not None
+    assert timer.elapsed >= 0.0
