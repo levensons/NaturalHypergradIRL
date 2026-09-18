@@ -1,0 +1,166 @@
+env:
+  name: cartpole
+  id: CartPole-v1
+  action_type: discrete
+  max_steps: 500
+
+expert:
+  algo: ppo
+  save_path: models/cartpole/expert
+  random_seed: 42
+  env_seed: 42
+  total_timesteps: 100000
+
+  params:
+    policy: MlpPolicy
+    learning_rate: 0.001
+    n_steps: 2048
+    batch_size: 64
+    n_epochs: 10
+    gamma: 0.99
+    seed: 42
+
+trajectory_collection:
+  output_dir: data/cartpole
+  random_seed: 42
+  env_seed: 42
+
+  train:
+    n: 1000
+
+  valid:
+    n: 100
+
+  test:
+    n: 100
+
+reward:
+  hidden_dim: 16
+  n_hidden_layers: 1
+  clamp_magnitude: 10
+
+policy:
+  hidden_dim: 32
+  n_hidden_layers: 2
+
+fisher:
+  random_seed: 42
+  env_seed: 42
+
+  n_outer_steps: 100
+  n_inner_steps: 500
+
+  n_agent_trajs: 1000
+
+  alpha: 0.1
+  gamma: 0.99
+
+  fisher_reg: 1e-3
+  fisher_sketch_size: null
+  fisher_batch_size: 64
+  use_sketch: false
+
+  lr_reward: 1e-2
+  max_grad_norm: 1.0
+  scheduler_gamma: 1.0
+
+  inner:
+    type: reinforce
+
+    train_env_seed: 100
+    eval_env_seed: 101
+
+    validate_every: 50
+    n_agent_eval_trajs: 3
+
+    use_baseline: false
+    baseline_momentum: null
+
+    params:
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20
+
+ml_irl:
+  random_seed: 42
+  env_seed: 42
+
+  n_outer_steps: 500
+  n_inner_steps: 100
+
+  n_agent_trajs: 1000
+
+  alpha: 0.1
+  gamma: 0.99
+
+  lr_reward: 1e-4
+  max_grad_norm: 1.0
+  scheduler_gamma: 1.0
+
+  inner:
+    type: reinforce
+
+    train_env_seed: 100
+    eval_env_seed: 101
+
+    validate_every: 50
+    n_agent_eval_trajs: 3
+
+    use_baseline: false
+    baseline_momentum: null
+
+    params:
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20
+
+data:
+  expert_train_trajs: data/cartpole/expert_train_trajs.pt
+  expert_valid_trajs: data/cartpole/expert_valid_trajs.pt
+  expert_test_trajs: data/cartpole/expert_test_trajs.pt
+  random_train_trajs: data/cartpole/random_train_trajs.pt
+  random_valid_trajs: data/cartpole/random_valid_trajs.pt
+  random_test_trajs: data/cartpole/random_test_trajs.pt
+
+checkpoint:
+  dir: checkpoints/cartpole
+
+logging:
+  log_dir: logs
+  report_dir: reports
+  log_every: 1
+
+evaluation:
+  random_seed: 42
+  env_seed: 42
+  n_agent_traj: 100
+
+  bootstrap:
+    enabled: true
+    n_samples: 1000
+    seed: 42
+
+policy_final_training:
+    type: reinforce
+
+    alpha: 0.1
+    gamma: 0.99
+
+    random_seed: 123
+    train_env_seed: 123
+    eval_env_seed: 124
+
+    validate_every: 50
+    n_agent_eval_trajs: 3
+
+    use_baseline: true
+    baseline_momentum: 0.9
+
+    params:
+      total_steps: 2000
+      lr_policy: 1e-3
+      scheduler_gamma: 1.0
+      max_grad_norm: null
+      n_traj_per_update: 20

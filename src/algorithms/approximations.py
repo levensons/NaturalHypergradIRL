@@ -2,13 +2,14 @@ import torch
 
 
 class CBSCFD:
-    def __init__(self, dim: int, m: int, reg: float):
+    def __init__(self, dim: int, m: int, reg: float, dtype: torch.dtype = torch.float32):
         self.dim = dim
         self.m = m
+        self.dtype = dtype
 
-        self.alpha = torch.tensor(reg, dtype=torch.float32)
-        self.Z = torch.zeros(2 * m, dim, dtype=torch.float32)
-        self.H = torch.full(size=(m,), fill_value=1 / reg, dtype=torch.float32)
+        self.alpha = torch.tensor(reg, dtype=self.dtype)
+        self.Z = torch.zeros(2 * m, dim, dtype=self.dtype)
+        self.H = torch.full(size=(m,), fill_value=1 / reg, dtype=self.dtype)
 
         self.ptr = m
 

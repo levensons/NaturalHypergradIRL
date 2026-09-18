@@ -1,5 +1,6 @@
-from typing import List
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import numpy as np
 import torch
@@ -7,6 +8,45 @@ from tqdm import tqdm
 
 from src.utils.policies import Policy
 from src.utils.env import Environment
+
+
+def collect_trajectory(
+    env: Environment,
+    policy: Policy,
+    deterministic: bool = False,
+) -> dict:
+    states = []
+    actions = []
+    rewards = []
+    next_states = []
+    terminateds = []
+
+    state = env.reset()
+
+    while True:
+        with torch.no_grad():
+            action = policy.sample(states=state, deterministic=deterministic)
+
+        next_state, reward, terminated, truncated = env.step(action)
+
+        states.append(state.detach())
+        actions.append(action.detach())
+        rewards.append(reward.detach())
+        next_states.append(next_state.detach())
+        terminateds.append(terminated.detach())
+
+        state = next_state
+
+        if terminated.item() or truncated.item():
+            break
+
+    return {
+        "states": torch.stack(states),
+        "actions": torch.stack(actions),
+        "rewards": torch.stack(rewards),
+        "next_states": torch.stack(next_states),
+        "terminateds": torch.stack(terminateds),
+    }
 
 
 def collect_trajectories(
@@ -23,42 +63,55 @@ def collect_trajectories(
     trajs = []
 
     for _ in tqdm(range(n), desc=desc, leave=False, disable=not verbose):
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        terminateds = []
-
-        state = env.reset()
-
-        while True:
-            with torch.no_grad():
-                action = policy.sample(states=state, deterministic=deterministic)
-
-            next_state, reward, terminated, truncated = env.step(action)
-
-            states.append(state.detach())
-            actions.append(action.detach())
-            rewards.append(reward.detach())
-            next_states.append(next_state.detach())
-            terminateds.append(terminated.detach())
-
-            state = next_state
-
-            if terminated.item() or truncated.item():
-                break
-
-        trajs.append(
-            {
-                "states": torch.stack(states),
-                "actions": torch.stack(actions),
-                "rewards": torch.stack(rewards),
-                "next_states": torch.stack(next_states),
-                "terminateds": torch.stack(terminateds),
-            }
-        )
+        trajs.append(collect_trajectory(env, policy, deterministic))
 
     return trajs
+
+
+def collect_trajectories_parallel(
+    envs,
+    policy,
+    n: int,
+    deterministic: bool = False,
+    desc: str = "collect trajs",
+    verbose: bool = True,
+):
+    if not envs:
+        raise ValueError("`envs` must contain at least one environment.")
+
+    n_workers = len(envs)
+
+    base = n // n_workers
+    remainder = n % n_workers
+    counts = [base + (worker_id < remainder) for worker_id in range(n_workers)]
+
+    progress_lock = Lock()
+
+    with tqdm(total=n, desc=desc, leave=False, disable=not verbose) as progress:
+
+        def collect(env, count: int):
+            trajectories = []
+
+            for _ in range(count):
+                traj = collect_trajectory(env, policy, deterministic)
+                trajectories.append(traj)
+
+                with progress_lock:
+                    progress.update(1)
+
+            return trajectories
+
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = [
+                executor.submit(collect, env, count)
+                for env, count in zip(envs, counts) if count > 0
+            ]
+
+            trajectories = []
+            for future in futures:
+                trajectories.extend(future.result())
+
+    return trajectories
 
 
 def trajectory_return(traj: dict) -> float:
