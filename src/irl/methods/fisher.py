@@ -112,7 +112,7 @@ def train_fisher(
         if agent_type == "sac":
             agent.replay_buffer.recalc_rewards(current_reward_fn)
 
-            reset_mode = os.getenv("SAC_RESET_MODE", "nothing")
+            reset_mode = os.getenv("SAC_RESET_MODE", "policy_critics")
 
             if reset_mode == "nothing":
                 agent.reset_optimizers()
