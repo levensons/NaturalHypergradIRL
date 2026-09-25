@@ -19,7 +19,7 @@ fisher:
   random_seed: 42
   env_seed: 42
   
-  n_outer_steps: 100
+  n_outer_steps: 50
   n_inner_steps: 100000
 
   n_agent_trajs: 1000
@@ -27,7 +27,7 @@ fisher:
   alpha: 0.2
   gamma: 0.99
 
-  fisher_reg: 1e-3
+  fisher_reg: 1e0
   fisher_batch_size: 256
   mode: cg
   fisher_sketch_size: null
