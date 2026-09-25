@@ -253,13 +253,33 @@ def train_fisher(
 
     mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
 
-    ram_monitor = PeakRAMMonitor(interval=0.05)
+    ram_monitor = PeakRAMMonitor(interval=0.001)
     ram_monitor.start()
 
     total_optimization_time = 0.0
     inner_step_times = []
     outer_step_times = []
+
     hypergradient_times = []
+    outer_grad_times = []
+    fisher_solve_times = []
+    cross_product_times = []
+
+    hypergradient_start_rss = []
+    hypergradient_peak_rss = []
+    hypergradient_delta_rss = []
+
+    outer_grad_start_rss = []
+    outer_grad_peak_rss = []
+    outer_grad_delta_rss = []
+
+    fisher_solve_start_rss = []
+    fisher_solve_peak_rss = []
+    fisher_solve_delta_rss = []
+
+    cross_product_start_rss = []
+    cross_product_peak_rss = []
+    cross_product_delta_rss = []
 
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
@@ -374,15 +394,92 @@ def train_fisher(
 
                 total_optimization_time += timer.elapsed
                 outer_step_times.append(timer.elapsed)
+
                 hypergradient_times.append(outer_optimizer.hypergradient_time)
+                outer_grad_times.append(outer_optimizer.outer_grad_time)
+                fisher_solve_times.append(outer_optimizer.fisher_solve_time)
+                cross_product_times.append(outer_optimizer.cross_product_time)
+
+                hypergradient_start_rss.append(outer_optimizer.hypergradient_start_rss_mb)
+                hypergradient_peak_rss.append(outer_optimizer.hypergradient_peak_rss_mb)
+                hypergradient_delta_rss.append(outer_optimizer.hypergradient_delta_rss_mb)
+
+                outer_grad_start_rss.append(outer_optimizer.outer_grad_start_rss_mb)
+                outer_grad_peak_rss.append(outer_optimizer.outer_grad_peak_rss_mb)
+                outer_grad_delta_rss.append(outer_optimizer.outer_grad_delta_rss_mb)
+
+                fisher_solve_start_rss.append(outer_optimizer.fisher_solve_start_rss_mb)
+                fisher_solve_peak_rss.append(outer_optimizer.fisher_solve_peak_rss_mb)
+                fisher_solve_delta_rss.append(outer_optimizer.fisher_solve_delta_rss_mb)
+
+                cross_product_start_rss.append(outer_optimizer.cross_product_start_rss_mb)
+                cross_product_peak_rss.append(outer_optimizer.cross_product_peak_rss_mb)
+                cross_product_delta_rss.append(outer_optimizer.cross_product_delta_rss_mb)
+
+                logger.info(
+                    "Memory | "
+                    f"hypergradient: start={hypergradient_start_rss[-1]:.2f} MB, "
+                    f"peak={hypergradient_peak_rss[-1]:.2f} MB, "
+                    f"delta={hypergradient_delta_rss[-1]:.2f} MB | "
+                    f"outer grad: start={outer_grad_start_rss[-1]:.2f} MB, "
+                    f"peak={outer_grad_peak_rss[-1]:.2f} MB, "
+                    f"delta={outer_grad_delta_rss[-1]:.2f} MB | "
+                    f"Fisher solve: start={fisher_solve_start_rss[-1]:.2f} MB, "
+                    f"peak={fisher_solve_peak_rss[-1]:.2f} MB, "
+                    f"delta={fisher_solve_delta_rss[-1]:.2f} MB | "
+                    f"cross product: start={cross_product_start_rss[-1]:.2f} MB, "
+                    f"peak={cross_product_peak_rss[-1]:.2f} MB, "
+                    f"delta={cross_product_delta_rss[-1]:.2f} MB"
+                )
+
+                logger.info(
+                    "Timing | "
+                    f"outer step={outer_step_times[-1]:.2f} s | "
+                    f"hypergradient={hypergradient_times[-1]:.2f} s | "
+                    f"outer grad={outer_grad_times[-1]:.2f} s | "
+                    f"Fisher solve={fisher_solve_times[-1]:.2f} s | "
+                    f"cross product={cross_product_times[-1]:.2f} s"
+                )
 
                 mlflow.log_metrics(
                     {
                         "timing/outer_step_seconds": float(outer_step_times[-1]),
                         "timing/hypergradient_seconds": float(hypergradient_times[-1]),
+                        "timing/outer_grad_seconds": float(outer_grad_times[-1]),
+                        "timing/fisher_solve_seconds": float(fisher_solve_times[-1]),
+                        "timing/cross_product_seconds": float(cross_product_times[-1]),
+                        "resources/hypergradient_start_rss_mb": float(hypergradient_start_rss[-1]),
+                        "resources/hypergradient_peak_rss_mb": float(hypergradient_peak_rss[-1]),
+                        "resources/hypergradient_delta_rss_mb": float(hypergradient_delta_rss[-1]),
+                        "resources/outer_grad_start_rss_mb": float(outer_grad_start_rss[-1]),
+                        "resources/outer_grad_peak_rss_mb": float(outer_grad_peak_rss[-1]),
+                        "resources/outer_grad_delta_rss_mb": float(outer_grad_delta_rss[-1]),
+                        "resources/fisher_solve_start_rss_mb": float(fisher_solve_start_rss[-1]),
+                        "resources/fisher_solve_peak_rss_mb": float(fisher_solve_peak_rss[-1]),
+                        "resources/fisher_solve_delta_rss_mb": float(fisher_solve_delta_rss[-1]),
+                        "resources/cross_product_start_rss_mb": float(cross_product_start_rss[-1]),
+                        "resources/cross_product_peak_rss_mb": float(cross_product_peak_rss[-1]),
+                        "resources/cross_product_delta_rss_mb": float(cross_product_delta_rss[-1]),
                     },
                     step=outer_step,
                 )
+
+                if outer_optimizer.mode == "cg":
+                    logger.info(
+                        "CG diagnostics | "
+                        f"iterations={outer_optimizer.cg_iterations} | "
+                        f"converged={outer_optimizer.cg_converged} | "
+                        f"final_relative_residual={outer_optimizer.cg_final_relative_residual:.3e}"
+                    )
+
+                    mlflow.log_metrics(
+                        {
+                            "cg/iterations": float(outer_optimizer.cg_iterations),
+                            "cg/converged": float(outer_optimizer.cg_converged),
+                            "cg/final_relative_residual": float(outer_optimizer.cg_final_relative_residual),
+                        },
+                        step=outer_step,
+                    )
 
     finally:
         ram_metrics = ram_monitor.stop()
@@ -396,6 +493,35 @@ def train_fisher(
         hypergradient_time_mean = np.mean(hypergradient_times)
         hypergradient_time_std = np.std(hypergradient_times, ddof=1)
 
+        outer_grad_time_mean = np.mean(outer_grad_times)
+        outer_grad_time_std = np.std(outer_grad_times, ddof=1)
+
+        fisher_solve_time_mean = np.mean(fisher_solve_times)
+        fisher_solve_time_std = np.std(fisher_solve_times, ddof=1)
+
+        cross_product_time_mean = np.mean(cross_product_times)
+        cross_product_time_std = np.std(cross_product_times, ddof=1)
+
+        hypergradient_delta_rss_mean = np.mean(hypergradient_delta_rss)
+        hypergradient_delta_rss_std = np.std(hypergradient_delta_rss, ddof=1)
+        hypergradient_delta_rss_max = np.max(hypergradient_delta_rss)
+        hypergradient_peak_rss_max = np.max(hypergradient_peak_rss)
+
+        outer_grad_delta_rss_mean = np.mean(outer_grad_delta_rss)
+        outer_grad_delta_rss_std = np.std(outer_grad_delta_rss, ddof=1)
+        outer_grad_delta_rss_max = np.max(outer_grad_delta_rss)
+        outer_grad_peak_rss_max = np.max(outer_grad_peak_rss)
+
+        fisher_solve_delta_rss_mean = np.mean(fisher_solve_delta_rss)
+        fisher_solve_delta_rss_std = np.std(fisher_solve_delta_rss, ddof=1)
+        fisher_solve_delta_rss_max = np.max(fisher_solve_delta_rss)
+        fisher_solve_peak_rss_max = np.max(fisher_solve_peak_rss)
+
+        cross_product_delta_rss_mean = np.mean(cross_product_delta_rss)
+        cross_product_delta_rss_std = np.std(cross_product_delta_rss, ddof=1)
+        cross_product_delta_rss_max = np.max(cross_product_delta_rss)
+        cross_product_peak_rss_max = np.max(cross_product_peak_rss)
+
         logger.info(
             "Training memory | "
             f"start RSS={ram_metrics['start_rss_mb']:.2f} MB | "
@@ -408,7 +534,42 @@ def train_fisher(
             f"total optimization={total_optimization_time:.2f} s | "
             f"inner step={inner_step_time_mean:.2f} ± {inner_step_time_std:.2f} s | "
             f"outer step={outer_step_time_mean:.2f} ± {outer_step_time_std:.2f} s | "
-            f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s"
+            f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s | "
+            f"outer grad={outer_grad_time_mean:.2f} ± {outer_grad_time_std:.2f} s | "
+            f"Fisher solve={fisher_solve_time_mean:.2f} ± {fisher_solve_time_std:.2f} s | "
+            f"cross product={cross_product_time_mean:.2f} ± {cross_product_time_std:.2f} s"
+        )
+
+        logger.info(
+            "Hypergradient memory | "
+            f"delta RSS={hypergradient_delta_rss_mean:.2f} ± "
+            f"{hypergradient_delta_rss_std:.2f} MB | "
+            f"max delta RSS={hypergradient_delta_rss_max:.2f} MB | "
+            f"max peak RSS={hypergradient_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Outer grad memory | "
+            f"delta RSS={outer_grad_delta_rss_mean:.2f} ± "
+            f"{outer_grad_delta_rss_std:.2f} MB | "
+            f"max delta RSS={outer_grad_delta_rss_max:.2f} MB | "
+            f"max peak RSS={outer_grad_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Fisher solve memory | "
+            f"delta RSS={fisher_solve_delta_rss_mean:.2f} ± "
+            f"{fisher_solve_delta_rss_std:.2f} MB | "
+            f"max delta RSS={fisher_solve_delta_rss_max:.2f} MB | "
+            f"max peak RSS={fisher_solve_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Cross product memory | "
+            f"delta RSS={cross_product_delta_rss_mean:.2f} ± "
+            f"{cross_product_delta_rss_std:.2f} MB | "
+            f"max delta RSS={cross_product_delta_rss_max:.2f} MB | "
+            f"max peak RSS={cross_product_peak_rss_max:.2f} MB"
         )
 
         try:
@@ -424,6 +585,28 @@ def train_fisher(
                     "timing/outer_step_seconds_std": float(outer_step_time_std),
                     "timing/hypergradient_seconds_mean": float(hypergradient_time_mean),
                     "timing/hypergradient_seconds_std": float(hypergradient_time_std),
+                    "timing/fisher_solve_seconds_mean": float(fisher_solve_time_mean),
+                    "timing/fisher_solve_seconds_std": float(fisher_solve_time_std),
+                    "timing/outer_grad_seconds_mean": float(outer_grad_time_mean),
+                    "timing/outer_grad_seconds_std": float(outer_grad_time_std),
+                    "timing/cross_product_seconds_mean": float(cross_product_time_mean),
+                    "timing/cross_product_seconds_std": float(cross_product_time_std),
+                    "resources/hypergradient_delta_rss_mb_mean": float(hypergradient_delta_rss_mean),
+                    "resources/hypergradient_delta_rss_mb_std": float(hypergradient_delta_rss_std),
+                    "resources/hypergradient_delta_rss_mb_max": float(hypergradient_delta_rss_max),
+                    "resources/hypergradient_peak_rss_mb_max": float(hypergradient_peak_rss_max),
+                    "resources/fisher_solve_delta_rss_mb_mean": float(fisher_solve_delta_rss_mean),
+                    "resources/fisher_solve_delta_rss_mb_std": float(fisher_solve_delta_rss_std),
+                    "resources/fisher_solve_delta_rss_mb_max": float(fisher_solve_delta_rss_max),
+                    "resources/fisher_solve_peak_rss_mb_max": float(fisher_solve_peak_rss_max),
+                    "resources/outer_grad_delta_rss_mb_mean": float(outer_grad_delta_rss_mean),
+                    "resources/outer_grad_delta_rss_mb_std": float(outer_grad_delta_rss_std),
+                    "resources/outer_grad_delta_rss_mb_max": float(outer_grad_delta_rss_max),
+                    "resources/outer_grad_peak_rss_mb_max": float(outer_grad_peak_rss_max),
+                    "resources/cross_product_delta_rss_mb_mean": float(cross_product_delta_rss_mean),
+                    "resources/cross_product_delta_rss_mb_std": float(cross_product_delta_rss_std),
+                    "resources/cross_product_delta_rss_mb_max": float(cross_product_delta_rss_max),
+                    "resources/cross_product_peak_rss_mb_max": float(cross_product_peak_rss_max),
                 }
             )
 
