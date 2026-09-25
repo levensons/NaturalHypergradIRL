@@ -17,7 +17,6 @@ If `--log-dir` is omitted, logs are written to `logs/`.
 import argparse
 from pathlib import Path
 from datetime import datetime
-import os
 
 import mlflow
 
