@@ -1,13 +1,12 @@
 from typing import Literal
 from tqdm import tqdm
-import time
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 
-from src.utils.policies import Policy
 from src.algorithms.approximations import CBSCFD
+from src.utils.policies import Policy
+from src.utils.resources import PeakRAMMonitor, RecordTime
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
 
@@ -32,6 +31,12 @@ class FisherNHD:
 
         if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
             raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
+
+        if fisher_batch_size <= 0:
+            raise ValueError(f"fisher_batch_size must be positive, got {fisher_batch_size}.")
+
+        if fisher_reg < 0:
+            raise ValueError(f"fisher_reg must be non-negative, got {fisher_reg}.")
         
         self.reward = reward
         self.policy = policy
@@ -44,11 +49,35 @@ class FisherNHD:
         self.sketch_size = sketch_size
         self.fisher_batch_size = fisher_batch_size
 
+        self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
+
         self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0
 
-        self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
-        self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, scheduler_gamma)
+        self.hypergradient_time = 0.0
+        self.hypergradient_start_rss_mb = 0.0
+        self.hypergradient_peak_rss_mb = 0.0
+        self.hypergradient_delta_rss_mb = 0.0
+
+        self.outer_grad_time = 0.0
+        self.outer_grad_start_rss_mb = 0.0
+        self.outer_grad_peak_rss_mb = 0.0
+        self.outer_grad_delta_rss_mb = 0.0
+
+        self.fisher_solve_time = 0.0
+        self.fisher_solve_start_rss_mb = 0.0
+        self.fisher_solve_peak_rss_mb = 0.0
+        self.fisher_solve_delta_rss_mb = 0.0
+
+        self.cross_product_time = 0.0
+        self.cross_product_start_rss_mb = 0.0
+        self.cross_product_peak_rss_mb = 0.0
+        self.cross_product_delta_rss_mb = 0.0
+
+        self.cg_converged = False
+        self.cg_iterations = 0
+        self.cg_final_relative_residual = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -260,7 +289,7 @@ class FisherNHD:
 
         return out
 
-    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 1000, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 50, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
         x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
         r = g.detach().clone()
         p = r.clone()
@@ -269,30 +298,50 @@ class FisherNHD:
             r_dot_r = torch.dot(r, r)
             g_norm = torch.linalg.vector_norm(g)
 
+        if g_norm == 0:
+            self.cg_iterations = 0
+            self.cg_converged = True
+            self.cg_final_relative_residual = 0.0
+            return x
+
+        self.cg_iterations = 0
+        self.cg_converged = False
+
         for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
             Fp = self._fisher_vector_product(trajs, p, verbose=False)
 
             with torch.no_grad():
                 p_dot_Fp = torch.dot(p, Fp)
+
+                if not torch.isfinite(p_dot_Fp):
+                    raise FloatingPointError(f"CG encountered non-finite p^T (F + lambda * I) p: {p_dot_Fp.item()}.")
+
                 if p_dot_Fp <= 0:
                     raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
 
-                alpha = r_dot_r / torch.dot(p, Fp)
+                alpha = r_dot_r / p_dot_Fp
 
                 x.add_(p, alpha=alpha)
                 r.add_(Fp, alpha=-alpha)
 
+                self.cg_iterations += 1
+
                 r_new_dot_r_new = torch.dot(r, r)
                 if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
+                    r_dot_r = r_new_dot_r_new
+                    self.cg_converged = True
                     break
 
                 beta = r_new_dot_r_new / r_dot_r
                 p.mul_(beta).add_(r)
                 r_dot_r = r_new_dot_r_new
 
+        with torch.no_grad():
+            self.cg_final_relative_residual = (torch.sqrt(r_dot_r) / g_norm).item()
+
         return x
 
-    def exact_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
+    def explicit_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
         F = torch.zeros(self.policy_num_params, self.policy_num_params, dtype=torch.float32, device=self.device)
 
         states_buffer = []
@@ -379,68 +428,115 @@ class FisherNHD:
         out.div_(len(trajs))
         out.neg_()
         return out
-    
-    def hypergradient_with_exact_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        fisher = self.exact_fisher(agent_trajs)
-        fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
+    def hypergradient_with_explicit_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (F + lambda * I).inv @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher = self.explicit_fisher(agent_trajs)
+                fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
+                fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (F + lambda * I).inv @ g
+
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
         return hypergrad
 
     def hypergradient_with_conjugate_gradients(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-        fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
+
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        
         return hypergrad
 
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-        fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
+
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+    
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        if self.mode == "explicit":
-            hypergradient = self.hypergradient_with_exact_fisher(expert_trajs, agent_trajs)
-        elif self.mode == "cg":
-            hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
-        elif self.mode == "sketch":
-            hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
-        else:
-            raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                if self.mode == "explicit":
+                    hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
+                elif self.mode == "cg":
+                    hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
+                elif self.mode == "sketch":
+                    hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
+                else:
+                    raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+
+        self.hypergradient_time = timer.elapsed
+        self.hypergradient_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.hypergradient_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.hypergradient_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
         if not torch.isfinite(hypergradient).all():
             raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")
@@ -458,360 +554,6 @@ class FisherNHD:
             self.scheduler.step()
 
         return hypergradient
-
-    def sweep_sketch_sizes(
-        self,
-        expert_trajs,
-        agent_trajs,
-        sketch_sizes,
-        compare_hypergradients: bool = False,
-    ):
-        eps = 1e-12
-
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)
-
-        # -------------------------------------------------------------------------
-        # Exact Fisher construction
-        # -------------------------------------------------------------------------
-
-        fisher_start = time.perf_counter()
-        fisher_exact = self.exact_fisher(agent_trajs, torch.float32)
-        fisher_end = time.perf_counter()
-
-        fisher_construction_time = fisher_end - fisher_start
-
-        # -------------------------------------------------------------------------
-        # Spectrum of the unregularized Fisher matrix
-        # -------------------------------------------------------------------------
-
-        # fisher_for_spectrum = fisher_exact.to(dtype=torch.float32)
-        # fisher_for_spectrum = 0.5 * (fisher_for_spectrum + fisher_for_spectrum.T)
-
-        # spectrum_start = time.perf_counter()
-        # eigenvalues = torch.linalg.eigvalsh(fisher_for_spectrum)
-        # spectrum_end = time.perf_counter()
-
-        # spectrum_time = spectrum_end - spectrum_start
-
-        # min_eigenvalue = eigenvalues[0].item()
-        # max_eigenvalue = eigenvalues[-1].item()
-        # mean_eigenvalue = eigenvalues.mean().item()
-        # median_eigenvalue = eigenvalues.median().item()
-
-        # rank_tolerance = torch.finfo(fisher_for_spectrum.dtype).eps * fisher_for_spectrum.shape[0] * max(abs(min_eigenvalue), abs(max_eigenvalue), 1.0)
-
-        # positive_eigenvalues = eigenvalues[eigenvalues > rank_tolerance]
-        # significant_negative_eigenvalues = eigenvalues[eigenvalues < -rank_tolerance]
-        # tiny_negative_eigenvalues = eigenvalues[(eigenvalues < 0.0) & (eigenvalues >= -rank_tolerance)]
-
-        # numerical_rank = positive_eigenvalues.numel()
-        # numerical_nullity = fisher_for_spectrum.shape[0] - numerical_rank
-
-        # if positive_eigenvalues.numel() > 0:
-        #     min_positive_eigenvalue = positive_eigenvalues[0].item()
-        #     positive_condition_number = max_eigenvalue / min_positive_eigenvalue
-        # else:
-        #     min_positive_eigenvalue = float("nan")
-        #     positive_condition_number = float("inf")
-
-        # regularized_eigenvalues = eigenvalues + self.fisher_reg
-        # regularized_min_eigenvalue = regularized_eigenvalues[0].item()
-        # regularized_max_eigenvalue = regularized_eigenvalues[-1].item()
-
-        # if regularized_min_eigenvalue > 0.0:
-        #     regularized_condition_number = regularized_max_eigenvalue / regularized_min_eigenvalue
-        # else:
-        #     regularized_condition_number = float("inf")
-
-        # mean_eigenvalue_scale = max(abs(mean_eigenvalue), eps)
-        # max_eigenvalue_scale = max(abs(max_eigenvalue), eps)
-
-        # print("\nUnregularized Fisher spectrum")
-        # print(f"Spectrum computation time:          {spectrum_time:.4f}s")
-        # print(f"Minimum eigenvalue:                 {min_eigenvalue:.8e}")
-        # print(f"Minimum positive eigenvalue:        {min_positive_eigenvalue:.8e}")
-        # print(f"Median eigenvalue:                  {median_eigenvalue:.8e}")
-        # print(f"Mean eigenvalue:                    {mean_eigenvalue:.8e}")
-        # print(f"Maximum eigenvalue:                 {max_eigenvalue:.8e}")
-        # print(f"Numerical rank:                     {numerical_rank}/{fisher_for_spectrum.shape[0]}")
-        # print(f"Numerical nullity:                  {numerical_nullity}")
-        # print(f"Significant negative eigenvalues:   {significant_negative_eigenvalues.numel()}")
-        # print(f"Tiny negative eigenvalues:          {tiny_negative_eigenvalues.numel()}")
-        # print(f"Positive-spectrum condition number: {positive_condition_number:.8e}")
-        # print()
-        # print(f"Regularization:                     {self.fisher_reg:.8e}")
-        # print(f"Regularization / mean eigenvalue:   {self.fisher_reg / mean_eigenvalue_scale:.8e}")
-        # print(f"Regularization / max eigenvalue:    {self.fisher_reg / max_eigenvalue_scale:.8e}")
-        # print(f"Regularized minimum eigenvalue:     {regularized_min_eigenvalue:.8e}")
-        # print(f"Regularized maximum eigenvalue:     {regularized_max_eigenvalue:.8e}")
-        # print(f"Regularized condition estimate:     {regularized_condition_number:.8e}")
-
-        # spectrum_stats = {
-        #     "spectrum_time": spectrum_time,
-        #     "min_eigenvalue": min_eigenvalue,
-        #     "min_positive_eigenvalue": min_positive_eigenvalue,
-        #     "median_eigenvalue": median_eigenvalue,
-        #     "mean_eigenvalue": mean_eigenvalue,
-        #     "max_eigenvalue": max_eigenvalue,
-        #     "numerical_rank": numerical_rank,
-        #     "numerical_nullity": numerical_nullity,
-        #     "significant_negative_eigenvalues": significant_negative_eigenvalues.numel(),
-        #     "tiny_negative_eigenvalues": tiny_negative_eigenvalues.numel(),
-        #     "positive_condition_number": positive_condition_number,
-        #     "regularization": float(self.fisher_reg),
-        #     "regularization_to_mean_eigenvalue": self.fisher_reg / mean_eigenvalue_scale,
-        #     "regularization_to_max_eigenvalue": self.fisher_reg / max_eigenvalue_scale,
-        #     "regularized_min_eigenvalue": regularized_min_eigenvalue,
-        #     "regularized_max_eigenvalue": regularized_max_eigenvalue,
-        #     "regularized_condition_number": regularized_condition_number,
-        # }
-
-        # del fisher_for_spectrum
-        # del eigenvalues
-        # del positive_eigenvalues
-        # del significant_negative_eigenvalues
-        # del tiny_negative_eigenvalues
-
-        # -------------------------------------------------------------------------
-        # Exact regularized solve
-        # -------------------------------------------------------------------------
-
-        fisher_exact.diagonal().add_(self.fisher_reg)
-
-        exact_g = d_outer_d_policy.to(
-            device=fisher_exact.device,
-            dtype=fisher_exact.dtype,
-        )
-
-        solve_start = time.perf_counter()
-        v_exact = torch.linalg.solve(fisher_exact, exact_g)
-        solve_end = time.perf_counter()
-
-        exact_solve_time = solve_end - solve_start
-        exact_pipeline_time = fisher_construction_time + exact_solve_time
-
-        exact_g_norm = exact_g.norm().item()
-        exact_v_norm = v_exact.norm().item()
-        exact_v_abs_min = v_exact.abs().min().item()
-        exact_v_abs_max = v_exact.abs().max().item()
-
-        exact_residual = fisher_exact @ v_exact - exact_g
-        exact_residual_norm = exact_residual.norm().item()
-        exact_relative_residual = exact_residual_norm / max(exact_g_norm, eps)
-
-        exact_is_finite = bool(torch.isfinite(v_exact).all().item())
-
-        print("\nExact regularized Fisher solve")
-        print(f"Fisher construction time:       {fisher_construction_time:>10.4f}s")
-        # print(f"Fisher spectrum analysis time:  {spectrum_time:>10.4f}s")
-        print(f"Exact Fisher solve time:        {exact_solve_time:>10.4f}s")
-        print(f"Exact pipeline time:            {exact_pipeline_time:>10.4f}s")
-        # print(f"Total including spectrum:       {exact_pipeline_time + spectrum_time:>10.4f}s")
-        print()
-        print(f"Fisher shape:                   {tuple(fisher_exact.shape)}")
-        print(f"Fisher dtype:                   {fisher_exact.dtype}")
-        print(f"Fisher device:                  {fisher_exact.device}")
-        print(f"Fisher regularization:          {self.fisher_reg:.8e}")
-        print(f"||g||:                          {exact_g_norm:.8e}")
-        print(f"||v_exact||:                    {exact_v_norm:.8e}")
-        print(f"min |v_exact_i|:                {exact_v_abs_min:.8e}")
-        print(f"max |v_exact_i|:                {exact_v_abs_max:.8e}")
-        print(f"exact residual norm:            {exact_residual_norm:.8e}")
-        print(f"exact relative residual:        {exact_relative_residual:.8e}")
-        print(f"exact is finite:                {exact_is_finite}")
-
-        hypergrad_exact = None
-        exact_hypergrad_norm = None
-
-        if compare_hypergradients:
-            policy_parameter = next(self.policy.parameters())
-
-            v_exact_for_cross = v_exact.to(
-                device=policy_parameter.device,
-                dtype=policy_parameter.dtype,
-            )
-
-            hypergrad_exact = -self.d_inner_d_cross_vec_product(
-                agent_trajs,
-                v_exact_for_cross,
-            )
-
-            exact_hypergrad_norm = hypergrad_exact.norm().item()
-            exact_hypergrad_is_finite = bool(torch.isfinite(hypergrad_exact).all().item())
-
-            print(f"||hypergrad_exact||:            {exact_hypergrad_norm:.8e}")
-            print(f"hypergrad exact is finite:      {exact_hypergrad_is_finite}")
-
-        # -------------------------------------------------------------------------
-        # Sketch sweep
-        # -------------------------------------------------------------------------
-
-        header = (
-            f"{'m':>7} | "
-            f"{'||v_s||':>13} | "
-            f"{'||v_e||':>13} | "
-            f"{'norm ratio':>12} | "
-            f"{'abs error':>13} | "
-            f"{'rel error':>11} | "
-            f"{'cosine':>10} | "
-            f"{'rel residual':>13} | "
-            f"{'finite':>7} | "
-            f"{'time':>10}"
-        )
-
-        if compare_hypergradients:
-            header += (
-                f" | "
-                f"{'||h_s||':>13} | "
-                f"{'||h_e||':>13} | "
-                f"{'h norm ratio':>12} | "
-                f"{'h rel error':>11} | "
-                f"{'unit h rel':>11} | "
-                f"{'h cosine':>10}"
-            )
-
-        print("\n" + header)
-        print("-" * len(header))
-
-        results = []
-
-        for sketch_size in sketch_sizes:
-            sketch_start = time.perf_counter()
-
-            v_sketch = self.fisher_solve_sketch(
-                agent_trajs,
-                d_outer_d_policy,
-                sketch_size,
-                verbose=True,
-            )
-
-            sketch_time = time.perf_counter() - sketch_start
-
-            v_exact_local = v_exact.to(
-                device=v_sketch.device,
-                dtype=v_sketch.dtype,
-            )
-            fisher_exact_local = fisher_exact.to(
-                device=v_sketch.device,
-                dtype=v_sketch.dtype,
-            )
-            exact_g_local = exact_g.to(
-                device=v_sketch.device,
-                dtype=v_sketch.dtype,
-            )
-
-            sketch_v_norm = v_sketch.norm().item()
-            local_exact_v_norm = v_exact_local.norm().item()
-
-            solve_absolute_error = (v_sketch - v_exact_local).norm().item()
-            solve_relative_error = solve_absolute_error / max(local_exact_v_norm, eps)
-            norm_ratio = sketch_v_norm / max(local_exact_v_norm, eps)
-
-            sketch_is_finite = bool(torch.isfinite(v_sketch).all().item())
-
-            if sketch_v_norm > eps and local_exact_v_norm > eps and sketch_is_finite:
-                solve_cosine = F.cosine_similarity(
-                    v_sketch.reshape(-1),
-                    v_exact_local.reshape(-1),
-                    dim=0,
-                    eps=eps,
-                ).item()
-            else:
-                solve_cosine = float("nan")
-
-            sketch_residual = fisher_exact_local @ v_sketch - exact_g_local
-            sketch_residual_norm = sketch_residual.norm().item()
-            sketch_relative_residual = sketch_residual_norm / max(exact_g_local.norm().item(), eps)
-
-            result = {
-                "sketch_size": int(sketch_size),
-                "exact_gradient_norm": exact_g_norm,
-                "exact_solution_norm": local_exact_v_norm,
-                "sketch_solution_norm": sketch_v_norm,
-                "solve_norm_ratio": norm_ratio,
-                "solve_absolute_error": solve_absolute_error,
-                "solve_relative_error": solve_relative_error,
-                "solve_cosine": solve_cosine,
-                "solve_residual_norm": sketch_residual_norm,
-                "solve_relative_residual": sketch_relative_residual,
-                "solution_is_finite": sketch_is_finite,
-                "time": sketch_time,
-                # "spectrum": spectrum_stats,
-            }
-
-            row = (
-                f"{sketch_size:>7} | "
-                f"{sketch_v_norm:>13.5e} | "
-                f"{local_exact_v_norm:>13.5e} | "
-                f"{norm_ratio:>12.5e} | "
-                f"{solve_absolute_error:>13.5e} | "
-                f"{solve_relative_error:>11.5e} | "
-                f"{solve_cosine:>10.5f} | "
-                f"{sketch_relative_residual:>13.5e} | "
-                f"{str(sketch_is_finite):>7} | "
-                f"{sketch_time:>9.3f}s"
-            )
-
-            if compare_hypergradients:
-                hypergrad_sketch = -self.d_inner_d_cross_vec_product(
-                    agent_trajs,
-                    v_sketch,
-                )
-                hypergrad_exact_local = hypergrad_exact.to(
-                    device=hypergrad_sketch.device,
-                    dtype=hypergrad_sketch.dtype,
-                )
-
-                sketch_hypergrad_norm = hypergrad_sketch.norm().item()
-                local_exact_hypergrad_norm = hypergrad_exact_local.norm().item()
-
-                hypergrad_norm_ratio = sketch_hypergrad_norm / max(local_exact_hypergrad_norm, eps)
-                hypergrad_absolute_error = (hypergrad_sketch - hypergrad_exact_local).norm().item()
-                hypergrad_relative_error = hypergrad_absolute_error / max(local_exact_hypergrad_norm, eps)
-                hypergrad_is_finite = bool(torch.isfinite(hypergrad_sketch).all().item())
-
-                if sketch_hypergrad_norm > eps and local_exact_hypergrad_norm > eps and hypergrad_is_finite:
-                    hypergrad_cosine = F.cosine_similarity(
-                        hypergrad_sketch.reshape(-1),
-                        hypergrad_exact_local.reshape(-1),
-                        dim=0,
-                        eps=eps,
-                    ).item()
-
-                    hypergrad_sketch_unit = hypergrad_sketch / sketch_hypergrad_norm
-                    hypergrad_exact_unit = hypergrad_exact_local / local_exact_hypergrad_norm
-                    hypergrad_unit_relative_error = (hypergrad_sketch_unit - hypergrad_exact_unit).norm().item()
-                else:
-                    hypergrad_cosine = float("nan")
-                    hypergrad_unit_relative_error = float("nan")
-
-                result.update(
-                    {
-                        "exact_hypergrad_norm": local_exact_hypergrad_norm,
-                        "sketch_hypergrad_norm": sketch_hypergrad_norm,
-                        "hypergrad_norm_ratio": hypergrad_norm_ratio,
-                        "hypergrad_absolute_error": hypergrad_absolute_error,
-                        "hypergrad_relative_error": hypergrad_relative_error,
-                        "hypergrad_unit_relative_error": hypergrad_unit_relative_error,
-                        "hypergrad_cosine": hypergrad_cosine,
-                        "hypergrad_is_finite": hypergrad_is_finite,
-                    }
-                )
-
-                row += (
-                    f" | "
-                    f"{sketch_hypergrad_norm:>13.5e} | "
-                    f"{local_exact_hypergrad_norm:>13.5e} | "
-                    f"{hypergrad_norm_ratio:>12.5e} | "
-                    f"{hypergrad_relative_error:>11.5e} | "
-                    f"{hypergrad_unit_relative_error:>11.5e} | "
-                    f"{hypergrad_cosine:>10.5f}"
-                )
-
-            print(row)
-            results.append(result)
-
-        return results
     
     def d_inner_d_policy(self, trajs, verbose: bool = True) -> torch.Tensor:
         """

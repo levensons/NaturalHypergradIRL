@@ -11,13 +11,14 @@ from types import ModuleType
 
 import mlflow
 import torch
+import numpy as np
 
 from src.algorithms.fisher_nhd import FisherNHD
 from src.evaluation.metrics import inner_loss, learned_reward_stats, outer_loss, policy_nll, rank_corr
 from src.irl.builders import SUPPORTED_AGENTS, build_agent, build_arch
 from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
-from src.utils.resources import PeakRAMMonitor
+from src.utils.resources import PeakRAMMonitor, RecordTime
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
@@ -111,7 +112,7 @@ def train_fisher(
         if agent_type == "sac":
             agent.replay_buffer.recalc_rewards(current_reward_fn)
 
-            reset_mode = os.getenv("SAC_RESET_MODE", "nothing")
+            reset_mode = os.getenv("SAC_RESET_MODE", "policy_critics")
 
             if reset_mode == "nothing":
                 agent.reset_optimizers()
@@ -248,20 +249,37 @@ def train_fisher(
         }
     )
 
-    mlflow.log_params(
-        {f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()}
-    )
+    mlflow.log_params({f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()})
 
-    mlflow.log_params(
-        {
-            f"arch/{key}": value
-            for key, value in arch.items()
-            if not isinstance(value, (list, dict))
-        }
-    )
+    mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
 
-    ram_monitor = PeakRAMMonitor(interval=0.05)
+    ram_monitor = PeakRAMMonitor(interval=0.001)
     ram_monitor.start()
+
+    total_optimization_time = 0.0
+    inner_step_times = []
+    outer_step_times = []
+
+    hypergradient_times = []
+    outer_grad_times = []
+    fisher_solve_times = []
+    cross_product_times = []
+
+    hypergradient_start_rss = []
+    hypergradient_peak_rss = []
+    hypergradient_delta_rss = []
+
+    outer_grad_start_rss = []
+    outer_grad_peak_rss = []
+    outer_grad_delta_rss = []
+
+    fisher_solve_start_rss = []
+    fisher_solve_peak_rss = []
+    fisher_solve_delta_rss = []
+
+    cross_product_start_rss = []
+    cross_product_peak_rss = []
+    cross_product_delta_rss = []
 
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
@@ -352,24 +370,166 @@ def train_fisher(
 
     try:
         for outer_step in range(1, n_outer_steps + 1):
-            inner_optimize(outer_step)
+            with RecordTime() as timer:
+                inner_optimize(outer_step)
 
-            agent_train_trajs = collect_trajectories(
-                env=env,
-                policy=policy,
-                n=n_agent_trajs,
-                deterministic=False,
-                desc="agent train trajs",
-                verbose=True,
-            )
+                agent_train_trajs = collect_trajectories(
+                    env=env,
+                    policy=policy,
+                    n=n_agent_trajs,
+                    deterministic=False,
+                    desc="agent train trajs",
+                    verbose=True,
+                )
+
+            total_optimization_time += timer.elapsed
+            inner_step_times.append(timer.elapsed)
+            mlflow.log_metric("timing/inner_step_seconds", float(timer.elapsed), step=outer_step)
 
             log_and_checkpoint(outer_step, agent_train_trajs)
 
             if outer_step < n_outer_steps:
-                outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+                with RecordTime() as timer:
+                    outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+                total_optimization_time += timer.elapsed
+                outer_step_times.append(timer.elapsed)
+
+                hypergradient_times.append(outer_optimizer.hypergradient_time)
+                outer_grad_times.append(outer_optimizer.outer_grad_time)
+                fisher_solve_times.append(outer_optimizer.fisher_solve_time)
+                cross_product_times.append(outer_optimizer.cross_product_time)
+
+                hypergradient_start_rss.append(outer_optimizer.hypergradient_start_rss_mb)
+                hypergradient_peak_rss.append(outer_optimizer.hypergradient_peak_rss_mb)
+                hypergradient_delta_rss.append(outer_optimizer.hypergradient_delta_rss_mb)
+
+                outer_grad_start_rss.append(outer_optimizer.outer_grad_start_rss_mb)
+                outer_grad_peak_rss.append(outer_optimizer.outer_grad_peak_rss_mb)
+                outer_grad_delta_rss.append(outer_optimizer.outer_grad_delta_rss_mb)
+
+                fisher_solve_start_rss.append(outer_optimizer.fisher_solve_start_rss_mb)
+                fisher_solve_peak_rss.append(outer_optimizer.fisher_solve_peak_rss_mb)
+                fisher_solve_delta_rss.append(outer_optimizer.fisher_solve_delta_rss_mb)
+
+                cross_product_start_rss.append(outer_optimizer.cross_product_start_rss_mb)
+                cross_product_peak_rss.append(outer_optimizer.cross_product_peak_rss_mb)
+                cross_product_delta_rss.append(outer_optimizer.cross_product_delta_rss_mb)
+
+                logger.info(
+                    "Memory | hypergradient: "
+                    f"start={hypergradient_start_rss[-1]:.2f} MB, "
+                    f"peak={hypergradient_peak_rss[-1]:.2f} MB, "
+                    f"delta={hypergradient_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | outer grad: "
+                    f"start={outer_grad_start_rss[-1]:.2f} MB, "
+                    f"peak={outer_grad_peak_rss[-1]:.2f} MB, "
+                    f"delta={outer_grad_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | Fisher solve: "
+                    f"start={fisher_solve_start_rss[-1]:.2f} MB, "
+                    f"peak={fisher_solve_peak_rss[-1]:.2f} MB, "
+                    f"delta={fisher_solve_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | cross product: "
+                    f"start={cross_product_start_rss[-1]:.2f} MB, "
+                    f"peak={cross_product_peak_rss[-1]:.2f} MB, "
+                    f"delta={cross_product_delta_rss[-1]:.2f} MB"
+                )
+
+                logger.info(
+                    "Timing | "
+                    f"outer step={outer_step_times[-1]:.2f} s | "
+                    f"hypergradient={hypergradient_times[-1]:.2f} s | "
+                    f"outer grad={outer_grad_times[-1]:.2f} s | "
+                    f"Fisher solve={fisher_solve_times[-1]:.2f} s | "
+                    f"cross product={cross_product_times[-1]:.2f} s"
+                )
+
+                mlflow.log_metrics(
+                    {
+                        "timing/outer_step_seconds": float(outer_step_times[-1]),
+                        "timing/hypergradient_seconds": float(hypergradient_times[-1]),
+                        "timing/outer_grad_seconds": float(outer_grad_times[-1]),
+                        "timing/fisher_solve_seconds": float(fisher_solve_times[-1]),
+                        "timing/cross_product_seconds": float(cross_product_times[-1]),
+                        "resources/hypergradient_start_rss_mb": float(hypergradient_start_rss[-1]),
+                        "resources/hypergradient_peak_rss_mb": float(hypergradient_peak_rss[-1]),
+                        "resources/hypergradient_delta_rss_mb": float(hypergradient_delta_rss[-1]),
+                        "resources/outer_grad_start_rss_mb": float(outer_grad_start_rss[-1]),
+                        "resources/outer_grad_peak_rss_mb": float(outer_grad_peak_rss[-1]),
+                        "resources/outer_grad_delta_rss_mb": float(outer_grad_delta_rss[-1]),
+                        "resources/fisher_solve_start_rss_mb": float(fisher_solve_start_rss[-1]),
+                        "resources/fisher_solve_peak_rss_mb": float(fisher_solve_peak_rss[-1]),
+                        "resources/fisher_solve_delta_rss_mb": float(fisher_solve_delta_rss[-1]),
+                        "resources/cross_product_start_rss_mb": float(cross_product_start_rss[-1]),
+                        "resources/cross_product_peak_rss_mb": float(cross_product_peak_rss[-1]),
+                        "resources/cross_product_delta_rss_mb": float(cross_product_delta_rss[-1]),
+                    },
+                    step=outer_step,
+                )
+
+                if outer_optimizer.mode == "cg":
+                    logger.info(
+                        "CG diagnostics | "
+                        f"iterations={outer_optimizer.cg_iterations} | "
+                        f"converged={outer_optimizer.cg_converged} | "
+                        f"final_relative_residual={outer_optimizer.cg_final_relative_residual:.3e}"
+                    )
+
+                    mlflow.log_metrics(
+                        {
+                            "cg/iterations": float(outer_optimizer.cg_iterations),
+                            "cg/converged": float(outer_optimizer.cg_converged),
+                            "cg/final_relative_residual": float(outer_optimizer.cg_final_relative_residual),
+                        },
+                        step=outer_step,
+                    )
 
     finally:
         ram_metrics = ram_monitor.stop()
+
+        inner_step_time_mean = np.mean(inner_step_times)
+        inner_step_time_std = np.std(inner_step_times, ddof=1)
+
+        outer_step_time_mean = np.mean(outer_step_times)
+        outer_step_time_std = np.std(outer_step_times, ddof=1)
+
+        hypergradient_time_mean = np.mean(hypergradient_times)
+        hypergradient_time_std = np.std(hypergradient_times, ddof=1)
+
+        outer_grad_time_mean = np.mean(outer_grad_times)
+        outer_grad_time_std = np.std(outer_grad_times, ddof=1)
+
+        fisher_solve_time_mean = np.mean(fisher_solve_times)
+        fisher_solve_time_std = np.std(fisher_solve_times, ddof=1)
+
+        cross_product_time_mean = np.mean(cross_product_times)
+        cross_product_time_std = np.std(cross_product_times, ddof=1)
+
+        hypergradient_delta_rss_mean = np.mean(hypergradient_delta_rss)
+        hypergradient_delta_rss_std = np.std(hypergradient_delta_rss, ddof=1)
+        hypergradient_delta_rss_max = np.max(hypergradient_delta_rss)
+        hypergradient_peak_rss_max = np.max(hypergradient_peak_rss)
+
+        outer_grad_delta_rss_mean = np.mean(outer_grad_delta_rss)
+        outer_grad_delta_rss_std = np.std(outer_grad_delta_rss, ddof=1)
+        outer_grad_delta_rss_max = np.max(outer_grad_delta_rss)
+        outer_grad_peak_rss_max = np.max(outer_grad_peak_rss)
+
+        fisher_solve_delta_rss_mean = np.mean(fisher_solve_delta_rss)
+        fisher_solve_delta_rss_std = np.std(fisher_solve_delta_rss, ddof=1)
+        fisher_solve_delta_rss_max = np.max(fisher_solve_delta_rss)
+        fisher_solve_peak_rss_max = np.max(fisher_solve_peak_rss)
+
+        cross_product_delta_rss_mean = np.mean(cross_product_delta_rss)
+        cross_product_delta_rss_std = np.std(cross_product_delta_rss, ddof=1)
+        cross_product_delta_rss_max = np.max(cross_product_delta_rss)
+        cross_product_peak_rss_max = np.max(cross_product_peak_rss)
 
         logger.info(
             "Training memory | "
@@ -378,17 +538,89 @@ def train_fisher(
             f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
         )
 
+        logger.info(
+            "Training time | "
+            f"total optimization={total_optimization_time:.2f} s | "
+            f"inner step={inner_step_time_mean:.2f} ± {inner_step_time_std:.2f} s | "
+            f"outer step={outer_step_time_mean:.2f} ± {outer_step_time_std:.2f} s | "
+            f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s | "
+            f"outer grad={outer_grad_time_mean:.2f} ± {outer_grad_time_std:.2f} s | "
+            f"Fisher solve={fisher_solve_time_mean:.2f} ± {fisher_solve_time_std:.2f} s | "
+            f"cross product={cross_product_time_mean:.2f} ± {cross_product_time_std:.2f} s"
+        )
+
+        logger.info(
+            "Hypergradient memory | "
+            f"delta RSS={hypergradient_delta_rss_mean:.2f} ± "
+            f"{hypergradient_delta_rss_std:.2f} MB | "
+            f"max delta RSS={hypergradient_delta_rss_max:.2f} MB | "
+            f"max peak RSS={hypergradient_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Outer grad memory | "
+            f"delta RSS={outer_grad_delta_rss_mean:.2f} ± "
+            f"{outer_grad_delta_rss_std:.2f} MB | "
+            f"max delta RSS={outer_grad_delta_rss_max:.2f} MB | "
+            f"max peak RSS={outer_grad_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Fisher solve memory | "
+            f"delta RSS={fisher_solve_delta_rss_mean:.2f} ± "
+            f"{fisher_solve_delta_rss_std:.2f} MB | "
+            f"max delta RSS={fisher_solve_delta_rss_max:.2f} MB | "
+            f"max peak RSS={fisher_solve_peak_rss_max:.2f} MB"
+        )
+
+        logger.info(
+            "Cross product memory | "
+            f"delta RSS={cross_product_delta_rss_mean:.2f} ± "
+            f"{cross_product_delta_rss_std:.2f} MB | "
+            f"max delta RSS={cross_product_delta_rss_max:.2f} MB | "
+            f"max peak RSS={cross_product_peak_rss_max:.2f} MB"
+        )
+
         try:
             mlflow.log_metrics(
                 {
                     "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
                     "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
                     "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
+                    "timing/total_optimization_seconds": float(total_optimization_time),
+                    "timing/inner_step_seconds_mean": float(inner_step_time_mean),
+                    "timing/inner_step_seconds_std": float(inner_step_time_std),
+                    "timing/outer_step_seconds_mean": float(outer_step_time_mean),
+                    "timing/outer_step_seconds_std": float(outer_step_time_std),
+                    "timing/hypergradient_seconds_mean": float(hypergradient_time_mean),
+                    "timing/hypergradient_seconds_std": float(hypergradient_time_std),
+                    "timing/fisher_solve_seconds_mean": float(fisher_solve_time_mean),
+                    "timing/fisher_solve_seconds_std": float(fisher_solve_time_std),
+                    "timing/outer_grad_seconds_mean": float(outer_grad_time_mean),
+                    "timing/outer_grad_seconds_std": float(outer_grad_time_std),
+                    "timing/cross_product_seconds_mean": float(cross_product_time_mean),
+                    "timing/cross_product_seconds_std": float(cross_product_time_std),
+                    "resources/hypergradient_delta_rss_mb_mean": float(hypergradient_delta_rss_mean),
+                    "resources/hypergradient_delta_rss_mb_std": float(hypergradient_delta_rss_std),
+                    "resources/hypergradient_delta_rss_mb_max": float(hypergradient_delta_rss_max),
+                    "resources/hypergradient_peak_rss_mb_max": float(hypergradient_peak_rss_max),
+                    "resources/fisher_solve_delta_rss_mb_mean": float(fisher_solve_delta_rss_mean),
+                    "resources/fisher_solve_delta_rss_mb_std": float(fisher_solve_delta_rss_std),
+                    "resources/fisher_solve_delta_rss_mb_max": float(fisher_solve_delta_rss_max),
+                    "resources/fisher_solve_peak_rss_mb_max": float(fisher_solve_peak_rss_max),
+                    "resources/outer_grad_delta_rss_mb_mean": float(outer_grad_delta_rss_mean),
+                    "resources/outer_grad_delta_rss_mb_std": float(outer_grad_delta_rss_std),
+                    "resources/outer_grad_delta_rss_mb_max": float(outer_grad_delta_rss_max),
+                    "resources/outer_grad_peak_rss_mb_max": float(outer_grad_peak_rss_max),
+                    "resources/cross_product_delta_rss_mb_mean": float(cross_product_delta_rss_mean),
+                    "resources/cross_product_delta_rss_mb_std": float(cross_product_delta_rss_std),
+                    "resources/cross_product_delta_rss_mb_max": float(cross_product_delta_rss_max),
+                    "resources/cross_product_peak_rss_mb_max": float(cross_product_peak_rss_max),
                 }
             )
 
         except Exception as error:
-            logger.warning(f"Failed to log memory metrics to MLflow: {error}")
+            logger.warning(f"Failed to log final metrics to MLflow: {error}")
 
     env.close()
 
