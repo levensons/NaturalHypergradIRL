@@ -1,14 +1,12 @@
 from typing import Literal
 from tqdm import tqdm
-import time
-from memory_profiler import profile
 
 import torch
 from torch import nn
 
 from src.algorithms.approximations import CBSCFD
 from src.utils.policies import Policy
-from src.utils.resources import RecordTime
+from src.utils.resources import PeakRAMMonitor, RecordTime
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
 
@@ -33,6 +31,12 @@ class FisherNHD:
 
         if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
             raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
+
+        if fisher_batch_size <= 0:
+            raise ValueError(f"fisher_batch_size must be positive, got {fisher_batch_size}.")
+
+        if fisher_reg < 0:
+            raise ValueError(f"fisher_reg must be non-negative, got {fisher_reg}.")
         
         self.reward = reward
         self.policy = policy
@@ -50,7 +54,30 @@ class FisherNHD:
 
         self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0
+
         self.hypergradient_time = 0.0
+        self.hypergradient_start_rss_mb = 0.0
+        self.hypergradient_peak_rss_mb = 0.0
+        self.hypergradient_delta_rss_mb = 0.0
+
+        self.outer_grad_time = 0.0
+        self.outer_grad_start_rss_mb = 0.0
+        self.outer_grad_peak_rss_mb = 0.0
+        self.outer_grad_delta_rss_mb = 0.0
+
+        self.fisher_solve_time = 0.0
+        self.fisher_solve_start_rss_mb = 0.0
+        self.fisher_solve_peak_rss_mb = 0.0
+        self.fisher_solve_delta_rss_mb = 0.0
+
+        self.cross_product_time = 0.0
+        self.cross_product_start_rss_mb = 0.0
+        self.cross_product_peak_rss_mb = 0.0
+        self.cross_product_delta_rss_mb = 0.0
+
+        self.cg_converged = False
+        self.cg_iterations = 0
+        self.cg_final_relative_residual = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -124,7 +151,6 @@ class FisherNHD:
         jv = torch.autograd.grad(dot, u)[0]
         return jv.detach()
 
-    @profile
     def fisher_solve_sketch(self, trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
         sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32)
 
@@ -178,7 +204,6 @@ class FisherNHD:
 
         return sketch.solve(g)
 
-    @profile
     def _fisher_vector_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         v = v.detach()
 
@@ -264,8 +289,7 @@ class FisherNHD:
 
         return out
 
-    @profile
-    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 1000, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 50, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
         x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
         r = g.detach().clone()
         p = r.clone()
@@ -274,30 +298,49 @@ class FisherNHD:
             r_dot_r = torch.dot(r, r)
             g_norm = torch.linalg.vector_norm(g)
 
+        if g_norm == 0:
+            self.cg_iterations = 0
+            self.cg_converged = True
+            self.cg_final_relative_residual = 0.0
+            return x
+
+        self.cg_iterations = 0
+        self.cg_converged = False
+
         for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
             Fp = self._fisher_vector_product(trajs, p, verbose=False)
 
             with torch.no_grad():
                 p_dot_Fp = torch.dot(p, Fp)
+
+                if not torch.isfinite(p_dot_Fp):
+                    raise FloatingPointError(f"CG encountered non-finite p^T (F + lambda * I) p: {p_dot_Fp.item()}.")
+
                 if p_dot_Fp <= 0:
                     raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
 
-                alpha = r_dot_r / torch.dot(p, Fp)
+                alpha = r_dot_r / p_dot_Fp
 
                 x.add_(p, alpha=alpha)
                 r.add_(Fp, alpha=-alpha)
 
+                self.cg_iterations += 1
+
                 r_new_dot_r_new = torch.dot(r, r)
                 if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
+                    r_dot_r = r_new_dot_r_new
+                    self.cg_converged = True
                     break
 
                 beta = r_new_dot_r_new / r_dot_r
                 p.mul_(beta).add_(r)
                 r_dot_r = r_new_dot_r_new
 
+        with torch.no_grad():
+            self.cg_final_relative_residual = (torch.sqrt(r_dot_r) / g_norm).item()
+
         return x
 
-    @profile
     def explicit_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
         F = torch.zeros(self.policy_num_params, self.policy_num_params, dtype=torch.float32, device=self.device)
 
@@ -386,71 +429,114 @@ class FisherNHD:
         out.neg_()
         return out
 
-    @profile
     def hypergradient_with_explicit_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        fisher = self.explicit_fisher(agent_trajs)
-        fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
-        fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (F + lambda * I).inv @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher = self.explicit_fisher(agent_trajs)
+                fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
+                fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (F + lambda * I).inv @ g
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
         return hypergrad
 
-    @profile
     def hypergradient_with_conjugate_gradients(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-        fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
+
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        
         return hypergrad
 
-    @profile
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-        fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
-        hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
-        with torch.no_grad():
-            tqdm.write(
-                f"Fisher stats | "
-                f"outer_grad_norm={d_outer_d_policy.norm().item():.3e} | "
-                f"hypergrad_norm={hypergrad.norm().item():.3e} | "
-                f"solve_norm={fisher_inv_d_outer_d_policy.norm().item():.3e} | "
-                f"solve_abs_max={fisher_inv_d_outer_d_policy.abs().max().item():.3e} | "
-            )
+        self.outer_grad_time = timer.elapsed
+        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
+
+        self.fisher_solve_time = timer.elapsed
+        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
+
+        self.cross_product_time = timer.elapsed
+        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+    
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with RecordTime(self, "hypergradient_time"):
-            if self.mode == "explicit":
-                hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
-            elif self.mode == "cg":
-                hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
-            elif self.mode == "sketch":
-                hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
-            else:
-                raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+        with PeakRAMMonitor(interval=0.001) as ram:
+            with RecordTime() as timer:
+                if self.mode == "explicit":
+                    hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
+                elif self.mode == "cg":
+                    hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
+                elif self.mode == "sketch":
+                    hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
+                else:
+                    raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+
+        self.hypergradient_time = timer.elapsed
+        self.hypergradient_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.hypergradient_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.hypergradient_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
 
         if not torch.isfinite(hypergradient).all():
             raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")
