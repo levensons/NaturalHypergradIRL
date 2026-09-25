@@ -6,7 +6,7 @@ import psutil
 
 
 class PeakRAMMonitor:
-    def __init__(self, interval: float = 0.05):
+    def __init__(self, interval: float = 0.001):
         if interval <= 0:
             raise ValueError(f"`interval` must be positive, got {interval}.")
 
@@ -16,6 +16,7 @@ class PeakRAMMonitor:
         self.start_rss = 0
         self.peak_rss = 0
         self.elapsed_seconds = 0.0
+        self.metrics: dict[str, float] | None = None
 
         self._started_at = 0.0
         self._stop_event = threading.Event()
@@ -84,10 +85,17 @@ class PeakRAMMonitor:
         self._thread.join()
 
         self._update()
-        metrics = self._current_metrics()
+        self.metrics = self._current_metrics()
 
         self._thread = None
-        return metrics
+        return self.metrics
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
 
 
 class RecordTime:
