@@ -417,17 +417,26 @@ def train_fisher(
                 cross_product_delta_rss.append(outer_optimizer.cross_product_delta_rss_mb)
 
                 logger.info(
-                    "Memory | "
-                    f"hypergradient: start={hypergradient_start_rss[-1]:.2f} MB, "
+                    "Memory | hypergradient: "
+                    f"start={hypergradient_start_rss[-1]:.2f} MB, "
                     f"peak={hypergradient_peak_rss[-1]:.2f} MB, "
-                    f"delta={hypergradient_delta_rss[-1]:.2f} MB | "
-                    f"outer grad: start={outer_grad_start_rss[-1]:.2f} MB, "
+                    f"delta={hypergradient_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | outer grad: "
+                    f"start={outer_grad_start_rss[-1]:.2f} MB, "
                     f"peak={outer_grad_peak_rss[-1]:.2f} MB, "
-                    f"delta={outer_grad_delta_rss[-1]:.2f} MB | "
-                    f"Fisher solve: start={fisher_solve_start_rss[-1]:.2f} MB, "
+                    f"delta={outer_grad_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | Fisher solve: "
+                    f"start={fisher_solve_start_rss[-1]:.2f} MB, "
                     f"peak={fisher_solve_peak_rss[-1]:.2f} MB, "
-                    f"delta={fisher_solve_delta_rss[-1]:.2f} MB | "
-                    f"cross product: start={cross_product_start_rss[-1]:.2f} MB, "
+                    f"delta={fisher_solve_delta_rss[-1]:.2f} MB"
+                )
+                logger.info(
+                    "Memory | cross product: "
+                    f"start={cross_product_start_rss[-1]:.2f} MB, "
                     f"peak={cross_product_peak_rss[-1]:.2f} MB, "
                     f"delta={cross_product_delta_rss[-1]:.2f} MB"
                 )
