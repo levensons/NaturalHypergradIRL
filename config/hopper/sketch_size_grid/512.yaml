@@ -29,8 +29,9 @@ fisher:
 
   fisher_reg: 1e-3
   fisher_batch_size: 256
+
   mode: sketch
-  fisher_sketch_size: 512
+  sketch_size: 512
 
   lr_reward: 1e-2
   max_grad_norm: 1.0

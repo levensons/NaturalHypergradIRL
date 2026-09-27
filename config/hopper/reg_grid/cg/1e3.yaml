@@ -27,10 +27,12 @@ fisher:
   alpha: 0.2
   gamma: 0.99
 
-  fisher_reg: 1e2
+  fisher_reg: 1e3
   fisher_batch_size: 256
-  mode: explicit
-  fisher_sketch_size: null
+
+  mode: cg
+  cg_max_iters: 100
+  cg_tol: 1e-6
 
   lr_reward: 1e-2
   max_grad_norm: 1.0
