@@ -23,11 +23,20 @@ class FisherNHD:
         max_grad_norm: float | None = None,
         scheduler_gamma: float = 1.0,
         mode: Literal["explicit", "cg", "sketch"] = "explicit",
+        cg_max_iters: int | None = None,
+        cg_tol: float | None = None,
         sketch_size: int | None = None,
         fisher_batch_size: int = 256,
     ):
         if mode not in {"explicit", "cg", "sketch"}:
             raise ValueError(f"Unknown Fisher solve mode: {mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+
+        if mode == "cg":
+            if cg_max_iters is None or cg_max_iters <= 0:
+                raise ValueError("cg_max_iters must be a positive integer when mode='cg'.")
+
+            if cg_tol is None or cg_tol <= 0:
+                raise ValueError("cg_tol must be positive when mode='cg'.")
 
         if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
             raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
@@ -46,6 +55,8 @@ class FisherNHD:
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
         self.mode = mode
+        self.cg_max_iters = cg_max_iters
+        self.cg_tol = cg_tol
         self.sketch_size = sketch_size
         self.fisher_batch_size = fisher_batch_size
 
@@ -289,7 +300,7 @@ class FisherNHD:
 
         return out
 
-    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int = 50, tol: float = 1e-6, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
         x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
         r = g.detach().clone()
         p = r.clone()
@@ -473,7 +484,12 @@ class FisherNHD:
 
         with PeakRAMMonitor(interval=0.001) as ram:
             with RecordTime() as timer:
-                fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(agent_trajs, d_outer_d_policy) # (F + lambda * I).inv @ g
+                fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(
+                    agent_trajs,
+                    d_outer_d_policy,
+                    self.cg_max_iters,
+                    self.cg_tol,
+                ) # (F + lambda * I).inv @ g
 
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -503,7 +519,11 @@ class FisherNHD:
 
         with PeakRAMMonitor(interval=0.001) as ram:
             with RecordTime() as timer:
-                fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size) # (F + lambda * I)^(-1) @ g
+                fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(
+                    agent_trajs,
+                    d_outer_d_policy,
+                    self.sketch_size,
+                ) # (F + lambda * I)^(-1) @ g
 
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]

@@ -84,7 +84,9 @@ def train_fisher(
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
         mode=str(fisher_cfg["mode"]),
-        sketch_size=fisher_cfg["fisher_sketch_size"],
+        cg_max_iters=None if fisher_cfg.get("cg_max_iters") is None else int(fisher_cfg["cg_max_iters"]),
+        cg_tol=None if fisher_cfg.get("cg_tol") is None else float(fisher_cfg["cg_tol"]),
+        sketch_size=None if fisher_cfg.get("sketch_size") is None else int(fisher_cfg["sketch_size"]),
         fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
     )
 
@@ -241,7 +243,9 @@ def train_fisher(
             "gamma": fisher_cfg["gamma"],
             "fisher_reg": fisher_cfg["fisher_reg"],
             "mode": fisher_cfg["mode"],
-            "fisher_sketch_size": fisher_cfg["fisher_sketch_size"],
+            "cg_tol": "None" if fisher_cfg.get("cg_tol") is None else fisher_cfg["cg_tol"],
+            "cg_max_iters": "None" if fisher_cfg.get("cg_max_iters") is None else fisher_cfg["cg_max_iters"],
+            "sketch_size": "None" if fisher_cfg.get("sketch_size") is None else fisher_cfg["sketch_size"],
             "fisher_batch_size": fisher_cfg["fisher_batch_size"],
             "lr_reward": fisher_cfg["lr_reward"],
             "max_grad_norm": fisher_cfg["max_grad_norm"],
@@ -495,21 +499,27 @@ def train_fisher(
 
         inner_step_time_mean = np.mean(inner_step_times)
         inner_step_time_std = np.std(inner_step_times, ddof=1)
+        inner_step_time_max = np.max(inner_step_times)
 
         outer_step_time_mean = np.mean(outer_step_times)
         outer_step_time_std = np.std(outer_step_times, ddof=1)
+        outer_step_time_max = np.max(outer_step_times)
 
         hypergradient_time_mean = np.mean(hypergradient_times)
         hypergradient_time_std = np.std(hypergradient_times, ddof=1)
+        hypergradient_time_max = np.max(hypergradient_times)
 
         outer_grad_time_mean = np.mean(outer_grad_times)
         outer_grad_time_std = np.std(outer_grad_times, ddof=1)
+        outer_grad_time_max = np.max(outer_grad_times)
 
         fisher_solve_time_mean = np.mean(fisher_solve_times)
         fisher_solve_time_std = np.std(fisher_solve_times, ddof=1)
+        fisher_solve_time_max = np.max(fisher_solve_times)
 
         cross_product_time_mean = np.mean(cross_product_times)
         cross_product_time_std = np.std(cross_product_times, ddof=1)
+        cross_product_time_max = np.max(cross_product_times)
 
         hypergradient_delta_rss_mean = np.mean(hypergradient_delta_rss)
         hypergradient_delta_rss_std = np.std(hypergradient_delta_rss, ddof=1)
@@ -540,13 +550,49 @@ def train_fisher(
 
         logger.info(
             "Training time | "
-            f"total optimization={total_optimization_time:.2f} s | "
-            f"inner step={inner_step_time_mean:.2f} ± {inner_step_time_std:.2f} s | "
-            f"outer step={outer_step_time_mean:.2f} ± {outer_step_time_std:.2f} s | "
-            f"hypergradient={hypergradient_time_mean:.2f} ± {hypergradient_time_std:.2f} s | "
-            f"outer grad={outer_grad_time_mean:.2f} ± {outer_grad_time_std:.2f} s | "
-            f"Fisher solve={fisher_solve_time_mean:.2f} ± {fisher_solve_time_std:.2f} s | "
-            f"cross product={cross_product_time_mean:.2f} ± {cross_product_time_std:.2f} s"
+            f"total optimization={total_optimization_time:.2f} s"
+        )
+
+        logger.info(
+            "Inner step time | "
+            f"mean={inner_step_time_mean:.2f} s | "
+            f"std={inner_step_time_std:.2f} s | "
+            f"max={inner_step_time_max:.2f} s"
+        )
+
+        logger.info(
+            "Outer step time | "
+            f"mean={outer_step_time_mean:.2f} s | "
+            f"std={outer_step_time_std:.2f} s | "
+            f"max={outer_step_time_max:.2f} s"
+        )
+
+        logger.info(
+            "Hypergradient time | "
+            f"mean={hypergradient_time_mean:.2f} s | "
+            f"std={hypergradient_time_std:.2f} s | "
+            f"max={hypergradient_time_max:.2f} s"
+        )
+
+        logger.info(
+            "Outer grad time | "
+            f"mean={outer_grad_time_mean:.2f} s | "
+            f"std={outer_grad_time_std:.2f} s | "
+            f"max={outer_grad_time_max:.2f} s"
+        )
+
+        logger.info(
+            "Fisher solve time | "
+            f"mean={fisher_solve_time_mean:.2f} s | "
+            f"std={fisher_solve_time_std:.2f} s | "
+            f"max={fisher_solve_time_max:.2f} s"
+        )
+
+        logger.info(
+            "Cross product time | "
+            f"mean={cross_product_time_mean:.2f} s | "
+            f"std={cross_product_time_std:.2f} s | "
+            f"max={cross_product_time_max:.2f} s"
         )
 
         logger.info(
@@ -600,6 +646,12 @@ def train_fisher(
                     "timing/outer_grad_seconds_std": float(outer_grad_time_std),
                     "timing/cross_product_seconds_mean": float(cross_product_time_mean),
                     "timing/cross_product_seconds_std": float(cross_product_time_std),
+                    "timing/inner_step_seconds_max": float(inner_step_time_max),
+                    "timing/outer_step_seconds_max": float(outer_step_time_max),
+                    "timing/hypergradient_seconds_max": float(hypergradient_time_max),
+                    "timing/outer_grad_seconds_max": float(outer_grad_time_max),
+                    "timing/fisher_solve_seconds_max": float(fisher_solve_time_max),
+                    "timing/cross_product_seconds_max": float(cross_product_time_max),
                     "resources/hypergradient_delta_rss_mb_mean": float(hypergradient_delta_rss_mean),
                     "resources/hypergradient_delta_rss_mb_std": float(hypergradient_delta_rss_std),
                     "resources/hypergradient_delta_rss_mb_max": float(hypergradient_delta_rss_max),
