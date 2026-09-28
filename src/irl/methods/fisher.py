@@ -254,7 +254,6 @@ def train_fisher(
     )
 
     mlflow.log_params({f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()})
-
     mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
 
     ram_monitor = PeakRAMMonitor(interval=0.001)
