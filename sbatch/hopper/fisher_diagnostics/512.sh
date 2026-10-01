@@ -3,7 +3,7 @@
 #SBATCH --partition=rocky
 #SBATCH --constraint="type_d"
 #SBATCH --gpus=0
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --time=1-00:00
 #SBATCH --mail-user=nvsevriukov@edu.hse.ru
 #SBATCH --mail-type=END,FAIL
