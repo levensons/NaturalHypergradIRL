@@ -10,15 +10,15 @@ from pathlib import Path
 from types import ModuleType
 
 import mlflow
-import torch
 import numpy as np
+import torch
 
 from src.algorithms.ml_irl import MLIRL
 from src.evaluation.metrics import inner_loss, learned_reward_stats, outer_loss, policy_nll, rank_corr
 from src.irl.builders import SUPPORTED_AGENTS, build_agent, build_arch
 from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
-from src.utils.resources import PeakRAMMonitor, RecordTime
+from src.utils.resources import RAM, RecordTime
 from src.utils.seeding import set_random_seed
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
@@ -30,6 +30,15 @@ def train_ml_irl(
     log_every: int,
     logger,
 ) -> None:
+
+    def log_memory_snapshot(tag: str) -> None:
+        memory = RAM.current()
+        logger.info(
+            f"Memory snapshot | {tag}: "
+            f"RSS={memory['rss_mb']:.2f} MB | "
+            f"USS={memory['uss_mb']:.2f} MB"
+        )
+
     ml_irl_cfg = config["ml_irl"]
     inner_cfg = ml_irl_cfg["inner"]
     inner_params = inner_cfg["params"]
@@ -51,18 +60,14 @@ def train_ml_irl(
     device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
-    env = env_builders.build_env(
-        env_cfg=env_cfg,
-        seed=int(ml_irl_cfg["env_seed"]),
-    )
-    train_env = env_builders.build_env(
-        env_cfg=env_cfg,
-        seed=int(inner_cfg["train_env_seed"]),
-    )
-    eval_env = env_builders.build_env(
-        env_cfg=env_cfg,
-        seed=int(inner_cfg["eval_env_seed"]),
-    )
+    log_memory_snapshot("before environments")
+
+    env = env_builders.build_env(env_cfg=env_cfg, seed=int(ml_irl_cfg["env_seed"]))
+
+    train_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["train_env_seed"]))
+    eval_env = env_builders.build_env(env_cfg=env_cfg, seed=int(inner_cfg["eval_env_seed"]))
+
+    log_memory_snapshot("after environments")
 
     expert_train_path = Path(data_cfg["expert_train_trajs"])
     random_train_path = Path(data_cfg["random_train_trajs"])
@@ -74,6 +79,8 @@ def train_ml_irl(
     expert_valid_trajs = load_trajectories(expert_valid_path, map_location="cpu")
     random_valid_trajs = load_trajectories(random_valid_path, map_location="cpu")
 
+    log_memory_snapshot("after datasets")
+
     logger.info(f"Loaded {len(expert_train_trajs)} expert train trajectories from {expert_train_path}")
     logger.info(f"Loaded {len(random_train_trajs)} random train trajectories from {random_train_path}")
     logger.info(f"Loaded {len(expert_valid_trajs)} expert valid trajectories from {expert_valid_path}")
@@ -81,6 +88,8 @@ def train_ml_irl(
 
     policy = env_builders.build_policy(env=env, policy_cfg=policy_cfg).to(device)
     reward = env_builders.build_reward(env=env, reward_cfg=reward_cfg).to(device)
+
+    log_memory_snapshot("after policy and reward")
 
     outer_optimizer = MLIRL(
         reward=reward,
@@ -90,6 +99,8 @@ def train_ml_irl(
         max_grad_norm=ml_irl_cfg["max_grad_norm"],
     )
 
+    log_memory_snapshot("after MLIRL")
+
     agent = build_agent(
         policy=policy,
         env=env,
@@ -98,8 +109,12 @@ def train_ml_irl(
         alpha=float(ml_irl_cfg["alpha"]),
     )
 
+    log_memory_snapshot("after agent")
+
     if agent_type == "sac":
         agent.replay_buffer.extend_from_trajectories(random_train_trajs)
+
+    log_memory_snapshot("after replay buffer initialization")
 
     n_outer_steps = int(ml_irl_cfg["n_outer_steps"])
     n_inner_steps = int(ml_irl_cfg["n_inner_steps"])
@@ -241,18 +256,32 @@ def train_ml_irl(
     mlflow.log_params({f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()})
     mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
 
-    ram_monitor = PeakRAMMonitor(interval=0.001)
+    log_memory_snapshot("before training")
+
+    ram_monitor = RAM(interval=0.001)
     ram_monitor.start()
 
     total_optimization_time = 0.0
 
     inner_step_times = []
-    outer_step_times = []
-    gradient_times = []
+    inner_step_peak_rss = []
+    inner_step_peak_rss_increase = []
+    inner_step_retained_rss = []
+    inner_step_released_from_peak = []
 
-    gradient_start_rss = []
+    trajectory_collection_times = []
+    trajectory_collection_peak_rss = []
+    trajectory_collection_peak_rss_increase = []
+    trajectory_collection_retained_rss = []
+    trajectory_collection_released_from_peak = []
+
+    outer_step_times = []
+
+    gradient_times = []
     gradient_peak_rss = []
-    gradient_delta_rss = []
+    gradient_peak_rss_increase = []
+    gradient_retained_rss = []
+    gradient_released_from_peak = []
 
     def log_and_checkpoint(outer_step: int, agent_trajs) -> None:
         nonlocal best_l_outer
@@ -339,8 +368,12 @@ def train_ml_irl(
                 "expert_mean_reward": expert_mean_reward,
                 "agent_mean_reward": agent_mean_reward,
                 "expert_agent_reward_diff": expert_mean_reward - agent_mean_reward,
+                "resources/training_start_rss_mb": ram_metrics["start_rss_mb"],
                 "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                "resources/training_end_rss_mb": ram_metrics["end_rss_mb"],
                 "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                "resources/training_retained_rss_mb": ram_metrics["retained_rss_mb"],
+                "resources/training_released_from_peak_mb": ram_metrics["released_from_peak_mb"],
                 "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
             },
             step=outer_step,
@@ -354,22 +387,82 @@ def train_ml_irl(
 
     try:
         for outer_step in range(1, n_outer_steps + 1):
-            with RecordTime() as timer:
-                inner_optimize(outer_step)
-
-                agent_train_trajs = collect_trajectories(
-                    env=env,
-                    policy=policy,
-                    n=n_agent_trajs,
-                    deterministic=False,
-                    desc="agent train trajs",
-                    verbose=True,
-                )
+            with RAM(interval=0.001) as ram:
+                with RecordTime() as timer:
+                    inner_optimize(outer_step)
 
             total_optimization_time += timer.elapsed
-            inner_step_times.append(timer.elapsed)
 
-            mlflow.log_metric("timing/inner_step_seconds", float(timer.elapsed), step=outer_step)
+            inner_step_times.append(timer.elapsed)
+            inner_step_peak_rss.append(ram.metrics["peak_rss_mb"])
+            inner_step_peak_rss_increase.append(ram.metrics["peak_rss_increase_mb"])
+            inner_step_retained_rss.append(ram.metrics["retained_rss_mb"])
+            inner_step_released_from_peak.append(ram.metrics["released_from_peak_mb"])
+
+            logger.info(
+                "Memory | inner step: "
+                f"start={ram.metrics['start_rss_mb']:.2f} MB, "
+                f"peak={ram.metrics['peak_rss_mb']:.2f} MB, "
+                f"end={ram.metrics['end_rss_mb']:.2f} MB, "
+                f"peak increase={ram.metrics['peak_rss_increase_mb']:.2f} MB, "
+                f"retained={ram.metrics['retained_rss_mb']:.2f} MB, "
+                f"released={ram.metrics['released_from_peak_mb']:.2f} MB"
+            )
+
+            mlflow.log_metrics(
+                {
+                    "timing/inner_step_seconds": float(timer.elapsed),
+                    "resources/inner_step_start_rss_mb": ram.metrics["start_rss_mb"],
+                    "resources/inner_step_peak_rss_mb": ram.metrics["peak_rss_mb"],
+                    "resources/inner_step_end_rss_mb": ram.metrics["end_rss_mb"],
+                    "resources/inner_step_peak_rss_increase_mb": ram.metrics["peak_rss_increase_mb"],
+                    "resources/inner_step_retained_rss_mb": ram.metrics["retained_rss_mb"],
+                    "resources/inner_step_released_from_peak_mb": ram.metrics["released_from_peak_mb"],
+                },
+                step=outer_step,
+            )
+
+            with RAM(interval=0.001) as ram:
+                with RecordTime() as timer:
+                    agent_train_trajs = collect_trajectories(
+                        env=env,
+                        policy=policy,
+                        n=n_agent_trajs,
+                        deterministic=False,
+                        desc="agent train trajs",
+                        verbose=True,
+                    )
+
+            total_optimization_time += timer.elapsed
+
+            trajectory_collection_times.append(timer.elapsed)
+            trajectory_collection_peak_rss.append(ram.metrics["peak_rss_mb"])
+            trajectory_collection_peak_rss_increase.append(ram.metrics["peak_rss_increase_mb"])
+            trajectory_collection_retained_rss.append(ram.metrics["retained_rss_mb"])
+            trajectory_collection_released_from_peak.append(ram.metrics["released_from_peak_mb"])
+
+            logger.info(
+                "Memory | trajectory collection: "
+                f"start={ram.metrics['start_rss_mb']:.2f} MB, "
+                f"peak={ram.metrics['peak_rss_mb']:.2f} MB, "
+                f"end={ram.metrics['end_rss_mb']:.2f} MB, "
+                f"peak increase={ram.metrics['peak_rss_increase_mb']:.2f} MB, "
+                f"retained={ram.metrics['retained_rss_mb']:.2f} MB, "
+                f"released={ram.metrics['released_from_peak_mb']:.2f} MB"
+            )
+
+            mlflow.log_metrics(
+                {
+                    "timing/trajectory_collection_seconds": float(timer.elapsed),
+                    "resources/trajectory_collection_start_rss_mb": ram.metrics["start_rss_mb"],
+                    "resources/trajectory_collection_peak_rss_mb": ram.metrics["peak_rss_mb"],
+                    "resources/trajectory_collection_end_rss_mb": ram.metrics["end_rss_mb"],
+                    "resources/trajectory_collection_peak_rss_increase_mb": ram.metrics["peak_rss_increase_mb"],
+                    "resources/trajectory_collection_retained_rss_mb": ram.metrics["retained_rss_mb"],
+                    "resources/trajectory_collection_released_from_peak_mb": ram.metrics["released_from_peak_mb"],
+                },
+                step=outer_step,
+            )
 
             log_and_checkpoint(outer_step, agent_train_trajs)
 
@@ -382,15 +475,19 @@ def train_ml_irl(
 
                 gradient_times.append(outer_optimizer.gradient_time)
 
-                gradient_start_rss.append(outer_optimizer.gradient_start_rss_mb)
                 gradient_peak_rss.append(outer_optimizer.gradient_peak_rss_mb)
-                gradient_delta_rss.append(outer_optimizer.gradient_delta_rss_mb)
+                gradient_peak_rss_increase.append(outer_optimizer.gradient_peak_rss_increase_mb)
+                gradient_retained_rss.append(outer_optimizer.gradient_retained_rss_mb)
+                gradient_released_from_peak.append(outer_optimizer.gradient_released_from_peak_mb)
 
                 logger.info(
                     "Memory | ML-IRL gradient: "
-                    f"start={gradient_start_rss[-1]:.2f} MB, "
-                    f"peak={gradient_peak_rss[-1]:.2f} MB, "
-                    f"delta={gradient_delta_rss[-1]:.2f} MB"
+                    f"start={outer_optimizer.gradient_start_rss_mb:.2f} MB, "
+                    f"peak={outer_optimizer.gradient_peak_rss_mb:.2f} MB, "
+                    f"end={outer_optimizer.gradient_end_rss_mb:.2f} MB, "
+                    f"peak increase={outer_optimizer.gradient_peak_rss_increase_mb:.2f} MB, "
+                    f"retained={outer_optimizer.gradient_retained_rss_mb:.2f} MB, "
+                    f"released={outer_optimizer.gradient_released_from_peak_mb:.2f} MB"
                 )
 
                 logger.info(
@@ -403,9 +500,12 @@ def train_ml_irl(
                     {
                         "timing/outer_step_seconds": float(outer_step_times[-1]),
                         "timing/gradient_seconds": float(gradient_times[-1]),
-                        "resources/gradient_start_rss_mb": float(gradient_start_rss[-1]),
-                        "resources/gradient_peak_rss_mb": float(gradient_peak_rss[-1]),
-                        "resources/gradient_delta_rss_mb": float(gradient_delta_rss[-1]),
+                        "resources/gradient_start_rss_mb": outer_optimizer.gradient_start_rss_mb,
+                        "resources/gradient_peak_rss_mb": outer_optimizer.gradient_peak_rss_mb,
+                        "resources/gradient_end_rss_mb": outer_optimizer.gradient_end_rss_mb,
+                        "resources/gradient_peak_rss_increase_mb": outer_optimizer.gradient_peak_rss_increase_mb,
+                        "resources/gradient_retained_rss_mb": outer_optimizer.gradient_retained_rss_mb,
+                        "resources/gradient_released_from_peak_mb": outer_optimizer.gradient_released_from_peak_mb,
                     },
                     step=outer_step,
                 )
@@ -413,89 +513,145 @@ def train_ml_irl(
     finally:
         ram_metrics = ram_monitor.stop()
 
-        inner_step_time_mean = np.mean(inner_step_times)
-        inner_step_time_std = np.std(inner_step_times, ddof=1)
-        inner_step_time_max = np.max(inner_step_times)
+        def summarize(values):
+            return {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values, ddof=1)),
+                "max": float(np.max(values)),
+            }
 
-        outer_step_time_mean = np.mean(outer_step_times)
-        outer_step_time_std = np.std(outer_step_times, ddof=1)
-        outer_step_time_max = np.max(outer_step_times)
+        inner_step_time = summarize(inner_step_times)
+        trajectory_collection_time = summarize(trajectory_collection_times)
+        outer_step_time = summarize(outer_step_times)
+        gradient_time = summarize(gradient_times)
 
-        gradient_time_mean = np.mean(gradient_times)
-        gradient_time_std = np.std(gradient_times, ddof=1)
-        gradient_time_max = np.max(gradient_times)
+        inner_step_peak = summarize(inner_step_peak_rss)
+        inner_step_increase = summarize(inner_step_peak_rss_increase)
+        inner_step_retained = summarize(inner_step_retained_rss)
+        inner_step_released = summarize(inner_step_released_from_peak)
 
-        gradient_delta_rss_mean = np.mean(gradient_delta_rss)
-        gradient_delta_rss_std = np.std(gradient_delta_rss, ddof=1)
-        gradient_delta_rss_max = np.max(gradient_delta_rss)
-        gradient_peak_rss_max = np.max(gradient_peak_rss)
+        trajectory_collection_peak = summarize(trajectory_collection_peak_rss)
+        trajectory_collection_increase = summarize(trajectory_collection_peak_rss_increase)
+        trajectory_collection_retained = summarize(trajectory_collection_retained_rss)
+        trajectory_collection_released = summarize(trajectory_collection_released_from_peak)
+
+        gradient_peak = summarize(gradient_peak_rss)
+        gradient_increase = summarize(gradient_peak_rss_increase)
+        gradient_retained = summarize(gradient_retained_rss)
+        gradient_released = summarize(gradient_released_from_peak)
+
+        def log_time_summary(name: str, stats: dict):
+            logger.info(
+                f"{name} time | "
+                f"mean={stats['mean']:.2f} s | "
+                f"std={stats['std']:.2f} s | "
+                f"max={stats['max']:.2f} s"
+            )
+
+        def log_memory_summary(name: str, peak: dict, increase: dict, retained: dict, released: dict):
+            logger.info(
+                f"{name} memory | "
+                f"peak RSS={peak['mean']:.2f} ± {peak['std']:.2f} MB | "
+                f"peak increase={increase['mean']:.2f} ± {increase['std']:.2f} MB | "
+                f"retained={retained['mean']:.2f} ± {retained['std']:.2f} MB | "
+                f"released={released['mean']:.2f} ± {released['std']:.2f} MB | "
+                f"max peak RSS={peak['max']:.2f} MB"
+            )
 
         logger.info(
             "Training memory | "
             f"start RSS={ram_metrics['start_rss_mb']:.2f} MB | "
             f"peak RSS={ram_metrics['peak_rss_mb']:.2f} MB | "
-            f"increase={ram_metrics['peak_rss_increase_mb']:.2f} MB"
+            f"end RSS={ram_metrics['end_rss_mb']:.2f} MB | "
+            f"peak increase={ram_metrics['peak_rss_increase_mb']:.2f} MB | "
+            f"retained={ram_metrics['retained_rss_mb']:.2f} MB | "
+            f"released={ram_metrics['released_from_peak_mb']:.2f} MB"
         )
 
-        logger.info(
-            "Training time | "
-            f"total optimization={total_optimization_time:.2f} s"
-        )
+        logger.info(f"Training time | total optimization={total_optimization_time:.2f} s")
 
-        logger.info(
-            "Inner step time | "
-            f"mean={inner_step_time_mean:.2f} s | "
-            f"std={inner_step_time_std:.2f} s | "
-            f"max={inner_step_time_max:.2f} s"
-        )
+        log_time_summary("Inner step", inner_step_time)
+        log_time_summary("Trajectory collection", trajectory_collection_time)
+        log_time_summary("Outer step", outer_step_time)
+        log_time_summary("ML-IRL gradient", gradient_time)
 
-        logger.info(
-            "Outer step time | "
-            f"mean={outer_step_time_mean:.2f} s | "
-            f"std={outer_step_time_std:.2f} s | "
-            f"max={outer_step_time_max:.2f} s"
-        )
-
-        logger.info(
-            "ML-IRL gradient time | "
-            f"mean={gradient_time_mean:.2f} s | "
-            f"std={gradient_time_std:.2f} s | "
-            f"max={gradient_time_max:.2f} s"
-        )
-
-        logger.info(
-            "ML-IRL gradient memory | "
-            f"delta RSS={gradient_delta_rss_mean:.2f} ± "
-            f"{gradient_delta_rss_std:.2f} MB | "
-            f"max delta RSS={gradient_delta_rss_max:.2f} MB | "
-            f"max peak RSS={gradient_peak_rss_max:.2f} MB"
-        )
+        log_memory_summary("Inner step", inner_step_peak, inner_step_increase, inner_step_retained, inner_step_released)
+        log_memory_summary("Trajectory collection", trajectory_collection_peak, trajectory_collection_increase, trajectory_collection_retained, trajectory_collection_released)
+        log_memory_summary("ML-IRL gradient", gradient_peak, gradient_increase, gradient_retained, gradient_released)
 
         try:
             mlflow.log_metrics(
                 {
+                    # Whole training
+                    "resources/training_start_rss_mb": ram_metrics["start_rss_mb"],
                     "resources/training_peak_rss_mb": ram_metrics["peak_rss_mb"],
+                    "resources/training_end_rss_mb": ram_metrics["end_rss_mb"],
                     "resources/training_peak_rss_increase_mb": ram_metrics["peak_rss_increase_mb"],
+                    "resources/training_retained_rss_mb": ram_metrics["retained_rss_mb"],
+                    "resources/training_released_from_peak_mb": ram_metrics["released_from_peak_mb"],
                     "resources/training_elapsed_seconds": ram_metrics["elapsed_seconds"],
                     "timing/total_optimization_seconds": float(total_optimization_time),
-                    "timing/inner_step_seconds_mean": float(inner_step_time_mean),
-                    "timing/inner_step_seconds_std": float(inner_step_time_std),
-                    "timing/inner_step_seconds_max": float(inner_step_time_max),
-                    "timing/outer_step_seconds_mean": float(outer_step_time_mean),
-                    "timing/outer_step_seconds_std": float(outer_step_time_std),
-                    "timing/outer_step_seconds_max": float(outer_step_time_max),
-                    "timing/gradient_seconds_mean": float(gradient_time_mean),
-                    "timing/gradient_seconds_std": float(gradient_time_std),
-                    "timing/gradient_seconds_max": float(gradient_time_max),
-                    "resources/gradient_delta_rss_mb_mean": float(gradient_delta_rss_mean),
-                    "resources/gradient_delta_rss_mb_std": float(gradient_delta_rss_std),
-                    "resources/gradient_delta_rss_mb_max": float(gradient_delta_rss_max),
-                    "resources/gradient_peak_rss_mb_max": float(gradient_peak_rss_max),
+
+                    # Inner optimization
+                    "timing/inner_step_seconds_mean": inner_step_time["mean"],
+                    "timing/inner_step_seconds_std": inner_step_time["std"],
+                    "timing/inner_step_seconds_max": inner_step_time["max"],
+                    "resources/inner_step_peak_rss_mb_mean": inner_step_peak["mean"],
+                    "resources/inner_step_peak_rss_mb_std": inner_step_peak["std"],
+                    "resources/inner_step_peak_rss_mb_max": inner_step_peak["max"],
+                    "resources/inner_step_peak_rss_increase_mb_mean": inner_step_increase["mean"],
+                    "resources/inner_step_peak_rss_increase_mb_std": inner_step_increase["std"],
+                    "resources/inner_step_peak_rss_increase_mb_max": inner_step_increase["max"],
+                    "resources/inner_step_retained_rss_mb_mean": inner_step_retained["mean"],
+                    "resources/inner_step_retained_rss_mb_std": inner_step_retained["std"],
+                    "resources/inner_step_retained_rss_mb_max": inner_step_retained["max"],
+                    "resources/inner_step_released_from_peak_mb_mean": inner_step_released["mean"],
+                    "resources/inner_step_released_from_peak_mb_std": inner_step_released["std"],
+                    "resources/inner_step_released_from_peak_mb_max": inner_step_released["max"],
+
+                    # Trajectory collection
+                    "timing/trajectory_collection_seconds_mean": trajectory_collection_time["mean"],
+                    "timing/trajectory_collection_seconds_std": trajectory_collection_time["std"],
+                    "timing/trajectory_collection_seconds_max": trajectory_collection_time["max"],
+                    "resources/trajectory_collection_peak_rss_mb_mean": trajectory_collection_peak["mean"],
+                    "resources/trajectory_collection_peak_rss_mb_std": trajectory_collection_peak["std"],
+                    "resources/trajectory_collection_peak_rss_mb_max": trajectory_collection_peak["max"],
+                    "resources/trajectory_collection_peak_rss_increase_mb_mean": trajectory_collection_increase["mean"],
+                    "resources/trajectory_collection_peak_rss_increase_mb_std": trajectory_collection_increase["std"],
+                    "resources/trajectory_collection_peak_rss_increase_mb_max": trajectory_collection_increase["max"],
+                    "resources/trajectory_collection_retained_rss_mb_mean": trajectory_collection_retained["mean"],
+                    "resources/trajectory_collection_retained_rss_mb_std": trajectory_collection_retained["std"],
+                    "resources/trajectory_collection_retained_rss_mb_max": trajectory_collection_retained["max"],
+                    "resources/trajectory_collection_released_from_peak_mb_mean": trajectory_collection_released["mean"],
+                    "resources/trajectory_collection_released_from_peak_mb_std": trajectory_collection_released["std"],
+                    "resources/trajectory_collection_released_from_peak_mb_max": trajectory_collection_released["max"],
+
+                    # Outer optimization
+                    "timing/outer_step_seconds_mean": outer_step_time["mean"],
+                    "timing/outer_step_seconds_std": outer_step_time["std"],
+                    "timing/outer_step_seconds_max": outer_step_time["max"],
+
+                    # ML-IRL gradient
+                    "timing/gradient_seconds_mean": gradient_time["mean"],
+                    "timing/gradient_seconds_std": gradient_time["std"],
+                    "timing/gradient_seconds_max": gradient_time["max"],
+                    "resources/gradient_peak_rss_mb_mean": gradient_peak["mean"],
+                    "resources/gradient_peak_rss_mb_std": gradient_peak["std"],
+                    "resources/gradient_peak_rss_mb_max": gradient_peak["max"],
+                    "resources/gradient_peak_rss_increase_mb_mean": gradient_increase["mean"],
+                    "resources/gradient_peak_rss_increase_mb_std": gradient_increase["std"],
+                    "resources/gradient_peak_rss_increase_mb_max": gradient_increase["max"],
+                    "resources/gradient_retained_rss_mb_mean": gradient_retained["mean"],
+                    "resources/gradient_retained_rss_mb_std": gradient_retained["std"],
+                    "resources/gradient_retained_rss_mb_max": gradient_retained["max"],
+                    "resources/gradient_released_from_peak_mb_mean": gradient_released["mean"],
+                    "resources/gradient_released_from_peak_mb_std": gradient_released["std"],
+                    "resources/gradient_released_from_peak_mb_max": gradient_released["max"],
                 }
             )
 
         except Exception as error:
-            logger.warning(f"Failed to log memory metrics to MLflow: {error}")
+            logger.warning(f"Failed to log final metrics to MLflow: {error}")
 
     env.close()
 
