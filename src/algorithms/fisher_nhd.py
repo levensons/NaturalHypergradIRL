@@ -86,6 +86,7 @@ class FisherNHD:
         self.cross_product_peak_rss_mb = 0.0
         self.cross_product_delta_rss_mb = 0.0
 
+        # CG profiling
         self.cg_converged = False
         self.cg_iterations = 0
         self.cg_final_relative_residual = 0.0
@@ -399,7 +400,6 @@ class FisherNHD:
         if buffer_size > 0:
             flush()
 
-        F = 0.5 * (F + F.T)
         return F
 
     def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
