@@ -6,7 +6,7 @@ from torch import nn
 
 from src.algorithms.approximations import CBSCFD
 from src.utils.policies import Policy
-from src.utils.resources import PeakRAMMonitor, RecordTime
+from src.utils.resources import RAM, RecordTime
 from src.utils.torch import flat_grad, num_params, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
 
@@ -66,25 +66,41 @@ class FisherNHD:
         self.raw_grad_norm = 0.0
         self.clipped_grad_norm = 0.0
 
+        # Hypergradient profiling
         self.hypergradient_time = 0.0
         self.hypergradient_start_rss_mb = 0.0
         self.hypergradient_peak_rss_mb = 0.0
-        self.hypergradient_delta_rss_mb = 0.0
+        self.hypergradient_end_rss_mb = 0.0
+        self.hypergradient_peak_rss_increase_mb = 0.0
+        self.hypergradient_retained_rss_mb = 0.0
+        self.hypergradient_released_from_peak_mb = 0.0
 
+        # Outer gradient profiling
         self.outer_grad_time = 0.0
         self.outer_grad_start_rss_mb = 0.0
         self.outer_grad_peak_rss_mb = 0.0
-        self.outer_grad_delta_rss_mb = 0.0
+        self.outer_grad_end_rss_mb = 0.0
+        self.outer_grad_peak_rss_increase_mb = 0.0
+        self.outer_grad_retained_rss_mb = 0.0
+        self.outer_grad_released_from_peak_mb = 0.0
 
+        # Fisher solve profiling
         self.fisher_solve_time = 0.0
         self.fisher_solve_start_rss_mb = 0.0
         self.fisher_solve_peak_rss_mb = 0.0
-        self.fisher_solve_delta_rss_mb = 0.0
+        self.fisher_solve_end_rss_mb = 0.0
+        self.fisher_solve_peak_rss_increase_mb = 0.0
+        self.fisher_solve_retained_rss_mb = 0.0
+        self.fisher_solve_released_from_peak_mb = 0.0
 
+        # Cross product profiling
         self.cross_product_time = 0.0
         self.cross_product_start_rss_mb = 0.0
         self.cross_product_peak_rss_mb = 0.0
-        self.cross_product_delta_rss_mb = 0.0
+        self.cross_product_end_rss_mb = 0.0
+        self.cross_product_peak_rss_increase_mb = 0.0
+        self.cross_product_retained_rss_mb = 0.0
+        self.cross_product_released_from_peak_mb = 0.0
 
         # CG profiling
         self.cg_converged = False
@@ -441,16 +457,19 @@ class FisherNHD:
         return out
 
     def hypergradient_with_explicit_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
         self.outer_grad_time = timer.elapsed
         self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
         self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.outer_grad_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 fisher = self.explicit_fisher(agent_trajs)
                 fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
@@ -459,30 +478,39 @@ class FisherNHD:
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
         self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
 
         self.cross_product_time = timer.elapsed
         self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
         self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
         return hypergrad
 
     def hypergradient_with_conjugate_gradients(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
         self.outer_grad_time = timer.elapsed
         self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
         self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.outer_grad_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(
                     agent_trajs,
@@ -494,30 +522,39 @@ class FisherNHD:
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
         self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
 
         self.cross_product_time = timer.elapsed
         self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
         self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
         
         return hypergrad
 
     def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
 
         self.outer_grad_time = timer.elapsed
         self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
         self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.outer_grad_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.outer_grad_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(
                     agent_trajs,
@@ -528,21 +565,27 @@ class FisherNHD:
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
         self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.fisher_solve_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
 
         self.cross_product_time = timer.elapsed
         self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
         self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.cross_product_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
     
         return hypergrad
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with PeakRAMMonitor(interval=0.001) as ram:
+        with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
                 if self.mode == "explicit":
                     hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
@@ -556,7 +599,10 @@ class FisherNHD:
         self.hypergradient_time = timer.elapsed
         self.hypergradient_start_rss_mb = ram.metrics["start_rss_mb"]
         self.hypergradient_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.hypergradient_delta_rss_mb = ram.metrics["peak_rss_increase_mb"]
+        self.hypergradient_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.hypergradient_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.hypergradient_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.hypergradient_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
         if not torch.isfinite(hypergradient).all():
             raise FloatingPointError("FisherNHD gradient contains NaN or Inf.")
