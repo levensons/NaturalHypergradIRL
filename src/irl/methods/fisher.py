@@ -101,6 +101,7 @@ def train_fisher(
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
+        precompute_scores=bool(fisher_cfg.get("precompute_scores", False)),
         mode=str(fisher_cfg["mode"]),
         cg_max_iters=None if fisher_cfg.get("cg_max_iters") is None else int(fisher_cfg["cg_max_iters"]),
         cg_tol=None if fisher_cfg.get("cg_tol") is None else float(fisher_cfg["cg_tol"]),
@@ -267,6 +268,7 @@ def train_fisher(
             "gamma": fisher_cfg["gamma"],
             "fisher_reg": fisher_cfg["fisher_reg"],
             "mode": fisher_cfg["mode"],
+            "precompute_scores": fisher_cfg.get("precompute_scores", False),
             "cg_tol": "None" if fisher_cfg.get("cg_tol") is None else fisher_cfg["cg_tol"],
             "cg_max_iters": "None" if fisher_cfg.get("cg_max_iters") is None else fisher_cfg["cg_max_iters"],
             "sketch_size": "None" if fisher_cfg.get("sketch_size") is None else fisher_cfg["sketch_size"],
@@ -274,11 +276,47 @@ def train_fisher(
             "lr_reward": fisher_cfg["lr_reward"],
             "max_grad_norm": fisher_cfg["max_grad_norm"],
             "scheduler_gamma": fisher_cfg["scheduler_gamma"],
+            "random_seed": fisher_cfg["random_seed"],
+            "env_seed": fisher_cfg["env_seed"],
+
+            "inner/type": agent_type,
+            "inner/train_env_seed": inner_cfg["train_env_seed"],
+            "inner/eval_env_seed": inner_cfg["eval_env_seed"],
+            "inner/n_agent_eval_trajs": inner_cfg["n_agent_eval_trajs"],
+            "inner/validate_every": inner_cfg["validate_every"],
         }
     )
 
-    mlflow.log_params({f"inner/{key}": "None" if value is None else value for key, value in inner_params.items()})
-    mlflow.log_params({f"arch/{key}": value for key, value in arch.items() if not isinstance(value, (list, dict))})
+    mlflow.log_params(
+        {
+            f"policy/{key}": "None" if value is None else value
+            for key, value in policy_cfg.items()
+            if not isinstance(value, (list, dict))
+        }
+    )
+
+    mlflow.log_params(
+        {
+            f"reward/{key}": "None" if value is None else value
+            for key, value in reward_cfg.items()
+            if not isinstance(value, (list, dict))
+        }
+    )
+
+    mlflow.log_params(
+        {
+            f"inner/{key}": "None" if value is None else value
+            for key, value in inner_params.items()
+        }
+    )
+
+    mlflow.log_params(
+        {
+            f"arch/{key}": value
+            for key, value in arch.items()
+            if not isinstance(value, (list, dict))
+        }
+    )
 
     log_memory_snapshot("before training")
 

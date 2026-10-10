@@ -22,6 +22,7 @@ class FisherNHD:
         fisher_reg: float,
         max_grad_norm: float | None = None,
         scheduler_gamma: float = 1.0,
+        precompute_scores: bool = False,
         mode: Literal["explicit", "cg", "sketch"] = "explicit",
         cg_max_iters: int | None = None,
         cg_tol: float | None = None,
@@ -55,6 +56,7 @@ class FisherNHD:
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
         self.mode = mode
+        self.precompute_scores = precompute_scores
         self.cg_max_iters = cg_max_iters
         self.cg_tol = cg_tol
         self.sketch_size = sketch_size
@@ -149,6 +151,59 @@ class FisherNHD:
         g.neg_()
         return g
 
+    def _weighted_score_matrix(self, trajs, verbose: bool = True) -> torch.Tensor:
+        rows = []
+
+        states_buffer = []
+        actions_buffer = []
+        weights_buffer = []
+        buffer_size = 0
+
+        def flush():
+            nonlocal buffer_size
+
+            batch_states = torch.cat(states_buffer, dim=0)
+            batch_actions = torch.cat(actions_buffer, dim=0)
+            batch_weights = torch.cat(weights_buffer, dim=0)
+
+            grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
+
+            with torch.no_grad():
+                row_scale = torch.sqrt((self.alpha / len(trajs)) * batch_weights)  # (B,)
+                D_batch = (row_scale.reshape(-1, 1) * grad_log_pi_a_s)  # (B, policy_dim)
+
+            rows.append(D_batch)
+
+            states_buffer.clear()
+            actions_buffer.clear()
+            weights_buffer.clear()
+            buffer_size = 0
+
+        for traj in tqdm(trajs, desc="Weighted score matrix", leave=False, disable=not verbose):
+            states = to_device(traj["states"], self.device)
+            actions = to_device(traj["actions"], self.device)
+            T = states.size(0)
+            weights = discount_weights(T, self.gamma, self.device, torch.float32)
+
+            start = 0
+            while start < T:
+                take = min(self.fisher_batch_size - buffer_size, T - start)
+
+                states_buffer.append(states[start : start + take])
+                actions_buffer.append(actions[start : start + take])
+                weights_buffer.append(weights[start : start + take])
+
+                buffer_size += take
+                start += take
+
+                if buffer_size == self.fisher_batch_size:
+                    flush()
+
+        if buffer_size > 0:
+            flush()
+
+        return torch.cat(rows, dim=0)
+
     def _grad_log_pi_a_s(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         T = states.size(0)
 
@@ -178,59 +233,6 @@ class FisherNHD:
         dot = g_flat @ v
         jv = torch.autograd.grad(dot, u)[0]
         return jv.detach()
-
-    def fisher_solve_sketch(self, trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
-        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32)
-
-        states_buffer = []
-        actions_buffer = []
-        weights_buffer = []
-        buffer_size = 0
-
-        def flush():
-            nonlocal buffer_size
-
-            batch_states = torch.cat(states_buffer, dim=0)
-            batch_actions = torch.cat(actions_buffer, dim=0)
-            batch_weights = torch.cat(weights_buffer, dim=0)
-
-            grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
-
-            with torch.no_grad():
-                row_scale = torch.sqrt((self.alpha / len(trajs)) * batch_weights)  # (B,)
-                X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (B, policy_dim)
-
-            sketch.extend(X_rows)
-
-            states_buffer.clear()
-            actions_buffer.clear()
-            weights_buffer.clear()
-            buffer_size = 0
-
-        for traj in tqdm(trajs, desc="Fisher sketch", leave=False, disable=not verbose):
-            states = to_device(traj["states"], self.device)
-            actions = to_device(traj["actions"], self.device)
-            T = states.size(0)
-            weights = discount_weights(T, self.gamma, self.device, torch.float32)
-
-            start = 0
-            while start < T:
-                take = min(self.fisher_batch_size - buffer_size, T - start)
-
-                states_buffer.append(states[start : start + take])
-                actions_buffer.append(actions[start : start + take])
-                weights_buffer.append(weights[start : start + take])
-
-                buffer_size += take
-                start += take
-
-                if buffer_size == self.fisher_batch_size:
-                    flush()
-
-        if buffer_size > 0:
-            flush()
-
-        return sketch.solve(g)
 
     def _fisher_vector_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         v = v.detach()
@@ -317,58 +319,6 @@ class FisherNHD:
 
         return out
 
-    def fisher_solve_conjugate_gradients(self, trajs, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
-        x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
-        r = g.detach().clone()
-        p = r.clone()
-
-        with torch.no_grad():
-            r_dot_r = torch.dot(r, r)
-            g_norm = torch.linalg.vector_norm(g)
-
-        if g_norm == 0:
-            self.cg_iterations = 0
-            self.cg_converged = True
-            self.cg_final_relative_residual = 0.0
-            return x
-
-        self.cg_iterations = 0
-        self.cg_converged = False
-
-        for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
-            Fp = self._fisher_vector_product(trajs, p, verbose=False)
-
-            with torch.no_grad():
-                p_dot_Fp = torch.dot(p, Fp)
-
-                if not torch.isfinite(p_dot_Fp):
-                    raise FloatingPointError(f"CG encountered non-finite p^T (F + lambda * I) p: {p_dot_Fp.item()}.")
-
-                if p_dot_Fp <= 0:
-                    raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
-
-                alpha = r_dot_r / p_dot_Fp
-
-                x.add_(p, alpha=alpha)
-                r.add_(Fp, alpha=-alpha)
-
-                self.cg_iterations += 1
-
-                r_new_dot_r_new = torch.dot(r, r)
-                if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
-                    r_dot_r = r_new_dot_r_new
-                    self.cg_converged = True
-                    break
-
-                beta = r_new_dot_r_new / r_dot_r
-                p.mul_(beta).add_(r)
-                r_dot_r = r_new_dot_r_new
-
-        with torch.no_grad():
-            self.cg_final_relative_residual = (torch.sqrt(r_dot_r) / g_norm).item()
-
-        return x
-
     def explicit_fisher(self, trajs, verbose: bool = True) -> torch.Tensor:
         F = torch.zeros(self.policy_num_params, self.policy_num_params, dtype=torch.float32, device=self.device)
 
@@ -420,8 +370,7 @@ class FisherNHD:
 
     def d_inner_d_cross_vec_product(self, trajs, v: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         """
-        Compute (∂²L_inner / ∂φ∂θ) @ v,
-        equivalently (∇²_{θφ} L_inner)^T @ v,
+        Compute (d_L_inner / d_phi d_theta) @ v
         without forming the mixed-derivative matrix.
         """
 
@@ -456,10 +405,188 @@ class FisherNHD:
         out.neg_()
         return out
 
-    def hypergradient_with_explicit_fisher(self, expert_trajs, agent_trajs) -> torch.Tensor:
+    # EFFICIENT VERSIONS
+
+    def fisher_solve_explicit_fisher(self, agent_trajs, g: torch.Tensor, verbose: bool = True) -> torch.Tensor:
+        fisher = self.explicit_fisher(agent_trajs, verbose)
+        fisher.diagonal().add_(self.fisher_reg)
+        return torch.linalg.solve(fisher, g)
+
+    def fisher_solve_cg(self, agent_trajs, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
+        x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
+        r = g.detach().clone()
+        p = r.clone()
+
+        with torch.no_grad():
+            r_dot_r = torch.dot(r, r)
+            g_norm = torch.linalg.vector_norm(g)
+
+        if g_norm == 0:
+            self.cg_iterations = 0
+            self.cg_converged = True
+            self.cg_final_relative_residual = 0.0
+            return x
+
+        self.cg_iterations = 0
+        self.cg_converged = False
+
+        for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
+            Fp = self._fisher_vector_product(agent_trajs, p, verbose=False)
+
+            with torch.no_grad():
+                p_dot_Fp = torch.dot(p, Fp)
+
+                if not torch.isfinite(p_dot_Fp):
+                    raise FloatingPointError(f"CG encountered non-finite p^T (F + lambda * I) p: {p_dot_Fp.item()}.")
+
+                if p_dot_Fp <= 0:
+                    raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
+
+                alpha = r_dot_r / p_dot_Fp
+
+                x.add_(p, alpha=alpha)
+                r.add_(Fp, alpha=-alpha)
+
+                self.cg_iterations += 1
+
+                r_new_dot_r_new = torch.dot(r, r)
+                if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
+                    r_dot_r = r_new_dot_r_new
+                    self.cg_converged = True
+                    break
+
+                beta = r_new_dot_r_new / r_dot_r
+                p.mul_(beta).add_(r)
+                r_dot_r = r_new_dot_r_new
+
+        with torch.no_grad():
+            self.cg_final_relative_residual = (torch.sqrt(r_dot_r) / g_norm).item()
+
+        return x
+
+    def fisher_solve_sketch(self, agent_trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32)
+
+        states_buffer = []
+        actions_buffer = []
+        weights_buffer = []
+        buffer_size = 0
+
+        def flush():
+            nonlocal buffer_size
+
+            batch_states = torch.cat(states_buffer, dim=0)
+            batch_actions = torch.cat(actions_buffer, dim=0)
+            batch_weights = torch.cat(weights_buffer, dim=0)
+
+            grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
+
+            with torch.no_grad():
+                row_scale = torch.sqrt((self.alpha / len(agent_trajs)) * batch_weights)  # (B,)
+                X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (B, policy_dim)
+
+            sketch.extend(X_rows)
+
+            states_buffer.clear()
+            actions_buffer.clear()
+            weights_buffer.clear()
+            buffer_size = 0
+
+        for traj in tqdm(agent_trajs, desc="Fisher sketch", leave=False, disable=not verbose):
+            states = to_device(traj["states"], self.device)
+            actions = to_device(traj["actions"], self.device)
+            T = states.size(0)
+            weights = discount_weights(T, self.gamma, self.device, torch.float32)
+
+            start = 0
+            while start < T:
+                take = min(self.fisher_batch_size - buffer_size, T - start)
+
+                states_buffer.append(states[start : start + take])
+                actions_buffer.append(actions[start : start + take])
+                weights_buffer.append(weights[start : start + take])
+
+                buffer_size += take
+                start += take
+
+                if buffer_size == self.fisher_batch_size:
+                    flush()
+
+        if buffer_size > 0:
+            flush()
+
+        return sketch.solve(g)
+
+    # PRECALCULATED VERSIONS
+
+    @torch.no_grad()
+    def fisher_solve_explicit_fisher_precalculated(self, D: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        F = D.T @ D
+        F.diagonal().add_(self.fisher_reg)
+        return torch.linalg.solve(F, g)
+
+    @torch.no_grad()
+    def fisher_solve_cg_precalculated(self, D: torch.Tensor, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
+        x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
+        r = g.detach().clone()
+        p = r.clone()
+
+        r_dot_r = torch.dot(r, r)
+        g_norm = torch.linalg.vector_norm(g)
+
+        if g_norm == 0:
+            self.cg_iterations = 0
+            self.cg_converged = True
+            self.cg_final_relative_residual = 0.0
+            return x
+
+        self.cg_iterations = 0
+        self.cg_converged = False
+
+        for _ in tqdm(range(max_iters), desc="Fisher solve CG", leave=False, disable=not verbose):
+            Dp = D @ p
+            Fp = D.T @ Dp + self.fisher_reg * p
+
+            p_dot_Fp = torch.dot(p, Fp)
+
+            if not torch.isfinite(p_dot_Fp):
+                raise FloatingPointError(f"CG encountered non-finite p^T (F + lambda * I) p: {p_dot_Fp.item()}.")
+
+            if p_dot_Fp <= 0:
+                raise FloatingPointError(f"CG expected positive p^T (F + lambda * I) p, got {p_dot_Fp.item():.3e}.")
+
+            alpha = r_dot_r / p_dot_Fp
+
+            x.add_(p, alpha=alpha)
+            r.add_(Fp, alpha=-alpha)
+
+            self.cg_iterations += 1
+
+            r_new_dot_r_new = torch.dot(r, r)
+            if torch.sqrt(r_new_dot_r_new) <= tol * g_norm:
+                r_dot_r = r_new_dot_r_new
+                self.cg_converged = True
+                break
+
+            beta = r_new_dot_r_new / r_dot_r
+            p.mul_(beta).add_(r)
+            r_dot_r = r_new_dot_r_new
+
+        self.cg_final_relative_residual = (torch.sqrt(r_dot_r) / g_norm).item()
+
+        return x
+
+    @torch.no_grad()
+    def fisher_solve_sketch_precalculated(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype)
+        sketch.extend(D)
+        return sketch.solve(g)
+
+    def hypergradient(self, expert_trajs, agent_trajs, precompute_scores: bool):
+        # 1. Outer gradient
         with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
-                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
+                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)
 
         self.outer_grad_time = timer.elapsed
         self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -469,11 +596,35 @@ class FisherNHD:
         self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
         self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                fisher = self.explicit_fisher(agent_trajs)
-                fisher.diagonal().add_(self.fisher_reg) # F + lambda * I
-                fisher_inv_d_outer_d_policy = torch.linalg.solve(fisher, d_outer_d_policy)  # (F + lambda * I).inv @ g
+        # 2. Inverse-Fisher-vector product
+        if precompute_scores:
+            D = self._weighted_score_matrix(agent_trajs)
+
+            try:
+                with RAM(interval=0.001) as ram:
+                    with RecordTime() as timer:
+                        if self.mode == "explicit":
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_precalculated(D, d_outer_d_policy)
+                        elif self.mode == "cg":
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_cg_precalculated(D, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
+                        elif self.mode == "sketch":
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_sketch_precalculated(D, d_outer_d_policy, self.sketch_size)
+                        else:
+                            raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+            finally:
+                del D
+
+        else:
+            with RAM(interval=0.001) as ram:
+                with RecordTime() as timer:
+                    if self.mode == "explicit":
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher(agent_trajs, d_outer_d_policy)
+                    elif self.mode == "cg":
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_cg(agent_trajs, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
+                    elif self.mode == "sketch":
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size)
+                    else:
+                        raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
 
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -482,97 +633,11 @@ class FisherNHD:
         self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
         self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
         self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
-
-        self.cross_product_time = timer.elapsed
-        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.cross_product_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        return hypergrad
-
-    def hypergradient_with_conjugate_gradients(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-
-        self.outer_grad_time = timer.elapsed
-        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.outer_grad_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.outer_grad_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                fisher_inv_d_outer_d_policy = self.fisher_solve_conjugate_gradients(
-                    agent_trajs,
-                    d_outer_d_policy,
-                    self.cg_max_iters,
-                    self.cg_tol,
-                ) # (F + lambda * I).inv @ g
-
-        self.fisher_solve_time = timer.elapsed
-        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.fisher_solve_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I).inv @ g
-
-        self.cross_product_time = timer.elapsed
-        self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.cross_product_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.cross_product_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
         
-        return hypergrad
-
-    def hypergradient_with_sketching(self, expert_trajs, agent_trajs) -> torch.Tensor:
+        # 3. Cross product
         with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
-                d_outer_d_policy = self.d_outer_d_policy(expert_trajs)  # g
-
-        self.outer_grad_time = timer.elapsed
-        self.outer_grad_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.outer_grad_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.outer_grad_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.outer_grad_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.outer_grad_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(
-                    agent_trajs,
-                    d_outer_d_policy,
-                    self.sketch_size,
-                ) # (F + lambda * I)^(-1) @ g
-
-        self.fisher_solve_time = timer.elapsed
-        self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
-        self.fisher_solve_peak_rss_mb = ram.metrics["peak_rss_mb"]
-        self.fisher_solve_end_rss_mb = ram.metrics["end_rss_mb"]
-        self.fisher_solve_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
-        self.fisher_solve_retained_rss_mb = ram.metrics["retained_rss_mb"]
-        self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-
-        with RAM(interval=0.001) as ram:
-            with RecordTime() as timer:
-                hypergrad = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)  # -C @ (F + lambda * I)^(-1) @ g
+                hypergradient = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)
 
         self.cross_product_time = timer.elapsed
         self.cross_product_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -581,20 +646,13 @@ class FisherNHD:
         self.cross_product_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
         self.cross_product_retained_rss_mb = ram.metrics["retained_rss_mb"]
         self.cross_product_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
-    
-        return hypergrad
+
+        return hypergradient
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
         with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
-                if self.mode == "explicit":
-                    hypergradient = self.hypergradient_with_explicit_fisher(expert_trajs, agent_trajs)
-                elif self.mode == "cg":
-                    hypergradient = self.hypergradient_with_conjugate_gradients(expert_trajs, agent_trajs)
-                elif self.mode == "sketch":
-                    hypergradient = self.hypergradient_with_sketching(expert_trajs, agent_trajs)
-                else:
-                    raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+                hypergradient = self.hypergradient(expert_trajs, agent_trajs, self.precompute_scores)
 
         self.hypergradient_time = timer.elapsed
         self.hypergradient_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -631,8 +689,8 @@ class FisherNHD:
             states = to_device(traj["states"], self.device)
             actions = to_device(traj["actions"], self.device)
 
-            log_probs = self.policy.log_prob(states, actions)  # (T,)
-            rewards = self.reward(states, actions).detach()    # (T,)
+            log_probs = self.policy.log_prob(states, actions)
+            rewards = self.reward(states, actions).detach()
 
             T = log_probs.numel()
             weights = discount_weights(T, self.gamma, self.device, log_probs.dtype)
@@ -641,8 +699,6 @@ class FisherNHD:
 
             tail_losses = torch.flip(torch.cumsum(torch.flip(per_step_loss, dims=[0]), dim=0), dims=[0]).detach()
 
-            # Score-function term:
-            # sum_t tail_loss_t * grad log pi_t
             score_term = torch.autograd.grad(
                 outputs=(tail_losses * log_probs).sum(),
                 inputs=list(self.policy.parameters()),
@@ -651,7 +707,6 @@ class FisherNHD:
             )
             score_term = flat_grad(score_term).detach()
 
-            # Explicit derivative of alpha * log pi
             entropy_direct_term = torch.autograd.grad(
                 outputs=self.alpha * (weights * log_probs).sum(),
                 inputs=list(self.policy.parameters()),
