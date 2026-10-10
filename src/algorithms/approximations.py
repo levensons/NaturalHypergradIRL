@@ -9,6 +9,9 @@ class CBSCFD:
         if 2 * m > dim:
             raise ValueError(f"`m` must satisfy 2 * m <= dim, got m={m}, dim={dim}.")
 
+        if reg <= 0:
+            raise ValueError(f"`reg` must be positive, got reg={reg}.")
+
         self.dim = dim
         self.m = m
         self.dtype = dtype
@@ -43,12 +46,15 @@ class CBSCFD:
 
                 delta = S[self.m - 1].square()
                 self.alpha.add_(delta)
-                S = torch.sqrt(torch.clamp(S.square() - delta, min=0.0))
+                S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
 
-                self.Z.copy_(S.reshape(-1, 1) * Vh)
+                Vh.mul_(S.unsqueeze(1))
+                self.Z.copy_(Vh)
                 self.Z[self.m:].zero_()
 
                 self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+
+                del Vh, S
 
                 self.ptr = self.m
 
@@ -74,11 +80,16 @@ class CBSCFD:
         K = B @ B.T - C.T @ P + self.alpha * I_b
         K = 0.5 * (K + K.T)
 
+        del C
+
         if cholesky:
             L = torch.linalg.cholesky(K)
             K_inv = torch.cholesky_solve(I_b, L)
+            del L
         else:
             K_inv = torch.linalg.inv(K)
+
+        del K, I_b
 
         P_K_inv = P @ K_inv
 
