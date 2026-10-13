@@ -1,10 +1,3 @@
-"""
-Fisher IRL trainer.
-
-Environment-specific objects are constructed through `env_builders`.
-The trainer itself is independent of a particular environment.
-"""
-
 import os
 from pathlib import Path
 from types import ModuleType
@@ -20,6 +13,7 @@ from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
 from src.utils.resources import RAM, RecordTime
 from src.utils.seeding import set_random_seed
+from src.utils.torch import num_params
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
 
@@ -101,7 +95,7 @@ def train_fisher(
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
         scheduler_gamma=float(fisher_cfg["scheduler_gamma"]),
-        precompute_scores=bool(fisher_cfg.get("precompute_scores", False)),
+        implementation=str(fisher_cfg.get("implementation", "streaming")),
         mode=str(fisher_cfg["mode"]),
         cg_max_iters=None if fisher_cfg.get("cg_max_iters") is None else int(fisher_cfg["cg_max_iters"]),
         cg_tol=None if fisher_cfg.get("cg_tol") is None else float(fisher_cfg["cg_tol"]),
@@ -268,7 +262,7 @@ def train_fisher(
             "gamma": fisher_cfg["gamma"],
             "fisher_reg": fisher_cfg["fisher_reg"],
             "mode": fisher_cfg["mode"],
-            "precompute_scores": fisher_cfg.get("precompute_scores", False),
+            "implementation": fisher_cfg.get("implementation", "streaming"),
             "cg_tol": "None" if fisher_cfg.get("cg_tol") is None else fisher_cfg["cg_tol"],
             "cg_max_iters": "None" if fisher_cfg.get("cg_max_iters") is None else fisher_cfg["cg_max_iters"],
             "sketch_size": "None" if fisher_cfg.get("sketch_size") is None else fisher_cfg["sketch_size"],
@@ -278,6 +272,8 @@ def train_fisher(
             "scheduler_gamma": fisher_cfg["scheduler_gamma"],
             "random_seed": fisher_cfg["random_seed"],
             "env_seed": fisher_cfg["env_seed"],
+            "policy_num_params": num_params(policy),
+            "reward_num_params": num_params(reward),
 
             "inner/type": agent_type,
             "inner/train_env_seed": inner_cfg["train_env_seed"],

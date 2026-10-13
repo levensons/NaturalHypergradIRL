@@ -10,7 +10,7 @@ reward:
   clamp_magnitude: 10
 
 policy:
-  hidden_dim: 256
+  hidden_dim: 64
   n_hidden_layers: 2
   log_std_min: -20
   log_std_max: 2
@@ -29,7 +29,7 @@ fisher:
 
   fisher_reg: 1e-3
   fisher_batch_size: 1024
-  precompute_scores: True
+  implementation: materialized
 
   mode: sketch
   sketch_size: 128

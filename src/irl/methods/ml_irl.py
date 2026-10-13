@@ -1,10 +1,3 @@
-"""
-ML-IRL trainer.
-
-Environment-specific objects are constructed through `env_builders`.
-The trainer itself is independent of a particular environment.
-"""
-
 import os
 from pathlib import Path
 from types import ModuleType
@@ -20,6 +13,7 @@ from src.utils.checkpoint import save_checkpoint
 from src.utils.data import load_trajectories
 from src.utils.resources import RAM, RecordTime
 from src.utils.seeding import set_random_seed
+from src.utils.torch import num_params
 from src.utils.trajectories import collect_trajectories, mean_trajectory_length, mean_trajectory_return
 
 
@@ -250,6 +244,8 @@ def train_ml_irl(
             "gamma": ml_irl_cfg["gamma"],
             "lr_reward": ml_irl_cfg["lr_reward"],
             "max_grad_norm": ml_irl_cfg["max_grad_norm"],
+            "policy_num_params": num_params(policy),
+            "reward_num_params": num_params(reward),
         }
     )
 

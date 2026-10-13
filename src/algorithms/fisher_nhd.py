@@ -22,7 +22,7 @@ class FisherNHD:
         fisher_reg: float,
         max_grad_norm: float | None = None,
         scheduler_gamma: float = 1.0,
-        precompute_scores: bool = False,
+        implementation: Literal["streaming", "materialized"] = "streaming",
         mode: Literal["explicit", "cg", "sketch"] = "explicit",
         cg_max_iters: int | None = None,
         cg_tol: float | None = None,
@@ -42,11 +42,17 @@ class FisherNHD:
         if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
             raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
 
+        if mode == "sketch" and fisher_reg <= 0:
+            raise ValueError("fisher_reg must be positive when mode='sketch'.")
+
         if fisher_batch_size <= 0:
             raise ValueError(f"fisher_batch_size must be positive, got {fisher_batch_size}.")
 
         if fisher_reg < 0:
             raise ValueError(f"fisher_reg must be non-negative, got {fisher_reg}.")
+
+        if implementation not in {"streaming", "materialized"}:
+            raise ValueError(f"Unknown Fisher implementation: {implementation}. Expected one of {'streaming', 'materialized'}.")
         
         self.reward = reward
         self.policy = policy
@@ -56,7 +62,7 @@ class FisherNHD:
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
         self.mode = mode
-        self.precompute_scores = precompute_scores
+        self.implementation = implementation
         self.cg_max_iters = cg_max_iters
         self.cg_tol = cg_tol
         self.sketch_size = sketch_size
@@ -416,14 +422,14 @@ class FisherNHD:
         out.neg_()
         return out
 
-    # EFFICIENT VERSIONS
+    # STREAMING VERSIONS
 
-    def fisher_solve_explicit_fisher(self, agent_trajs, g: torch.Tensor, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_explicit_fisher_streaming(self, agent_trajs, g: torch.Tensor, verbose: bool = True) -> torch.Tensor:
         fisher = self.explicit_fisher(agent_trajs, verbose)
         fisher.diagonal().add_(self.fisher_reg)
         return torch.linalg.solve(fisher, g)
 
-    def fisher_solve_cg(self, agent_trajs, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_cg_streaming(self, agent_trajs, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
         x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
         r = g.detach().clone()
         p = r.clone()
@@ -475,7 +481,7 @@ class FisherNHD:
 
         return x
 
-    def fisher_solve_sketch(self, agent_trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_sketch_streaming(self, agent_trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
         sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32)
 
         states_buffer = []
@@ -541,16 +547,16 @@ class FisherNHD:
 
         return out
 
-    # PRECALCULATED VERSIONS
+    # MATERIALIZED VERSIONS
 
     @torch.no_grad()
-    def fisher_solve_explicit_fisher_precalculated(self, D: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    def fisher_solve_explicit_fisher_materialized(self, D: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         F = D.T @ D
         F.diagonal().add_(self.fisher_reg)
         return torch.linalg.solve(F, g)
 
     @torch.no_grad()
-    def fisher_solve_cg_precalculated(self, D: torch.Tensor, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
+    def fisher_solve_cg_materialized(self, D: torch.Tensor, g: torch.Tensor, max_iters: int, tol: float, verbose: bool = True) -> torch.Tensor:
         x = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
         r = g.detach().clone()
         p = r.clone()
@@ -601,7 +607,7 @@ class FisherNHD:
         return x
 
     @torch.no_grad()
-    def fisher_solve_sketch_precalculated(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
+    def fisher_solve_sketch_materialized(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
         sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype)
         sketch.extend(D)
         out = sketch.solve(g)
@@ -619,7 +625,7 @@ class FisherNHD:
 
         return out
 
-    def hypergradient(self, expert_trajs, agent_trajs, precompute_scores: bool):
+    def hypergradient(self, expert_trajs, agent_trajs, implementation: Literal["streaming", "materialized"]):
         # 1. Outer gradient
         with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
@@ -634,34 +640,37 @@ class FisherNHD:
         self.outer_grad_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
         # 2. Inverse-Fisher-vector product
-        if precompute_scores:
+        if implementation == "materialized":
             D = self._weighted_score_matrix(agent_trajs)
 
             try:
                 with RAM(interval=0.001) as ram:
                     with RecordTime() as timer:
                         if self.mode == "explicit":
-                            fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_precalculated(D, d_outer_d_policy)
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_materialized(D, d_outer_d_policy)
                         elif self.mode == "cg":
-                            fisher_inv_d_outer_d_policy = self.fisher_solve_cg_precalculated(D, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_cg_materialized(D, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
                         elif self.mode == "sketch":
-                            fisher_inv_d_outer_d_policy = self.fisher_solve_sketch_precalculated(D, d_outer_d_policy, self.sketch_size)
+                            fisher_inv_d_outer_d_policy = self.fisher_solve_sketch_materialized(D, d_outer_d_policy, self.sketch_size)
                         else:
                             raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
             finally:
                 del D
 
-        else:
+        elif implementation == "streaming":
             with RAM(interval=0.001) as ram:
                 with RecordTime() as timer:
                     if self.mode == "explicit":
-                        fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher(agent_trajs, d_outer_d_policy)
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_streaming(agent_trajs, d_outer_d_policy)
                     elif self.mode == "cg":
-                        fisher_inv_d_outer_d_policy = self.fisher_solve_cg(agent_trajs, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_cg_streaming(agent_trajs, d_outer_d_policy, self.cg_max_iters, self.cg_tol)
                     elif self.mode == "sketch":
-                        fisher_inv_d_outer_d_policy = self.fisher_solve_sketch(agent_trajs, d_outer_d_policy, self.sketch_size)
+                        fisher_inv_d_outer_d_policy = self.fisher_solve_sketch_streaming(agent_trajs, d_outer_d_policy, self.sketch_size)
                     else:
                         raise ValueError(f"Unknown Fisher solve mode: {self.mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
+
+        else:
+            raise ValueError(f"Unknown Fisher implementation: {implementation}. Expected one of {'streaming', 'materialized'}.")
 
         self.fisher_solve_time = timer.elapsed
         self.fisher_solve_start_rss_mb = ram.metrics["start_rss_mb"]
@@ -689,7 +698,7 @@ class FisherNHD:
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
         with RAM(interval=0.001) as ram:
             with RecordTime() as timer:
-                hypergradient = self.hypergradient(expert_trajs, agent_trajs, self.precompute_scores)
+                hypergradient = self.hypergradient(expert_trajs, agent_trajs, self.implementation)
 
         self.hypergradient_time = timer.elapsed
         self.hypergradient_start_rss_mb = ram.metrics["start_rss_mb"]
