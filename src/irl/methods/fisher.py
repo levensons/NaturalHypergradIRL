@@ -672,6 +672,35 @@ def train_fisher(
                         step=outer_step,
                     )
 
+                elif outer_optimizer.mode == "sketch":
+                    logger.info(
+                        "Sketch diagnostics | "
+                        f"rows_processed={outer_optimizer.sketch_rows_processed} | "
+                        f"svd_count={outer_optimizer.sketch_svd_count} | "
+                        f"extend_time={outer_optimizer.sketch_extend_time:.3f}s | "
+                        f"svd_time={outer_optimizer.sketch_svd_time:.3f}s | "
+                        f"mean_svd_time={outer_optimizer.sketch_mean_svd_time:.6f}s | "
+                        f"svd_fraction={outer_optimizer.sketch_svd_fraction:.2%} | "
+                        f"other_time={outer_optimizer.sketch_other_time:.3f}s | "
+                        f"solve_time={outer_optimizer.sketch_solve_time:.3f}s | "
+                        f"total_time={outer_optimizer.sketch_total_time:.3f}s"
+                    )
+
+                    mlflow.log_metrics(
+                        {
+                            "sketch/rows_processed": float(outer_optimizer.sketch_rows_processed),
+                            "sketch/svd_count": float(outer_optimizer.sketch_svd_count),
+                            "sketch/extend_time": float(outer_optimizer.sketch_extend_time),
+                            "sketch/svd_time": float(outer_optimizer.sketch_svd_time),
+                            "sketch/mean_svd_time": float(outer_optimizer.sketch_mean_svd_time),
+                            "sketch/svd_fraction": float(outer_optimizer.sketch_svd_fraction),
+                            "sketch/other_time": float(outer_optimizer.sketch_other_time),
+                            "sketch/solve_time": float(outer_optimizer.sketch_solve_time),
+                            "sketch/total_time": float(outer_optimizer.sketch_total_time),
+                        },
+                        step=outer_step,
+                    )
+
     finally:
         ram_metrics = ram_monitor.stop()
 

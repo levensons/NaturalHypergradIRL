@@ -4,7 +4,7 @@
 #SBATCH --constraint="type_d"
 #SBATCH --gpus=0
 #SBATCH --cpus-per-task=8
-#SBATCH --time=1-00:00
+#SBATCH --time=0-48:00
 #SBATCH --mail-user=nvsevriukov@edu.hse.ru
 #SBATCH --mail-type=END,FAIL
 
@@ -33,18 +33,3 @@ python -m src.irl.train \
     --checkpoint "$CHECKPOINT" \
     --run-name "$RUN_PREFIX/irl_training" \
     --log-dir "$LOG_PREFIX/irl_training"
-
-# 2. Final policy training on the learned reward
-python -m src.irl.policy_final_training \
-    --env hopper \
-    --config "$CONFIG" \
-    --checkpoint "$CHECKPOINT" \
-    --run-name "$RUN_PREFIX/final_policy_training" \
-    --log-dir "$LOG_PREFIX/final_policy_training"
-
-# 3. Final evaluation
-python -m src.evaluation.evaluate \
-    --env hopper \
-    --config "$CONFIG" \
-    --checkpoint "$CHECKPOINT" \
-    --report-dir "$REPORT_DIR"

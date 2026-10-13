@@ -10,7 +10,7 @@ reward:
   clamp_magnitude: 10
 
 policy:
-  hidden_dim: 64
+  hidden_dim: 256
   n_hidden_layers: 2
   log_std_min: -20
   log_std_max: 2
@@ -28,7 +28,8 @@ fisher:
   gamma: 0.99
 
   fisher_reg: 1e0
-  fisher_batch_size: 256
+  fisher_batch_size: 1024
+  precompute_scores: True
 
   mode: explicit
 

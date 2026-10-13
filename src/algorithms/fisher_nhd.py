@@ -109,6 +109,17 @@ class FisherNHD:
         self.cg_iterations = 0
         self.cg_final_relative_residual = 0.0
 
+        # Sketch profiling
+        self.sketch_rows_processed = 0
+        self.sketch_svd_count = 0
+        self.sketch_extend_time = 0.0
+        self.sketch_svd_time = 0.0
+        self.sketch_mean_svd_time = 0.0
+        self.sketch_svd_fraction = 0.0
+        self.sketch_other_time = 0.0
+        self.sketch_solve_time = 0.0
+        self.sketch_total_time = 0.0
+
     @property
     def device(self) -> torch.device:
         return next(self.reward.parameters()).device
@@ -515,7 +526,20 @@ class FisherNHD:
         if buffer_size > 0:
             flush()
 
-        return sketch.solve(g)
+        out = sketch.solve(g)
+
+        stats = sketch.profiling
+        self.sketch_rows_processed = stats["rows_processed"]
+        self.sketch_svd_count = stats["svd_count"]
+        self.sketch_extend_time = stats["extend_time"]
+        self.sketch_svd_time = stats["svd_time"]
+        self.sketch_mean_svd_time = stats["mean_svd_time"]
+        self.sketch_svd_fraction = stats["svd_fraction"]
+        self.sketch_other_time = stats["extend_time"] - stats["svd_time"]
+        self.sketch_solve_time = stats["solve_time"]
+        self.sketch_total_time = stats["total_time"]
+
+        return out
 
     # PRECALCULATED VERSIONS
 
@@ -580,7 +604,20 @@ class FisherNHD:
     def fisher_solve_sketch_precalculated(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
         sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype)
         sketch.extend(D)
-        return sketch.solve(g)
+        out = sketch.solve(g)
+
+        stats = sketch.profiling
+        self.sketch_rows_processed = stats["rows_processed"]
+        self.sketch_svd_count = stats["svd_count"]
+        self.sketch_extend_time = stats["extend_time"]
+        self.sketch_svd_time = stats["svd_time"]
+        self.sketch_mean_svd_time = stats["mean_svd_time"]
+        self.sketch_svd_fraction = stats["svd_fraction"]
+        self.sketch_other_time = stats["extend_time"] - stats["svd_time"]
+        self.sketch_solve_time = stats["solve_time"]
+        self.sketch_total_time = stats["total_time"]
+
+        return out
 
     def hypergradient(self, expert_trajs, agent_trajs, precompute_scores: bool):
         # 1. Outer gradient

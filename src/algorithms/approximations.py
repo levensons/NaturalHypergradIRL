@@ -1,3 +1,5 @@
+import time
+
 import torch
 
 
@@ -22,8 +24,16 @@ class CBSCFD:
 
         self.ptr = m
 
+        self.extend_time = 0.0
+        self.svd_time = 0.0
+        self.svd_count = 0
+        self.solve_time = 0.0
+        self.rows_processed = 0
+
     @torch.no_grad()
     def extend(self, rows: torch.Tensor):
+        start_extend = time.perf_counter()
+
         if rows.ndim == 1:
             rows = rows.unsqueeze(0)
         if rows.ndim != 2:
@@ -34,6 +44,8 @@ class CBSCFD:
         # rows: (batch_size, dim)
         rows = rows.to(device=self.Z.device, dtype=self.Z.dtype)
 
+        self.rows_processed += rows.shape[0]
+
         start = 0
         while start < rows.shape[0]:
             take = min(2 * self.m - self.ptr, rows.shape[0] - start)
@@ -42,7 +54,10 @@ class CBSCFD:
             self.ptr += take
 
             if self.ptr == 2 * self.m:
+                start_svd = time.perf_counter()
                 _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                self.svd_time += time.perf_counter() - start_svd
+                self.svd_count += 1
 
                 delta = S[self.m - 1].square()
                 self.alpha.add_(delta)
@@ -59,6 +74,8 @@ class CBSCFD:
                 self.ptr = self.m
 
             start += take
+
+        self.extend_time += time.perf_counter() - start_extend
 
     @torch.no_grad()
     def get_Z(self):
@@ -106,6 +123,8 @@ class CBSCFD:
 
     @torch.no_grad()
     def solve(self, g: torch.Tensor, cholesky: bool = True):
+        start_solve = time.perf_counter()
+
         if g.ndim != 1 or g.shape[0] != self.dim:
             raise ValueError(f"g must have shape [{self.dim}], got {g.shape}.")
 
@@ -115,4 +134,23 @@ class CBSCFD:
         v = Z @ g
         v = H @ v
         v = Z.T @ v
-        return (g - v) / self.alpha
+        out = (g - v) / self.alpha
+
+        self.solve_time += time.perf_counter() - start_solve
+        return out
+
+    @property
+    def profiling(self) -> dict:
+        mean_svd_time = self.svd_time / self.svd_count if self.svd_count > 0 else 0.0
+        svd_fraction = self.svd_time / self.extend_time if self.extend_time > 0 else 0.0
+
+        return {
+            "rows_processed": self.rows_processed,
+            "svd_count": self.svd_count,
+            "extend_time": self.extend_time,
+            "svd_time": self.svd_time,
+            "mean_svd_time": mean_svd_time,
+            "svd_fraction": svd_fraction,
+            "solve_time": self.solve_time,
+            "total_time": self.extend_time + self.solve_time,
+        }
