@@ -117,14 +117,19 @@ class FisherNHD:
 
         # Sketch profiling
         self.sketch_rows_processed = 0
+        self.sketch_iteration_count = 0
+        self.sketch_extend_count = 0
         self.sketch_svd_count = 0
         self.sketch_extend_time = 0.0
         self.sketch_svd_time = 0.0
-        self.sketch_mean_svd_time = 0.0
-        self.sketch_svd_fraction = 0.0
         self.sketch_other_time = 0.0
         self.sketch_solve_time = 0.0
         self.sketch_total_time = 0.0
+        self.sketch_mean_extend_time = 0.0
+        self.sketch_mean_svd_time = 0.0
+        self.sketch_mean_other_time = 0.0
+        self.sketch_mean_other_per_iteration = 0.0
+        self.sketch_svd_fraction = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -141,6 +146,24 @@ class FisherNHD:
     @property
     def policy_num_params(self) -> int:
         return num_params(self.policy)
+
+    def _update_sketch_profiling(self, sketch: CBSCFD) -> None:
+        stats = sketch.profiling
+
+        self.sketch_rows_processed = stats["rows_processed"]
+        self.sketch_iteration_count = stats["iteration_count"]
+        self.sketch_extend_count = stats["extend_count"]
+        self.sketch_svd_count = stats["svd_count"]
+        self.sketch_extend_time = stats["extend_time"]
+        self.sketch_svd_time = stats["svd_time"]
+        self.sketch_other_time = stats["other_time"]
+        self.sketch_solve_time = stats["solve_time"]
+        self.sketch_total_time = stats["total_time"]
+        self.sketch_mean_extend_time = stats["mean_extend_time"]
+        self.sketch_mean_svd_time = stats["mean_svd_time"]
+        self.sketch_mean_other_time = stats["mean_other_time"]
+        self.sketch_mean_other_per_iteration = stats["mean_other_per_iteration"]
+        self.sketch_svd_fraction = stats["svd_fraction"]
 
     def d_outer_d_policy(self, expert_trajs, verbose: bool = True) -> torch.Tensor:
         g = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
@@ -533,18 +556,7 @@ class FisherNHD:
             flush()
 
         out = sketch.solve(g)
-
-        stats = sketch.profiling
-        self.sketch_rows_processed = stats["rows_processed"]
-        self.sketch_svd_count = stats["svd_count"]
-        self.sketch_extend_time = stats["extend_time"]
-        self.sketch_svd_time = stats["svd_time"]
-        self.sketch_mean_svd_time = stats["mean_svd_time"]
-        self.sketch_svd_fraction = stats["svd_fraction"]
-        self.sketch_other_time = stats["extend_time"] - stats["svd_time"]
-        self.sketch_solve_time = stats["solve_time"]
-        self.sketch_total_time = stats["total_time"]
-
+        self._update_sketch_profiling(sketch)
         return out
 
     # MATERIALIZED VERSIONS
@@ -612,17 +624,7 @@ class FisherNHD:
         sketch.extend(D)
         out = sketch.solve(g)
 
-        stats = sketch.profiling
-        self.sketch_rows_processed = stats["rows_processed"]
-        self.sketch_svd_count = stats["svd_count"]
-        self.sketch_extend_time = stats["extend_time"]
-        self.sketch_svd_time = stats["svd_time"]
-        self.sketch_mean_svd_time = stats["mean_svd_time"]
-        self.sketch_svd_fraction = stats["svd_fraction"]
-        self.sketch_other_time = stats["extend_time"] - stats["svd_time"]
-        self.sketch_solve_time = stats["solve_time"]
-        self.sketch_total_time = stats["total_time"]
-
+        self._update_sketch_profiling(sketch)
         return out
 
     def hypergradient(self, expert_trajs, agent_trajs, implementation: Literal["streaming", "materialized"]):

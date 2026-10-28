@@ -4,7 +4,13 @@ import torch
 
 
 class CBSCFD:
-    def __init__(self, dim: int, m: int, reg: float, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        dim: int,
+        m: int,
+        reg: float,
+        dtype: torch.dtype = torch.float32,
+    ):
         if m <= 0:
             raise ValueError(f"`m` must be positive, got m={m}.")
 
@@ -24,7 +30,10 @@ class CBSCFD:
 
         self.ptr = m
 
+        # Metrics
+        self.iteration_count = 0
         self.extend_time = 0.0
+        self.extend_count = 0
         self.svd_time = 0.0
         self.svd_count = 0
         self.solve_time = 0.0
@@ -32,6 +41,19 @@ class CBSCFD:
 
     @torch.no_grad()
     def extend(self, rows: torch.Tensor):
+        previous_threads = torch.get_num_threads()
+
+        try:
+            if previous_threads != 1:
+                torch.set_num_threads(1)
+            return self._extend(rows)
+
+        finally:
+            if torch.get_num_threads() != previous_threads:
+                torch.set_num_threads(previous_threads)
+
+    @torch.no_grad()
+    def _extend(self, rows: torch.Tensor):
         start_extend = time.perf_counter()
 
         if rows.ndim == 1:
@@ -48,6 +70,8 @@ class CBSCFD:
 
         start = 0
         while start < rows.shape[0]:
+            self.iteration_count += 1
+
             take = min(2 * self.m - self.ptr, rows.shape[0] - start)
 
             self.Z[self.ptr : self.ptr + take].copy_(rows[start : start + take])
@@ -76,6 +100,7 @@ class CBSCFD:
             start += take
 
         self.extend_time += time.perf_counter() - start_extend
+        self.extend_count += 1
 
     @torch.no_grad()
     def get_Z(self):
@@ -141,15 +166,28 @@ class CBSCFD:
 
     @property
     def profiling(self) -> dict:
+        other_time = self.extend_time - self.svd_time
+        mean_extend_time = self.extend_time / self.extend_count if self.extend_count > 0 else 0.0
         mean_svd_time = self.svd_time / self.svd_count if self.svd_count > 0 else 0.0
+        mean_other_time = other_time / self.extend_count if self.extend_count > 0 else 0.0
+        mean_other_per_iteration = other_time / self.iteration_count if self.iteration_count > 0 else 0.0
         svd_fraction = self.svd_time / self.extend_time if self.extend_time > 0 else 0.0
 
         return {
             "rows_processed": self.rows_processed,
+            "iteration_count": self.iteration_count,
+            "extend_count": self.extend_count,
             "svd_count": self.svd_count,
+
             "extend_time": self.extend_time,
             "svd_time": self.svd_time,
+            "other_time": other_time,
+
+            "mean_extend_time": mean_extend_time,
             "mean_svd_time": mean_svd_time,
+            "mean_other_time": mean_other_time,
+            "mean_other_per_iteration": mean_other_per_iteration,
+
             "svd_fraction": svd_fraction,
             "solve_time": self.solve_time,
             "total_time": self.extend_time + self.solve_time,

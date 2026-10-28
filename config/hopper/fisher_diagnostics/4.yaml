@@ -19,7 +19,7 @@ fisher:
   random_seed: 42
   env_seed: 42
   
-  n_outer_steps: 10
+  n_outer_steps: 1
   n_inner_steps: 100000
 
   n_agent_trajs: 1000
@@ -28,7 +28,7 @@ fisher:
   gamma: 0.99
 
   fisher_reg: 1e-3
-  fisher_batch_size: 1024
+  fisher_batch_size: 256
   implementation: materialized
 
   mode: sketch

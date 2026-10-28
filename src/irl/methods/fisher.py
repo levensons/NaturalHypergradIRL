@@ -451,7 +451,7 @@ def train_fisher(
     )
 
     try:
-        for outer_step in range(1, n_outer_steps + 1):
+        for outer_step in range(0, n_outer_steps + 1):
             with RAM(interval=0.001) as ram:
                 with RecordTime() as timer:
                     inner_optimize(outer_step)
@@ -672,12 +672,17 @@ def train_fisher(
                     logger.info(
                         "Sketch diagnostics | "
                         f"rows_processed={outer_optimizer.sketch_rows_processed} | "
+                        f"iteration_count={outer_optimizer.sketch_iteration_count} | "
+                        f"extend_count={outer_optimizer.sketch_extend_count} | "
                         f"svd_count={outer_optimizer.sketch_svd_count} | "
                         f"extend_time={outer_optimizer.sketch_extend_time:.3f}s | "
                         f"svd_time={outer_optimizer.sketch_svd_time:.3f}s | "
-                        f"mean_svd_time={outer_optimizer.sketch_mean_svd_time:.6f}s | "
-                        f"svd_fraction={outer_optimizer.sketch_svd_fraction:.2%} | "
                         f"other_time={outer_optimizer.sketch_other_time:.3f}s | "
+                        f"mean_extend_time={outer_optimizer.sketch_mean_extend_time:.6f}s | "
+                        f"mean_svd_time={outer_optimizer.sketch_mean_svd_time:.6f}s | "
+                        f"mean_other_time={outer_optimizer.sketch_mean_other_time:.6f}s | "
+                        f"mean_other_per_iteration={outer_optimizer.sketch_mean_other_per_iteration:.6f}s | "
+                        f"svd_fraction={outer_optimizer.sketch_svd_fraction:.2%} | "
                         f"solve_time={outer_optimizer.sketch_solve_time:.3f}s | "
                         f"total_time={outer_optimizer.sketch_total_time:.3f}s"
                     )
@@ -685,12 +690,17 @@ def train_fisher(
                     mlflow.log_metrics(
                         {
                             "sketch/rows_processed": float(outer_optimizer.sketch_rows_processed),
+                            "sketch/iteration_count": float(outer_optimizer.sketch_iteration_count),
+                            "sketch/extend_count": float(outer_optimizer.sketch_extend_count),
                             "sketch/svd_count": float(outer_optimizer.sketch_svd_count),
                             "sketch/extend_time": float(outer_optimizer.sketch_extend_time),
                             "sketch/svd_time": float(outer_optimizer.sketch_svd_time),
-                            "sketch/mean_svd_time": float(outer_optimizer.sketch_mean_svd_time),
-                            "sketch/svd_fraction": float(outer_optimizer.sketch_svd_fraction),
                             "sketch/other_time": float(outer_optimizer.sketch_other_time),
+                            "sketch/mean_extend_time": float(outer_optimizer.sketch_mean_extend_time),
+                            "sketch/mean_svd_time": float(outer_optimizer.sketch_mean_svd_time),
+                            "sketch/mean_other_time": float(outer_optimizer.sketch_mean_other_time),
+                            "sketch/mean_other_per_iteration": float(outer_optimizer.sketch_mean_other_per_iteration),
+                            "sketch/svd_fraction": float(outer_optimizer.sketch_svd_fraction),
                             "sketch/solve_time": float(outer_optimizer.sketch_solve_time),
                             "sketch/total_time": float(outer_optimizer.sketch_total_time),
                         },
@@ -701,9 +711,12 @@ def train_fisher(
         ram_metrics = ram_monitor.stop()
 
         def summarize(values):
+            if len(values) == 0:
+                return {"mean": 0.0, "std": 0.0, "max": 0.0}
+
             return {
                 "mean": float(np.mean(values)),
-                "std": float(np.std(values, ddof=1)),
+                "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
                 "max": float(np.max(values)),
             }
 

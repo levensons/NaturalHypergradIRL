@@ -20,9 +20,9 @@ ml_irl:
   env_seed: 42
 
   n_outer_steps: 999999999
-  n_inner_steps: 1000
+  n_inner_steps: 5000
 
-  n_agent_trajs: 100
+  n_agent_trajs: 10
 
   alpha: 0.2
   gamma: 0.99

@@ -1,19 +1,3 @@
-"""
-Unified IRL training entrypoint.
-
-Usage:
-    python -m src.irl.train \
-        --env lqr \
-        --method fisher \
-        --config config/lqr/exp1.yaml \
-        --checkpoint checkpoints/lqr/exp1.pt \
-        --run-name exp1 \
-        --log-dir logs/lqr/exp1/irl_training
-
-A timestamped log file is created inside `--log-dir`.
-If `--log-dir` is omitted, logs are written to `logs/`.
-"""
-
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -111,15 +95,10 @@ def main() -> None:
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-
     log_path = log_dir / f"{timestamp}.log"
+    logger = get_logger(f"{args.method}_{env_name}", log_path=log_path)
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = get_logger(
-        f"{args.method}_{env_name}",
-        log_path=log_path,
-    )
 
     env_builders = import_env_builders(args.env)
     trainer = TRAINERS[args.method]

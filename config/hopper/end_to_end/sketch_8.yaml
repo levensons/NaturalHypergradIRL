@@ -29,6 +29,7 @@ fisher:
 
   fisher_reg: 1e-3
   fisher_batch_size: 256
+  implementation: streaming
 
   mode: sketch
   sketch_size: 8

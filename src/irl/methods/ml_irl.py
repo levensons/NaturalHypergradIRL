@@ -382,7 +382,7 @@ def train_ml_irl(
     )
 
     try:
-        for outer_step in range(1, n_outer_steps + 1):
+        for outer_step in range(0, n_outer_steps + 1):
             with RAM(interval=0.001) as ram:
                 with RecordTime() as timer:
                     inner_optimize(outer_step)
@@ -510,9 +510,12 @@ def train_ml_irl(
         ram_metrics = ram_monitor.stop()
 
         def summarize(values):
+            if len(values) == 0:
+                return {"mean": 0.0, "std": 0.0, "max": 0.0}
+
             return {
                 "mean": float(np.mean(values)),
-                "std": float(np.std(values, ddof=1)),
+                "std": float(np.std(values, ddof=1)) if len(values) > 1 else 0.0,
                 "max": float(np.max(values)),
             }
 
