@@ -4,7 +4,7 @@
 #SBATCH --constraint=type_d
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=1
 #SBATCH --gpus=0
 #SBATCH --time=0-48:00
 #SBATCH --mail-user=nvsevriukov@edu.hse.ru
@@ -16,8 +16,8 @@ module purge
 module load Python
 conda activate nhd_env
 
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
 
 export GIT_PYTHON_REFRESH=quiet
 export SAC_RESET_MODE=policy_critics
