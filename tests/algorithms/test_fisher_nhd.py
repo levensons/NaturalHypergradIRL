@@ -181,6 +181,56 @@ def test_cg_materialized_matches_streaming(nhd: FisherNHD, trajectories, gradien
 # SKETCH
 
 
+@pytest.mark.parametrize("variant", ["baseline", "qr_only"])
+@pytest.mark.parametrize("sketch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [1, 3, 8])
+def test_sketch_variant_wiring_and_equivalence(
+    trajectories, sketch_size, batch_size, variant, monkeypatch,
+):
+    from src.algorithms import fisher_nhd
+
+    torch.manual_seed(761)
+    optimizer = FisherNHD(
+        reward=DummyReward(),
+        policy=DummyPolicy(),
+        gamma=0.9,
+        alpha=0.5,
+        lr=1e-2,
+        fisher_reg=0.7,
+        mode="sketch",
+        sketch_size=sketch_size,
+        fisher_batch_size=batch_size,
+        cbscfd_variant=variant,
+    )
+    assert optimizer.cbscfd_variant == variant
+    matrix = optimizer._weighted_score_matrix(trajectories, verbose=False)
+    gradient = torch.randn(optimizer.policy_num_params)
+
+    # Numerically equivalent outputs alone cannot prove the selected variant
+    # reached CBSCFD; record its construction in both Fisher implementations.
+    selected = []
+    original = fisher_nhd.CBSCFD
+
+    def record_variant(*args, **kwargs):
+        selected.append(kwargs.get("variant", "baseline"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fisher_nhd, "CBSCFD", record_variant)
+    streaming = optimizer.fisher_solve_sketch_streaming(
+        trajectories, gradient, sketch_size, verbose=False,
+    )
+    materialized = optimizer.fisher_solve_sketch_materialized(matrix, gradient, sketch_size)
+    assert selected == [variant, variant]
+    assert optimizer.sketch_rows_processed == matrix.shape[0]
+    assert optimizer.sketch_svd_count == matrix.shape[0] // sketch_size
+
+    baseline = original(optimizer.policy_num_params, sketch_size, optimizer.fisher_reg)
+    baseline.extend(matrix)
+    expected = baseline.solve(gradient)
+    torch.testing.assert_close(streaming, expected, rtol=3e-5, atol=3e-6)
+    torch.testing.assert_close(materialized, expected, rtol=3e-5, atol=3e-6)
+
+
 @pytest.mark.parametrize("sketch_size", [1, 2])
 def test_sketch_materialized_matches_streaming(nhd: FisherNHD, trajectories, gradient, score_matrix, sketch_size):
     expected = nhd.fisher_solve_sketch_streaming(trajectories, gradient, sketch_size=sketch_size, verbose=False)
@@ -235,6 +285,19 @@ def test_grad_log_pi_shape_and_finiteness(nhd: FisherNHD, trajectories):
 
 
 # VALIDATION
+
+
+def test_invalid_cbscfd_variant_raises():
+    with pytest.raises(ValueError, match="Unknown CBSCFD variant"):
+        FisherNHD(
+            reward=DummyReward(),
+            policy=DummyPolicy(),
+            gamma=0.9,
+            alpha=0.5,
+            lr=1e-2,
+            fisher_reg=0.7,
+            cbscfd_variant="invalid",
+        )
 
 
 def test_invalid_mode_raises():

@@ -101,6 +101,7 @@ def train_fisher(
         cg_tol=None if fisher_cfg.get("cg_tol") is None else float(fisher_cfg["cg_tol"]),
         sketch_size=None if fisher_cfg.get("sketch_size") is None else int(fisher_cfg["sketch_size"]),
         fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
+        cbscfd_variant=str(fisher_cfg.get("cbscfd_variant", "baseline")),
     )
 
     log_memory_snapshot("after FisherNHD")
@@ -267,6 +268,7 @@ def train_fisher(
             "cg_max_iters": "None" if fisher_cfg.get("cg_max_iters") is None else fisher_cfg["cg_max_iters"],
             "sketch_size": "None" if fisher_cfg.get("sketch_size") is None else fisher_cfg["sketch_size"],
             "fisher_batch_size": fisher_cfg["fisher_batch_size"],
+            "cbscfd_variant": fisher_cfg.get("cbscfd_variant", "baseline"),
             "lr_reward": fisher_cfg["lr_reward"],
             "max_grad_norm": fisher_cfg["max_grad_norm"],
             "scheduler_gamma": fisher_cfg["scheduler_gamma"],
