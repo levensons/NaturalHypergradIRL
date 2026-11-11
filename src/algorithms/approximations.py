@@ -10,7 +10,14 @@ class CBSCFD:
         m: int,
         reg: float,
         dtype: torch.dtype = torch.float32,
+        variant: str = "baseline",
     ):
+        if variant not in {"baseline", "qr_only"}:
+            raise ValueError(f"Unknown CBSCFD variant: {variant}.")
+
+        self.variant = variant
+        self.use_qr = variant == "qr_only"
+
         if m <= 0:
             raise ValueError(f"`m` must be positive, got m={m}.")
 
@@ -78,22 +85,42 @@ class CBSCFD:
             self.ptr += take
 
             if self.ptr == 2 * self.m:
-                start_svd = time.perf_counter()
-                _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
-                self.svd_time += time.perf_counter() - start_svd
-                self.svd_count += 1
+                if self.use_qr:
+                    # A must remain unchanged until U.T @ A is fully computed.
+                    # mode="r" returns an empty Q and R; no Q is materialized.
+                    _, R = torch.linalg.qr(self.Z.T, mode="r")
+                    start_svd = time.perf_counter()
+                    U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
+                    self.svd_time += time.perf_counter() - start_svd
+                    self.svd_count += 1
+                    delta = S[self.m - 1].square()
+                    q = (S[:self.m].square() - delta).clamp(min=0.0)
+                    ratio = torch.zeros_like(q)
+                    positive = S[:self.m] > 0
+                    ratio[positive] = q[positive].sqrt() / S[:self.m][positive]
+                    top = (U[:, :self.m].T @ self.Z) * ratio[:, None]
+                    self.alpha.add_(delta)
+                    self.Z[:self.m].copy_(top)
+                    self.Z[self.m:].zero_()
+                    self.H.copy_(1 / (q + self.alpha))
+                    del R, U, S, q, ratio, positive, top
+                else:
+                    start_svd = time.perf_counter()
+                    _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                    self.svd_time += time.perf_counter() - start_svd
+                    self.svd_count += 1
 
-                delta = S[self.m - 1].square()
-                self.alpha.add_(delta)
-                S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
+                    delta = S[self.m - 1].square()
+                    self.alpha.add_(delta)
+                    S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
 
-                Vh.mul_(S.unsqueeze(1))
-                self.Z.copy_(Vh)
-                self.Z[self.m:].zero_()
+                    Vh.mul_(S.unsqueeze(1))
+                    self.Z.copy_(Vh)
+                    self.Z[self.m:].zero_()
 
-                self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+                    self.H.copy_(1 / (S[:self.m].square() + self.alpha))
 
-                del Vh, S
+                    del Vh, S
 
                 self.ptr = self.m
 

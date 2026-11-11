@@ -28,7 +28,12 @@ class FisherNHD:
         cg_tol: float | None = None,
         sketch_size: int | None = None,
         fisher_batch_size: int = 256,
+        cbscfd_variant: str = "baseline",
     ):
+        if cbscfd_variant not in {"baseline", "qr_only"}:
+            raise ValueError(f"Unknown CBSCFD variant: {cbscfd_variant}.")
+        self.cbscfd_variant = cbscfd_variant
+
         if mode not in {"explicit", "cg", "sketch"}:
             raise ValueError(f"Unknown Fisher solve mode: {mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
 
@@ -505,7 +510,7 @@ class FisherNHD:
         return x
 
     def fisher_solve_sketch_streaming(self, agent_trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
-        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32)
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32, variant=self.cbscfd_variant)
 
         states_buffer = []
         actions_buffer = []
@@ -620,7 +625,7 @@ class FisherNHD:
 
     @torch.no_grad()
     def fisher_solve_sketch_materialized(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
-        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype)
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype, variant=self.cbscfd_variant)
         sketch.extend(D)
         out = sketch.solve(g)
 
