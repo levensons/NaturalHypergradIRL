@@ -16,8 +16,15 @@ parameter. Direct callers can pass `variant="qr_only"` to `CBSCFD`, or
 
 For a buffer `A` of shape `(2*m, dim)`, QR compression factors `A.T` and runs
 SVD on the smaller `R.T` matrix. It preserves the CBSCFD shrinkage and inverse
-solve, up to floating-point roundoff. `svd_time` measures only the smaller SVD;
-QR and sketch reconstruction are included in `extend_time` and `other_time`.
+solve, up to floating-point roundoff. The single `svd_time` timer measures the
+entire QR + small-SVD path for `qr_only`, and full SVD for `baseline`. It starts
+before QR and stops after the small SVD, excluding sketch reconstruction.
+`mean_svd_time` averages that same measurement; `other_time` is
+`extend_time - svd_time` and includes reconstruction.
+
+MLflow records `sketch/timing_schema_version=2` to distinguish these joint
+timings from historical QR runs that measured only the smaller SVD. Historical
+QR timings cannot be converted without a separate QR measurement.
 
 Numerical tests compare the variants' sketch Gram matrices, regularization,
 and inverse solves, and exercise streaming and materialized Fisher paths:

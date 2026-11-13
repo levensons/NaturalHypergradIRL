@@ -88,8 +88,9 @@ class CBSCFD:
                 if self.use_qr:
                     # A must remain unchanged until U.T @ A is fully computed.
                     # mode="r" returns an empty Q and R; no Q is materialized.
-                    _, R = torch.linalg.qr(self.Z.T, mode="r")
+                    # Compare the entire QR + small-SVD path with full SVD.
                     start_svd = time.perf_counter()
+                    _, R = torch.linalg.qr(self.Z.T, mode="r")
                     U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
                     self.svd_time += time.perf_counter() - start_svd
                     self.svd_count += 1
@@ -208,6 +209,7 @@ class CBSCFD:
 
             "extend_time": self.extend_time,
             "svd_time": self.svd_time,
+            "timing_schema_version": 2,
             "other_time": other_time,
 
             "mean_extend_time": mean_extend_time,

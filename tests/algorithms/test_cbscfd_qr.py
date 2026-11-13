@@ -91,6 +91,35 @@ def test_qr_compresses_using_small_svd(monkeypatch):
     assert shapes == [(8, 8)]
 
 
+@pytest.mark.parametrize("variant,expected_time", [("baseline", 6.0), ("qr_only", 10.0)])
+def test_svd_timer_covers_the_complete_factorization(monkeypatch, variant, expected_time):
+    """Fixed kernel costs catch omitting QR or counting its time twice."""
+    clock = [0.0]
+    original_qr, original_svd = torch.linalg.qr, torch.linalg.svd
+
+    def qr(*args, **kwargs):
+        result = original_qr(*args, **kwargs)
+        clock[0] += 2.0
+        return result
+
+    def svd(*args, **kwargs):
+        result = original_svd(*args, **kwargs)
+        clock[0] += 3.0
+        return result
+
+    monkeypatch.setattr(torch.linalg, "qr", qr)
+    monkeypatch.setattr(torch.linalg, "svd", svd)
+    monkeypatch.setattr("src.algorithms.approximations.time.perf_counter", lambda: clock[0])
+    sketch = CBSCFD(17, 4, .7, variant=variant)
+    sketch.extend(torch.eye(17)[:8])  # Two compressions: QR=2 and SVD=3 each.
+    stats = sketch.profiling
+    assert stats["svd_count"] == 2
+    assert stats["svd_time"] == expected_time
+    assert stats["mean_svd_time"] == expected_time / 2
+    assert stats["other_time"] == 0.0
+    assert stats["timing_schema_version"] == 2
+
+
 @pytest.mark.parametrize("variant", ["invalid", "solve_only", "qr_and_solve"])
 def test_unsupported_variant_raises(variant):
     with pytest.raises(ValueError, match="Unknown CBSCFD variant"):

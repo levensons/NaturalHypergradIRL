@@ -697,6 +697,7 @@ def train_fisher(
                             "sketch/svd_count": float(outer_optimizer.sketch_svd_count),
                             "sketch/extend_time": float(outer_optimizer.sketch_extend_time),
                             "sketch/svd_time": float(outer_optimizer.sketch_svd_time),
+                            "sketch/timing_schema_version": 2.0,
                             "sketch/other_time": float(outer_optimizer.sketch_other_time),
                             "sketch/mean_extend_time": float(outer_optimizer.sketch_mean_extend_time),
                             "sketch/mean_svd_time": float(outer_optimizer.sketch_mean_svd_time),
