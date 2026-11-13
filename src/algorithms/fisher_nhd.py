@@ -135,6 +135,10 @@ class FisherNHD:
         self.sketch_mean_other_time = 0.0
         self.sketch_mean_other_per_iteration = 0.0
         self.sketch_svd_fraction = 0.0
+        self.sketch_svd_peak_rss_increase_mb = 0.0
+        self.sketch_qr_peak_rss_increase_mb = 0.0
+        self.sketch_matmul_peak_rss_increase_mb = 0.0
+        self.sketch_update_peak_rss_increase_mb = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -169,6 +173,10 @@ class FisherNHD:
         self.sketch_mean_other_time = stats["mean_other_time"]
         self.sketch_mean_other_per_iteration = stats["mean_other_per_iteration"]
         self.sketch_svd_fraction = stats["svd_fraction"]
+        self.sketch_svd_peak_rss_increase_mb = stats["svd_peak_rss_increase_mb"]
+        self.sketch_qr_peak_rss_increase_mb = stats["qr_peak_rss_increase_mb"]
+        self.sketch_matmul_peak_rss_increase_mb = stats["matmul_peak_rss_increase_mb"]
+        self.sketch_update_peak_rss_increase_mb = stats["sketch_update_peak_rss_increase_mb"]
 
     def d_outer_d_policy(self, expert_trajs, verbose: bool = True) -> torch.Tensor:
         g = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)

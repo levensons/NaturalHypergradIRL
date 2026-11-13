@@ -686,7 +686,11 @@ def train_fisher(
                         f"mean_other_per_iteration={outer_optimizer.sketch_mean_other_per_iteration:.6f}s | "
                         f"svd_fraction={outer_optimizer.sketch_svd_fraction:.2%} | "
                         f"solve_time={outer_optimizer.sketch_solve_time:.3f}s | "
-                        f"total_time={outer_optimizer.sketch_total_time:.3f}s"
+                        f"total_time={outer_optimizer.sketch_total_time:.3f}s | "
+                        f"svd_peak_rss_increase={outer_optimizer.sketch_svd_peak_rss_increase_mb:.2f} MB | "
+                        f"qr_peak_rss_increase={outer_optimizer.sketch_qr_peak_rss_increase_mb:.2f} MB | "
+                        f"matmul_peak_rss_increase={outer_optimizer.sketch_matmul_peak_rss_increase_mb:.2f} MB | "
+                        f"sketch_update_peak_rss_increase={outer_optimizer.sketch_update_peak_rss_increase_mb:.2f} MB"
                     )
 
                     mlflow.log_metrics(
@@ -706,6 +710,10 @@ def train_fisher(
                             "sketch/svd_fraction": float(outer_optimizer.sketch_svd_fraction),
                             "sketch/solve_time": float(outer_optimizer.sketch_solve_time),
                             "sketch/total_time": float(outer_optimizer.sketch_total_time),
+                            "sketch/svd_peak_rss_increase_mb": float(outer_optimizer.sketch_svd_peak_rss_increase_mb),
+                            "sketch/qr_peak_rss_increase_mb": float(outer_optimizer.sketch_qr_peak_rss_increase_mb),
+                            "sketch/matmul_peak_rss_increase_mb": float(outer_optimizer.sketch_matmul_peak_rss_increase_mb),
+                            "sketch/sketch_update_peak_rss_increase_mb": float(outer_optimizer.sketch_update_peak_rss_increase_mb),
                         },
                         step=outer_step,
                     )

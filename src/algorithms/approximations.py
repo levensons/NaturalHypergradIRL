@@ -2,6 +2,8 @@ import time
 
 import torch
 
+from src.utils.resources import RAM
+
 
 class CBSCFD:
     def __init__(
@@ -45,6 +47,10 @@ class CBSCFD:
         self.svd_count = 0
         self.solve_time = 0.0
         self.rows_processed = 0
+        self.svd_peak_rss_increase_mb = 0.0
+        self.qr_peak_rss_increase_mb = 0.0
+        self.matmul_peak_rss_increase_mb = 0.0
+        self.sketch_update_peak_rss_increase_mb = 0.0
 
     @torch.no_grad()
     def extend(self, rows: torch.Tensor):
@@ -90,24 +96,43 @@ class CBSCFD:
                     # mode="r" returns an empty Q and R; no Q is materialized.
                     # Compare the entire QR + small-SVD path with full SVD.
                     start_svd = time.perf_counter()
-                    _, R = torch.linalg.qr(self.Z.T, mode="r")
-                    U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
+
+                    with RAM(interval=1e-5) as ram:
+                        _, R = torch.linalg.qr(self.Z.T, mode="r")
+                    self.qr_peak_rss_increase_mb = max(self.qr_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
+                    with RAM(interval=1e-5) as ram:
+                        U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
+                    self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
                     self.svd_time += time.perf_counter() - start_svd
                     self.svd_count += 1
+
                     delta = S[self.m - 1].square()
                     q = (S[:self.m].square() - delta).clamp(min=0.0)
                     ratio = torch.zeros_like(q)
                     positive = S[:self.m] > 0
                     ratio[positive] = q[positive].sqrt() / S[:self.m][positive]
-                    top = (U[:, :self.m].T @ self.Z) * ratio[:, None]
+
+                    with RAM(interval=1e-5) as ram:
+                        top = (U[:, :self.m].T @ self.Z) * ratio[:, None]
+                    self.matmul_peak_rss_increase_mb = max(self.matmul_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
                     self.alpha.add_(delta)
-                    self.Z[:self.m].copy_(top)
-                    self.Z[self.m:].zero_()
-                    self.H.copy_(1 / (q + self.alpha))
+
+                    with RAM(interval=1e-5) as ram:
+                        self.Z[:self.m].copy_(top)
+                        self.Z[self.m:].zero_()
+                        self.H.copy_(1 / (q + self.alpha))
+                    self.sketch_update_peak_rss_increase_mb = max(self.sketch_update_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
                     del R, U, S, q, ratio, positive, top
+
                 else:
                     start_svd = time.perf_counter()
-                    _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                    with RAM(interval=1e-5) as ram:
+                        _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                    self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
                     self.svd_time += time.perf_counter() - start_svd
                     self.svd_count += 1
 
@@ -115,11 +140,12 @@ class CBSCFD:
                     self.alpha.add_(delta)
                     S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
 
-                    Vh.mul_(S.unsqueeze(1))
-                    self.Z.copy_(Vh)
-                    self.Z[self.m:].zero_()
-
-                    self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+                    with RAM(interval=1e-5) as ram:
+                        Vh.mul_(S.unsqueeze(1))
+                        self.Z.copy_(Vh)
+                        self.Z[self.m:].zero_()
+                        self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+                    self.sketch_update_peak_rss_increase_mb = max(self.sketch_update_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
                     del Vh, S
 
@@ -220,4 +246,9 @@ class CBSCFD:
             "svd_fraction": svd_fraction,
             "solve_time": self.solve_time,
             "total_time": self.extend_time + self.solve_time,
+
+            "svd_peak_rss_increase_mb": self.svd_peak_rss_increase_mb,
+            "qr_peak_rss_increase_mb": self.qr_peak_rss_increase_mb,
+            "matmul_peak_rss_increase_mb": self.matmul_peak_rss_increase_mb,
+            "sketch_update_peak_rss_increase_mb": self.sketch_update_peak_rss_increase_mb,
         }
