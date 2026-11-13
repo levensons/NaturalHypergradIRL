@@ -1,8 +1,34 @@
+import time
+
 import torch
+
+from src.utils.resources import RAM
 
 
 class CBSCFD:
-    def __init__(self, dim: int, m: int, reg: float, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        dim: int,
+        m: int,
+        reg: float,
+        dtype: torch.dtype = torch.float32,
+        variant: str = "baseline",
+    ):
+        if variant not in {"baseline", "qr_only"}:
+            raise ValueError(f"Unknown CBSCFD variant: {variant}.")
+
+        self.variant = variant
+        self.use_qr = variant == "qr_only"
+
+        if m <= 0:
+            raise ValueError(f"`m` must be positive, got m={m}.")
+
+        if 2 * m > dim:
+            raise ValueError(f"`m` must satisfy 2 * m <= dim, got m={m}, dim={dim}.")
+
+        if reg <= 0:
+            raise ValueError(f"`reg` must be positive, got reg={reg}.")
+
         self.dim = dim
         self.m = m
         self.dtype = dtype
@@ -13,8 +39,36 @@ class CBSCFD:
 
         self.ptr = m
 
+        # Metrics
+        self.iteration_count = 0
+        self.extend_time = 0.0
+        self.extend_count = 0
+        self.svd_time = 0.0
+        self.svd_count = 0
+        self.solve_time = 0.0
+        self.rows_processed = 0
+        self.svd_peak_rss_increase_mb = 0.0
+        self.qr_peak_rss_increase_mb = 0.0
+        self.matmul_peak_rss_increase_mb = 0.0
+        self.sketch_update_peak_rss_increase_mb = 0.0
+
     @torch.no_grad()
     def extend(self, rows: torch.Tensor):
+        previous_threads = torch.get_num_threads()
+
+        try:
+            if previous_threads != 1:
+                torch.set_num_threads(1)
+            return self._extend(rows)
+
+        finally:
+            if torch.get_num_threads() != previous_threads:
+                torch.set_num_threads(previous_threads)
+
+    @torch.no_grad()
+    def _extend(self, rows: torch.Tensor):
+        start_extend = time.perf_counter()
+
         if rows.ndim == 1:
             rows = rows.unsqueeze(0)
         if rows.ndim != 2:
@@ -25,28 +79,82 @@ class CBSCFD:
         # rows: (batch_size, dim)
         rows = rows.to(device=self.Z.device, dtype=self.Z.dtype)
 
+        self.rows_processed += rows.shape[0]
+
         start = 0
         while start < rows.shape[0]:
+            self.iteration_count += 1
+
             take = min(2 * self.m - self.ptr, rows.shape[0] - start)
 
             self.Z[self.ptr : self.ptr + take].copy_(rows[start : start + take])
             self.ptr += take
 
             if self.ptr == 2 * self.m:
-                _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                if self.use_qr:
+                    # A must remain unchanged until U.T @ A is fully computed.
+                    # mode="r" returns an empty Q and R; no Q is materialized.
+                    # Compare the entire QR + small-SVD path with full SVD.
+                    start_svd = time.perf_counter()
 
-                delta = S[self.m - 1].square()
-                self.alpha.add_(delta)
-                S = torch.sqrt(torch.clamp(S.square() - delta, min=0.0))
+                    with RAM(interval=1e-5) as ram:
+                        _, R = torch.linalg.qr(self.Z.T, mode="r")
+                    self.qr_peak_rss_increase_mb = max(self.qr_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
-                self.Z.copy_(S.reshape(-1, 1) * Vh)
-                self.Z[self.m:].zero_()
+                    with RAM(interval=1e-5) as ram:
+                        U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
+                    self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
-                self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+                    self.svd_time += time.perf_counter() - start_svd
+                    self.svd_count += 1
+
+                    delta = S[self.m - 1].square()
+                    q = (S[:self.m].square() - delta).clamp(min=0.0)
+                    ratio = torch.zeros_like(q)
+                    positive = S[:self.m] > 0
+                    ratio[positive] = q[positive].sqrt() / S[:self.m][positive]
+
+                    with RAM(interval=1e-5) as ram:
+                        top = (U[:, :self.m].T @ self.Z) * ratio[:, None]
+                    self.matmul_peak_rss_increase_mb = max(self.matmul_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
+                    self.alpha.add_(delta)
+
+                    with RAM(interval=1e-5) as ram:
+                        self.Z[:self.m].copy_(top)
+                        self.Z[self.m:].zero_()
+                        self.H.copy_(1 / (q + self.alpha))
+                    self.sketch_update_peak_rss_increase_mb = max(self.sketch_update_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
+                    del R, U, S, q, ratio, positive, top
+
+                else:
+                    start_svd = time.perf_counter()
+                    with RAM(interval=1e-5) as ram:
+                        _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
+                    self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+                    self.svd_time += time.perf_counter() - start_svd
+                    self.svd_count += 1
+
+                    delta = S[self.m - 1].square()
+                    self.alpha.add_(delta)
+                    S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
+
+                    with RAM(interval=1e-5) as ram:
+                        Vh.mul_(S.unsqueeze(1))
+                        self.Z.copy_(Vh)
+                        self.Z[self.m:].zero_()
+                        self.H.copy_(1 / (S[:self.m].square() + self.alpha))
+                    self.sketch_update_peak_rss_increase_mb = max(self.sketch_update_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
+
+                    del Vh, S
 
                 self.ptr = self.m
 
             start += take
+
+        self.extend_time += time.perf_counter() - start_extend
+        self.extend_count += 1
 
     @torch.no_grad()
     def get_Z(self):
@@ -68,11 +176,16 @@ class CBSCFD:
         K = B @ B.T - C.T @ P + self.alpha * I_b
         K = 0.5 * (K + K.T)
 
+        del C
+
         if cholesky:
             L = torch.linalg.cholesky(K)
             K_inv = torch.cholesky_solve(I_b, L)
+            del L
         else:
             K_inv = torch.linalg.inv(K)
+
+        del K, I_b
 
         P_K_inv = P @ K_inv
 
@@ -89,6 +202,8 @@ class CBSCFD:
 
     @torch.no_grad()
     def solve(self, g: torch.Tensor, cholesky: bool = True):
+        start_solve = time.perf_counter()
+
         if g.ndim != 1 or g.shape[0] != self.dim:
             raise ValueError(f"g must have shape [{self.dim}], got {g.shape}.")
 
@@ -98,4 +213,42 @@ class CBSCFD:
         v = Z @ g
         v = H @ v
         v = Z.T @ v
-        return (g - v) / self.alpha
+        out = (g - v) / self.alpha
+
+        self.solve_time += time.perf_counter() - start_solve
+        return out
+
+    @property
+    def profiling(self) -> dict:
+        other_time = self.extend_time - self.svd_time
+        mean_extend_time = self.extend_time / self.extend_count if self.extend_count > 0 else 0.0
+        mean_svd_time = self.svd_time / self.svd_count if self.svd_count > 0 else 0.0
+        mean_other_time = other_time / self.extend_count if self.extend_count > 0 else 0.0
+        mean_other_per_iteration = other_time / self.iteration_count if self.iteration_count > 0 else 0.0
+        svd_fraction = self.svd_time / self.extend_time if self.extend_time > 0 else 0.0
+
+        return {
+            "rows_processed": self.rows_processed,
+            "iteration_count": self.iteration_count,
+            "extend_count": self.extend_count,
+            "svd_count": self.svd_count,
+
+            "extend_time": self.extend_time,
+            "svd_time": self.svd_time,
+            "timing_schema_version": 2,
+            "other_time": other_time,
+
+            "mean_extend_time": mean_extend_time,
+            "mean_svd_time": mean_svd_time,
+            "mean_other_time": mean_other_time,
+            "mean_other_per_iteration": mean_other_per_iteration,
+
+            "svd_fraction": svd_fraction,
+            "solve_time": self.solve_time,
+            "total_time": self.extend_time + self.solve_time,
+
+            "svd_peak_rss_increase_mb": self.svd_peak_rss_increase_mb,
+            "qr_peak_rss_increase_mb": self.qr_peak_rss_increase_mb,
+            "matmul_peak_rss_increase_mb": self.matmul_peak_rss_increase_mb,
+            "sketch_update_peak_rss_increase_mb": self.sketch_update_peak_rss_increase_mb,
+        }

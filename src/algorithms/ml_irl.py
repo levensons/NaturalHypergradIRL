@@ -1,10 +1,9 @@
-from tqdm import tqdm
-
 import torch
 from torch import nn
 
 from src.utils.torch import flat_grad, assign_flat_gradients, to_device
 from src.utils.trajectories import discount_weights
+from src.utils.resources import RAM, RecordTime
 
 
 class MLIRL:
@@ -28,6 +27,14 @@ class MLIRL:
         self.loss_value = 0.0
         self.expert_learned_return = 0.0
         self.agent_learned_return = 0.0
+
+        self.gradient_time = 0.0
+        self.gradient_start_rss_mb = 0.0
+        self.gradient_peak_rss_mb = 0.0
+        self.gradient_end_rss_mb = 0.0
+        self.gradient_peak_rss_increase_mb = 0.0
+        self.gradient_retained_rss_mb = 0.0
+        self.gradient_released_from_peak_mb = 0.0
 
     @property
     def device(self) -> torch.device:
@@ -72,7 +79,17 @@ class MLIRL:
         return gradient
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        gradient = self.gradient(expert_trajs, agent_trajs)
+        with RAM(interval=0.001) as ram:
+            with RecordTime() as timer:
+                gradient = self.gradient(expert_trajs, agent_trajs)
+
+        self.gradient_time = timer.elapsed
+        self.gradient_start_rss_mb = ram.metrics["start_rss_mb"]
+        self.gradient_peak_rss_mb = ram.metrics["peak_rss_mb"]
+        self.gradient_end_rss_mb = ram.metrics["end_rss_mb"]
+        self.gradient_peak_rss_increase_mb = ram.metrics["peak_rss_increase_mb"]
+        self.gradient_retained_rss_mb = ram.metrics["retained_rss_mb"]
+        self.gradient_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
 
         if not torch.isfinite(gradient).all():
             raise FloatingPointError("ML-IRL gradient contains NaN or Inf.")
@@ -85,7 +102,7 @@ class MLIRL:
 
         self.clipped_grad_norm = float(gradient.norm().item())
 
-        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad()
         assign_flat_gradients(self.reward, gradient)
         self.optimizer.step()
 

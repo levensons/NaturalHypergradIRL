@@ -1,24 +1,6 @@
-"""
-Unified IRL training entrypoint.
-
-Usage:
-    python -m src.irl.train \
-        --env lqr \
-        --method fisher \
-        --config config/lqr/exp1.yaml \
-        --checkpoint checkpoints/lqr/exp1.pt \
-        --run-name exp1 \
-        --log-dir logs/lqr/exp1/irl_training \
-        --n-jobs 8
-
-A timestamped log file is created inside `--log-dir`.
-If `--log-dir` is omitted, logs are written to `logs/`.
-"""
-
 import argparse
 from pathlib import Path
 from datetime import datetime
-import os
 
 import mlflow
 
@@ -79,28 +61,11 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Log outer-loop metrics every N steps.",
     )
-    parser.add_argument(
-        "--n-jobs",
-        type=int,
-        default=1,
-        help="Number of parallel environments used for trajectory collection.",
-    )
 
     args = parser.parse_args()
 
     if args.log_every <= 0:
         parser.error("--log-every must be positive.")
-
-    if args.n_jobs == -1:
-        slurm_cpus = os.getenv("SLURM_CPUS_PER_TASK")
-
-        if slurm_cpus is not None:
-            args.n_jobs = int(slurm_cpus)
-        else:
-            args.n_jobs = os.cpu_count() or 1
-
-    elif args.n_jobs <= 0:
-        parser.error("--n-jobs must be positive or -1.")
 
     return args
 
@@ -130,15 +95,10 @@ def main() -> None:
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-
     log_path = log_dir / f"{timestamp}.log"
+    logger = get_logger(f"{args.method}_{env_name}", log_path=log_path)
 
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-
-    logger = get_logger(
-        f"{args.method}_{env_name}",
-        log_path=log_path,
-    )
 
     env_builders = import_env_builders(args.env)
     trainer = TRAINERS[args.method]
@@ -151,7 +111,6 @@ def main() -> None:
     logger.info(f"Checkpoint: {checkpoint_path}")
     logger.info(f"Log path: {log_path}")
     logger.info(f"Log every: {args.log_every}")
-    logger.info(f"N jobs: {args.n_jobs}")
 
     mlflow.set_experiment(args.env)
 
@@ -169,7 +128,6 @@ def main() -> None:
                 "config": str(config_path),
                 "checkpoint": str(checkpoint_path),
                 "log_every": args.log_every,
-                "n_jobs": args.n_jobs,
             }
         )
 
