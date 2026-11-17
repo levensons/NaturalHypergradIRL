@@ -254,7 +254,7 @@ def train_ml_irl(
 
     log_memory_snapshot("before training")
 
-    ram_monitor = RAM(interval=0.001)
+    ram_monitor = RAM()
     ram_monitor.start()
 
     total_optimization_time = 0.0
@@ -383,7 +383,7 @@ def train_ml_irl(
 
     try:
         for outer_step in range(0, n_outer_steps + 1):
-            with RAM(interval=0.001) as ram:
+            with RAM() as ram:
                 with RecordTime() as timer:
                     inner_optimize(outer_step)
 
@@ -418,7 +418,7 @@ def train_ml_irl(
                 step=outer_step,
             )
 
-            with RAM(interval=0.001) as ram:
+            with RAM() as ram:
                 with RecordTime() as timer:
                     agent_train_trajs = collect_trajectories(
                         env=env,

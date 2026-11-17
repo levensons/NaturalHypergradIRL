@@ -97,11 +97,11 @@ class CBSCFD:
                     # Compare the entire QR + small-SVD path with full SVD.
                     start_svd = time.perf_counter()
 
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         _, R = torch.linalg.qr(self.Z.T, mode="r")
                     self.qr_peak_rss_increase_mb = max(self.qr_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         U, S, _ = torch.linalg.svd(R.T, full_matrices=False)
                     self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
@@ -114,13 +114,13 @@ class CBSCFD:
                     positive = S[:self.m] > 0
                     ratio[positive] = q[positive].sqrt() / S[:self.m][positive]
 
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         top = (U[:, :self.m].T @ self.Z) * ratio[:, None]
                     self.matmul_peak_rss_increase_mb = max(self.matmul_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
                     self.alpha.add_(delta)
 
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         self.Z[:self.m].copy_(top)
                         self.Z[self.m:].zero_()
                         self.H.copy_(1 / (q + self.alpha))
@@ -130,7 +130,7 @@ class CBSCFD:
 
                 else:
                     start_svd = time.perf_counter()
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
                     self.svd_peak_rss_increase_mb = max(self.svd_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
                     self.svd_time += time.perf_counter() - start_svd
@@ -140,7 +140,7 @@ class CBSCFD:
                     self.alpha.add_(delta)
                     S.square_().sub_(delta).clamp_(min=0.0).sqrt_()
 
-                    with RAM(interval=1e-5) as ram:
+                    with RAM() as ram:
                         Vh.mul_(S.unsqueeze(1))
                         self.Z.copy_(Vh)
                         self.Z[self.m:].zero_()

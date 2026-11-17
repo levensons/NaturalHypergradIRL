@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --gpus=0
-#SBATCH --time=0-72:00
+#SBATCH --time=4-00:00
 #SBATCH --mail-user=nvsevriukov@edu.hse.ru
 #SBATCH --mail-type=END,FAIL
 
@@ -45,4 +45,27 @@ for SIZE in 1 2 4 8 16 32 64 128 256 512; do
             --log-dir "$LOG_PREFIX/irl_training"
 
     done
+done
+
+for METHOD in explicit cg; do
+
+    NAME="$METHOD"
+
+    CONFIG="config/hopper/svd_vs_qr/${NAME}.yaml"
+    CHECKPOINT="checkpoints/hopper/svd_vs_qr/${NAME}.pt"
+    RUN_PREFIX="svd_vs_qr/${NAME}"
+    LOG_PREFIX="logs/hopper/svd_vs_qr/${NAME}"
+
+    echo "=================================="
+    echo "Starting configuration: $NAME"
+    echo "=================================="
+
+    python -m src.irl.train \
+        --env hopper \
+        --method fisher \
+        --config "$CONFIG" \
+        --checkpoint "$CHECKPOINT" \
+        --run-name "$RUN_PREFIX/irl_training" \
+        --log-dir "$LOG_PREFIX/irl_training"
+
 done

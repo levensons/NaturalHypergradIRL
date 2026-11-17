@@ -642,7 +642,7 @@ class FisherNHD:
 
     def hypergradient(self, expert_trajs, agent_trajs, implementation: Literal["streaming", "materialized"]):
         # 1. Outer gradient
-        with RAM(interval=0.001) as ram:
+        with RAM() as ram:
             with RecordTime() as timer:
                 d_outer_d_policy = self.d_outer_d_policy(expert_trajs)
 
@@ -659,7 +659,7 @@ class FisherNHD:
             D = self._weighted_score_matrix(agent_trajs)
 
             try:
-                with RAM(interval=0.001) as ram:
+                with RAM() as ram:
                     with RecordTime() as timer:
                         if self.mode == "explicit":
                             fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_materialized(D, d_outer_d_policy)
@@ -673,7 +673,7 @@ class FisherNHD:
                 del D
 
         elif implementation == "streaming":
-            with RAM(interval=0.001) as ram:
+            with RAM() as ram:
                 with RecordTime() as timer:
                     if self.mode == "explicit":
                         fisher_inv_d_outer_d_policy = self.fisher_solve_explicit_fisher_streaming(agent_trajs, d_outer_d_policy)
@@ -696,7 +696,7 @@ class FisherNHD:
         self.fisher_solve_released_from_peak_mb = ram.metrics["released_from_peak_mb"]
         
         # 3. Cross product
-        with RAM(interval=0.001) as ram:
+        with RAM() as ram:
             with RecordTime() as timer:
                 hypergradient = -self.d_inner_d_cross_vec_product(agent_trajs, fisher_inv_d_outer_d_policy)
 
@@ -711,7 +711,7 @@ class FisherNHD:
         return hypergradient
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with RAM(interval=0.001) as ram:
+        with RAM() as ram:
             with RecordTime() as timer:
                 hypergradient = self.hypergradient(expert_trajs, agent_trajs, self.implementation)
 

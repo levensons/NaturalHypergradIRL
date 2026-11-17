@@ -79,7 +79,7 @@ class MLIRL:
         return gradient
 
     def step(self, expert_trajs, agent_trajs) -> torch.Tensor:
-        with RAM(interval=0.001) as ram:
+        with RAM() as ram:
             with RecordTime() as timer:
                 gradient = self.gradient(expert_trajs, agent_trajs)
 

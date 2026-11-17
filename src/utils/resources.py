@@ -7,7 +7,7 @@ import psutil
 class RAM:
     MB = 1024**2
 
-    def __init__(self, interval: float = 0.001):
+    def __init__(self, interval: float = 1e-6):
         if interval <= 0:
             raise ValueError(f"`interval` must be positive, got {interval}.")
 
