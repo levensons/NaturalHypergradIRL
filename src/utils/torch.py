@@ -1,4 +1,6 @@
-from typing import Any, Tuple, Iterable
+from pathlib import Path
+from typing import Any, Tuple
+
 import torch
 from torch import nn
 
@@ -76,3 +78,21 @@ def to_device(obj: Any, device: torch.device | str) -> Any:
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
+
+
+def load_tensor(path: Path | str, name: str | None = None) -> torch.Tensor:
+    path = Path(path)
+    label = name or path.name
+
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+    tensor = torch.load(path, map_location="cpu", weights_only=True)
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{label} must be a torch.Tensor, got {type(tensor)}.")
+
+    if not tensor.is_floating_point():
+        raise TypeError(f"{label} must have floating-point dtype, got {tensor.dtype}.")
+
+    return tensor.contiguous()
