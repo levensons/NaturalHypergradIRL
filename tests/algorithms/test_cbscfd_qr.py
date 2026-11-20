@@ -30,8 +30,8 @@ def test_qr_preserves_states_and_inverse_solve(dtype, m, dim, pattern, batching)
     rows.requires_grad_()
 
     batch_size = {"rows": 1, "cross_boundary": m + 1, "all": n}[batching]
-    baseline = CBSCFD(dim, m, 0.7, dtype=dtype)
-    qr = CBSCFD(dim, m, 0.7, dtype=dtype, variant="qr_only")
+    baseline = CBSCFD(dim, m, 0.7, dtype=dtype, decomposition="svd")
+    qr = CBSCFD(dim, m, 0.7, dtype=dtype, decomposition="qr_svd")
     tolerance = 3e-5 if dtype == torch.float32 else 3e-12
 
     # Check the initial sketch, then partial buffers and repeated compressions.
@@ -86,13 +86,13 @@ def test_qr_compresses_using_small_svd(monkeypatch):
         return original(matrix, **kwargs)
 
     monkeypatch.setattr(torch.linalg, "svd", record_shape)
-    sketch = CBSCFD(17, 4, 0.7, variant="qr_only")
+    sketch = CBSCFD(17, 4, 0.7, decomposition="qr_svd")
     sketch.extend(torch.eye(17)[:4])
     assert shapes == [(8, 8)]
 
 
-@pytest.mark.parametrize("variant,expected_time", [("baseline", 6.0), ("qr_only", 10.0)])
-def test_svd_timer_covers_the_complete_factorization(monkeypatch, variant, expected_time):
+@pytest.mark.parametrize("decomposition,expected_time", [("svd", 6.0), ("qr_svd", 10.0)])
+def test_svd_timer_covers_the_complete_factorization(monkeypatch, decomposition, expected_time):
     """Fixed kernel costs catch omitting QR or counting its time twice."""
     clock = [0.0]
     original_qr, original_svd = torch.linalg.qr, torch.linalg.svd
@@ -110,7 +110,7 @@ def test_svd_timer_covers_the_complete_factorization(monkeypatch, variant, expec
     monkeypatch.setattr(torch.linalg, "qr", qr)
     monkeypatch.setattr(torch.linalg, "svd", svd)
     monkeypatch.setattr("src.algorithms.approximations.time.perf_counter", lambda: clock[0])
-    sketch = CBSCFD(17, 4, .7, variant=variant)
+    sketch = CBSCFD(17, 4, .7, decomposition=decomposition)
     sketch.extend(torch.eye(17)[:8])  # Two compressions: QR=2 and SVD=3 each.
     stats = sketch.profiling
     assert stats["svd_count"] == 2
@@ -120,7 +120,7 @@ def test_svd_timer_covers_the_complete_factorization(monkeypatch, variant, expec
     assert stats["timing_schema_version"] == 2
 
 
-@pytest.mark.parametrize("variant", ["invalid", "solve_only", "qr_and_solve"])
-def test_unsupported_variant_raises(variant):
-    with pytest.raises(ValueError, match="Unknown CBSCFD variant"):
-        CBSCFD(8, 2, 0.7, variant=variant)
+@pytest.mark.parametrize("decomposition", ["invalid", "solve_only", "qr_and_solve"])
+def test_unsupported_decomposition_raises(decomposition):
+    with pytest.raises(ValueError, match="Unknown CBSCFD decomposition"):
+        CBSCFD(8, 2, 0.7, decomposition=decomposition)

@@ -34,6 +34,7 @@ def nhd():
         policy=DummyPolicy(),
         gamma=0.9,
         alpha=0.5,
+        beta=0.0,
         lr=1e-2,
         fisher_reg=1e-2,
         fisher_batch_size=3,
@@ -181,11 +182,11 @@ def test_cg_materialized_matches_streaming(nhd: FisherNHD, trajectories, gradien
 # SKETCH
 
 
-@pytest.mark.parametrize("variant", ["baseline", "qr_only"])
+@pytest.mark.parametrize("decomposition", ["svd", "qr_svd"])
 @pytest.mark.parametrize("sketch_size", [1, 2])
 @pytest.mark.parametrize("batch_size", [1, 3, 8])
-def test_sketch_variant_wiring_and_equivalence(
-    trajectories, sketch_size, batch_size, variant, monkeypatch,
+def test_sketch_decomposition_wiring_and_equivalence(
+    trajectories, sketch_size, batch_size, decomposition, monkeypatch,
 ):
     from src.algorithms import fisher_nhd
 
@@ -195,32 +196,33 @@ def test_sketch_variant_wiring_and_equivalence(
         policy=DummyPolicy(),
         gamma=0.9,
         alpha=0.5,
+        beta=0.0,
         lr=1e-2,
         fisher_reg=0.7,
         mode="sketch",
         sketch_size=sketch_size,
         fisher_batch_size=batch_size,
-        cbscfd_variant=variant,
+        sketch_decomposition=decomposition,
     )
-    assert optimizer.cbscfd_variant == variant
+    assert optimizer.sketch_decomposition == decomposition
     matrix = optimizer._weighted_score_matrix(trajectories, verbose=False)
     gradient = torch.randn(optimizer.policy_num_params)
 
-    # Numerically equivalent outputs alone cannot prove the selected variant
+    # Numerically equivalent outputs alone cannot prove the selected decomposition
     # reached CBSCFD; record its construction in both Fisher implementations.
     selected = []
     original = fisher_nhd.CBSCFD
 
-    def record_variant(*args, **kwargs):
-        selected.append(kwargs.get("variant", "baseline"))
+    def record_decomposition(*args, **kwargs):
+        selected.append(kwargs.get("decomposition", "svd"))
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fisher_nhd, "CBSCFD", record_variant)
+    monkeypatch.setattr(fisher_nhd, "CBSCFD", record_decomposition)
     streaming = optimizer.fisher_solve_sketch_streaming(
         trajectories, gradient, sketch_size, verbose=False,
     )
     materialized = optimizer.fisher_solve_sketch_materialized(matrix, gradient, sketch_size)
-    assert selected == [variant, variant]
+    assert selected == [decomposition, decomposition]
     assert optimizer.sketch_rows_processed == matrix.shape[0]
     assert optimizer.sketch_svd_count == matrix.shape[0] // sketch_size
 
@@ -287,16 +289,19 @@ def test_grad_log_pi_shape_and_finiteness(nhd: FisherNHD, trajectories):
 # VALIDATION
 
 
-def test_invalid_cbscfd_variant_raises():
-    with pytest.raises(ValueError, match="Unknown CBSCFD variant"):
+def test_invalid_sketch_decomposition_raises():
+    with pytest.raises(ValueError, match="Unknown CBSCFD decomposition"):
         FisherNHD(
             reward=DummyReward(),
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=0.7,
-            cbscfd_variant="invalid",
+            mode="sketch",
+            sketch_size=1,
+            sketch_decomposition="invalid",
         )
 
 
@@ -307,6 +312,7 @@ def test_invalid_mode_raises():
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=1e-2,
             mode="invalid",
@@ -320,6 +326,7 @@ def test_invalid_implementation_raises():
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=1e-2,
             implementation="invalid",
@@ -334,6 +341,7 @@ def test_sketch_mode_requires_positive_sketch_size(sketch_size):
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=1e-2,
             mode="sketch",
@@ -349,6 +357,7 @@ def test_cg_mode_requires_valid_parameters(cg_max_iters, cg_tol):
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=1e-2,
             mode="cg",
@@ -365,6 +374,7 @@ def test_invalid_fisher_batch_size_raises(fisher_batch_size):
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=1e-2,
             fisher_batch_size=fisher_batch_size,
@@ -378,6 +388,56 @@ def test_negative_fisher_regularization_raises():
             policy=DummyPolicy(),
             gamma=0.9,
             alpha=0.5,
+            beta=0.0,
             lr=1e-2,
             fisher_reg=-1e-2,
         )
+
+
+@pytest.mark.parametrize("beta", [0.2, 1.0])
+def test_beta_scales_fisher_consistently(nhd: FisherNHD, trajectories, gradient, beta):
+    D_zero = nhd._weighted_score_matrix(trajectories, verbose=False)
+    F_zero = nhd.explicit_fisher(trajectories, verbose=False)
+
+    nhd.beta = beta
+    scale = (nhd.alpha + beta) / nhd.alpha
+
+    D = nhd._weighted_score_matrix(trajectories, verbose=False)
+    F = nhd.explicit_fisher(trajectories, verbose=False)
+    Fv = nhd._fisher_vector_product(trajectories, gradient, verbose=False)
+
+    torch.testing.assert_close(D, scale**0.5 * D_zero)
+    torch.testing.assert_close(F, scale * F_zero)
+    torch.testing.assert_close(D.T @ D, F)
+    torch.testing.assert_close(Fv, F @ gradient + nhd.fisher_reg * gradient)
+
+
+def test_negative_beta_raises():
+    with pytest.raises(ValueError, match="beta must be non-negative"):
+        FisherNHD(
+            reward=DummyReward(),
+            policy=DummyPolicy(),
+            gamma=0.9,
+            alpha=0.5,
+            beta=-0.1,
+            lr=1e-2,
+            fisher_reg=1e-2,
+        )
+
+
+@pytest.mark.parametrize("mode", ["explicit", "cg"])
+def test_non_sketch_mode_accepts_none_decomposition(mode):
+    optimizer = FisherNHD(
+        reward=DummyReward(),
+        policy=DummyPolicy(),
+        gamma=0.9,
+        alpha=0.5,
+        beta=0.0,
+        lr=1e-2,
+        fisher_reg=1e-2,
+        mode=mode,
+        cg_max_iters=100 if mode == "cg" else None,
+        cg_tol=1e-6 if mode == "cg" else None,
+        sketch_decomposition=None,
+    )
+    assert optimizer.sketch_decomposition is None
