@@ -1,4 +1,5 @@
 import time
+from typing import Literal
 
 import torch
 
@@ -12,13 +13,10 @@ class CBSCFD:
         m: int,
         reg: float,
         dtype: torch.dtype = torch.float32,
-        variant: str = "baseline",
+        decomposition: Literal["svd", "qr_svd"] = "svd",
     ):
-        if variant not in {"baseline", "qr_only"}:
-            raise ValueError(f"Unknown CBSCFD variant: {variant}.")
-
-        self.variant = variant
-        self.use_qr = variant == "qr_only"
+        if decomposition not in {"svd", "qr_svd"}:
+            raise ValueError(f"Unknown CBSCFD decomposition: {decomposition}.")
 
         if m <= 0:
             raise ValueError(f"`m` must be positive, got m={m}.")
@@ -32,6 +30,7 @@ class CBSCFD:
         self.dim = dim
         self.m = m
         self.dtype = dtype
+        self.decomposition = decomposition
 
         self.alpha = torch.tensor(reg, dtype=self.dtype)
         self.Z = torch.zeros(2 * m, dim, dtype=self.dtype)
@@ -91,7 +90,7 @@ class CBSCFD:
             self.ptr += take
 
             if self.ptr == 2 * self.m:
-                if self.use_qr:
+                if self.decomposition == "qr_svd":
                     # A must remain unchanged until U.T @ A is fully computed.
                     # mode="r" returns an empty Q and R; no Q is materialized.
                     # Compare the entire QR + small-SVD path with full SVD.
@@ -128,7 +127,7 @@ class CBSCFD:
 
                     del R, U, S, q, ratio, positive, top
 
-                else:
+                elif self.decomposition == "svd":
                     start_svd = time.perf_counter()
                     with RAM() as ram:
                         _, S, Vh = torch.linalg.svd(self.Z, full_matrices=False)
@@ -148,6 +147,9 @@ class CBSCFD:
                     self.sketch_update_peak_rss_increase_mb = max(self.sketch_update_peak_rss_increase_mb, ram.metrics["peak_rss_increase_mb"])
 
                     del Vh, S
+
+                else:
+                    raise ValueError(f"Unknown CBSCFD decomposition: {self.decomposition}.")
 
                 self.ptr = self.m
 

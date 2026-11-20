@@ -1,3 +1,4 @@
+import copy
 import os
 from pathlib import Path
 from types import ModuleType
@@ -91,6 +92,7 @@ def train_fisher(
         policy=policy,
         gamma=float(fisher_cfg["gamma"]),
         alpha=float(fisher_cfg["alpha"]),
+        beta=float(fisher_cfg["beta"]),
         lr=float(fisher_cfg["lr_reward"]),
         fisher_reg=float(fisher_cfg["fisher_reg"]),
         max_grad_norm=fisher_cfg["max_grad_norm"],
@@ -100,8 +102,8 @@ def train_fisher(
         cg_max_iters=None if fisher_cfg.get("cg_max_iters") is None else int(fisher_cfg["cg_max_iters"]),
         cg_tol=None if fisher_cfg.get("cg_tol") is None else float(fisher_cfg["cg_tol"]),
         sketch_size=None if fisher_cfg.get("sketch_size") is None else int(fisher_cfg["sketch_size"]),
+        sketch_decomposition=None if fisher_cfg.get("sketch_decomposition") is None else str(fisher_cfg.get("sketch_decomposition")),
         fisher_batch_size=int(fisher_cfg["fisher_batch_size"]),
-        cbscfd_variant=str(fisher_cfg.get("cbscfd_variant", "baseline")),
     )
 
     log_memory_snapshot("after FisherNHD")
@@ -112,6 +114,7 @@ def train_fisher(
         agent_cfg=inner_cfg,
         gamma=float(fisher_cfg["gamma"]),
         alpha=float(fisher_cfg["alpha"]),
+        beta=float(fisher_cfg["beta"]),
     )
 
     log_memory_snapshot("after agent")
@@ -125,8 +128,14 @@ def train_fisher(
     n_inner_steps = int(fisher_cfg["n_inner_steps"])
     n_agent_trajs = int(fisher_cfg["n_agent_trajs"])
 
+    policy_old: torch.nn.Module = None
+
     def inner_optimize(outer_step: int) -> None:
         agent.policy.train()
+
+        current_beta = float(fisher_cfg["beta"]) if policy_old is not None else 0.0
+        outer_optimizer.beta = current_beta
+        agent.beta = current_beta
 
         current_reward_fn = reward.as_fn()
         train_env.custom_reward_fn = current_reward_fn
@@ -188,10 +197,10 @@ def train_fisher(
                 verbose=False,
             )
 
-            l_inner = inner_loss(agent.policy, reward, agent_valid_trajs, agent.gamma, agent.alpha)
+            l_inner_value = inner_loss(agent.policy, reward, agent_valid_trajs, agent.gamma, agent.alpha, agent.beta, policy_old)
             l_outer_value = outer_loss(agent.policy, expert_valid_trajs, agent.gamma)
 
-            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, verbose=False)
+            l_inner_grad = outer_optimizer.d_inner_d_policy(agent_valid_trajs, policy_old, verbose=False)
             grad_norm = l_inner_grad.norm()
             grad_rms = grad_norm / (l_inner_grad.numel() ** 0.5)
             grad_abs_max = l_inner_grad.abs().max()
@@ -200,7 +209,7 @@ def train_fisher(
 
             mlflow.log_metrics(
                 {
-                    f"{agent_type}_{outer_step}/l_inner": float(l_inner),
+                    f"{agent_type}_{outer_step}/l_inner": float(l_inner_value),
                     f"{agent_type}_{outer_step}/l_outer": float(l_outer_value),
                     f"{agent_type}_{outer_step}/env_return": float(mean_trajectory_return(agent_valid_trajs)),
                     f"{agent_type}_{outer_step}/length": float(mean_trajectory_length(agent_valid_trajs)),
@@ -218,6 +227,7 @@ def train_fisher(
         if agent_type == "sac":
             agent.optimize(
                 train_env=train_env,
+                policy_old=policy_old,
                 total_steps=n_inner_steps,
                 batch_size=int(inner_params["batch_size"]),
                 max_grad_norm=inner_params["max_grad_norm"],
@@ -260,6 +270,7 @@ def train_fisher(
             "n_inner_steps": n_inner_steps,
             "n_agent_trajs": n_agent_trajs,
             "alpha": fisher_cfg["alpha"],
+            "beta": fisher_cfg["beta"],
             "gamma": fisher_cfg["gamma"],
             "fisher_reg": fisher_cfg["fisher_reg"],
             "mode": fisher_cfg["mode"],
@@ -267,8 +278,8 @@ def train_fisher(
             "cg_tol": "None" if fisher_cfg.get("cg_tol") is None else fisher_cfg["cg_tol"],
             "cg_max_iters": "None" if fisher_cfg.get("cg_max_iters") is None else fisher_cfg["cg_max_iters"],
             "sketch_size": "None" if fisher_cfg.get("sketch_size") is None else fisher_cfg["sketch_size"],
+            "sketch_decomposition": "None" if fisher_cfg.get("sketch_decomposition") is None else fisher_cfg["sketch_decomposition"],
             "fisher_batch_size": fisher_cfg["fisher_batch_size"],
-            "cbscfd_variant": fisher_cfg.get("cbscfd_variant", "baseline"),
             "lr_reward": fisher_cfg["lr_reward"],
             "max_grad_norm": fisher_cfg["max_grad_norm"],
             "scheduler_gamma": fisher_cfg["scheduler_gamma"],
@@ -479,6 +490,8 @@ def train_fisher(
             mlflow.log_metrics(
                 {
                     "timing/inner_step_seconds": float(timer.elapsed),
+                    "regularization/effective_beta": float(outer_optimizer.beta),
+                    "regularization/has_policy_old": float(policy_old is not None),
                     "resources/inner_step_start_rss_mb": ram.metrics["start_rss_mb"],
                     "resources/inner_step_peak_rss_mb": ram.metrics["peak_rss_mb"],
                     "resources/inner_step_end_rss_mb": ram.metrics["end_rss_mb"],
@@ -536,6 +549,10 @@ def train_fisher(
             if outer_step < n_outer_steps:
                 with RecordTime() as timer:
                     outer_optimizer.step(expert_train_trajs, agent_train_trajs)
+
+                policy_old = copy.deepcopy(policy)
+                policy_old.eval()
+                policy_old.requires_grad_(False)
 
                 total_optimization_time += timer.elapsed
                 outer_step_times.append(timer.elapsed)

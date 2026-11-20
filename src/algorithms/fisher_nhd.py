@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import Literal
 from tqdm import tqdm
 
@@ -18,6 +20,7 @@ class FisherNHD:
         policy: Policy,
         gamma: float,
         alpha: float,
+        beta: float,
         lr: float,
         fisher_reg: float,
         max_grad_norm: float | None = None,
@@ -27,12 +30,9 @@ class FisherNHD:
         cg_max_iters: int | None = None,
         cg_tol: float | None = None,
         sketch_size: int | None = None,
+        sketch_decomposition: Literal["svd", "qr_svd"] = "svd",
         fisher_batch_size: int = 256,
-        cbscfd_variant: str = "baseline",
     ):
-        if cbscfd_variant not in {"baseline", "qr_only"}:
-            raise ValueError(f"Unknown CBSCFD variant: {cbscfd_variant}.")
-        self.cbscfd_variant = cbscfd_variant
 
         if mode not in {"explicit", "cg", "sketch"}:
             raise ValueError(f"Unknown Fisher solve mode: {mode}. Expected one of {'explicit', 'cg', 'sketch'}.")
@@ -44,17 +44,27 @@ class FisherNHD:
             if cg_tol is None or cg_tol <= 0:
                 raise ValueError("cg_tol must be positive when mode='cg'.")
 
-        if mode == "sketch" and (sketch_size is None or sketch_size <= 0):
-            raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
+        if mode == "sketch":
+            if sketch_size is None or sketch_size <= 0:
+                raise ValueError("sketch_size must be a positive integer when mode='sketch'.")
 
-        if mode == "sketch" and fisher_reg <= 0:
-            raise ValueError("fisher_reg must be positive when mode='sketch'.")
+            if fisher_reg <= 0:
+                raise ValueError("fisher_reg must be positive when mode='sketch'.")
+
+            if sketch_decomposition not in {"svd", "qr_svd"}:
+                raise ValueError(f"Unknown CBSCFD decomposition: {sketch_decomposition}.")
 
         if fisher_batch_size <= 0:
             raise ValueError(f"fisher_batch_size must be positive, got {fisher_batch_size}.")
 
         if fisher_reg < 0:
             raise ValueError(f"fisher_reg must be non-negative, got {fisher_reg}.")
+
+        if beta < 0:
+            raise ValueError(f"beta must be non-negative, got {beta}.")
+
+        if alpha + beta <= 0:
+            raise ValueError("alpha + beta must be positive.")
 
         if implementation not in {"streaming", "materialized"}:
             raise ValueError(f"Unknown Fisher implementation: {implementation}. Expected one of {'streaming', 'materialized'}.")
@@ -64,6 +74,7 @@ class FisherNHD:
         self.fisher_reg = fisher_reg
         self.gamma = gamma
         self.alpha = alpha
+        self.beta = beta
         self.max_grad_norm = max_grad_norm
         self.scheduler_gamma = scheduler_gamma
         self.mode = mode
@@ -71,6 +82,7 @@ class FisherNHD:
         self.cg_max_iters = cg_max_iters
         self.cg_tol = cg_tol
         self.sketch_size = sketch_size
+        self.sketch_decomposition = sketch_decomposition
         self.fisher_batch_size = fisher_batch_size
 
         self.optimizer = torch.optim.SGD(self.reward.parameters(), lr=lr)
@@ -222,7 +234,7 @@ class FisherNHD:
             grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
 
             with torch.no_grad():
-                row_scale = torch.sqrt((self.alpha / len(trajs)) * batch_weights)  # (B,)
+                row_scale = torch.sqrt(((self.alpha + self.beta) / len(trajs)) * batch_weights)  # (B,)
                 D_batch = (row_scale.reshape(-1, 1) * grad_log_pi_a_s)  # (B, policy_dim)
 
             rows.append(D_batch)
@@ -327,7 +339,7 @@ class FisherNHD:
                 create_graph=False,
             )[0].detach()  # (B,)
 
-            scaled_weights = (self.alpha * batch_weights / len(trajs))  # (B,)
+            scaled_weights = (self.alpha + self.beta) * batch_weights / len(trajs)  # (B,)
 
             x = scaled_weights * jv  # (B,)
             jt_x = torch.autograd.grad(
@@ -388,7 +400,7 @@ class FisherNHD:
             batch_weights = torch.cat(weights_buffer, dim=0)
 
             grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions) # (B, policy_dim)
-            scaled_weights = (self.alpha * batch_weights / len(trajs)).reshape(-1, 1) # (B, 1)
+            scaled_weights = ((self.alpha + self.beta) * batch_weights / len(trajs)).reshape(-1, 1) # (B, 1)
             F.addmm_(grad_log_pi_a_s.T, grad_log_pi_a_s * scaled_weights) # (policy_dim, policy_dim)
 
             states_buffer.clear()
@@ -518,7 +530,7 @@ class FisherNHD:
         return x
 
     def fisher_solve_sketch_streaming(self, agent_trajs, g: torch.Tensor, sketch_size: int, verbose: bool = True) -> torch.Tensor:
-        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32, variant=self.cbscfd_variant)
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=torch.float32, decomposition=self.sketch_decomposition)
 
         states_buffer = []
         actions_buffer = []
@@ -535,7 +547,7 @@ class FisherNHD:
             grad_log_pi_a_s = self._grad_log_pi_a_s(batch_states, batch_actions)  # (B, policy_dim)
 
             with torch.no_grad():
-                row_scale = torch.sqrt((self.alpha / len(agent_trajs)) * batch_weights)  # (B,)
+                row_scale = torch.sqrt(((self.alpha + self.beta) / len(agent_trajs)) * batch_weights)  # (B,)
                 X_rows = row_scale.reshape(-1, 1) * grad_log_pi_a_s  # (B, policy_dim)
 
             sketch.extend(X_rows)
@@ -633,7 +645,7 @@ class FisherNHD:
 
     @torch.no_grad()
     def fisher_solve_sketch_materialized(self, D: torch.Tensor, g: torch.Tensor, sketch_size: int) -> torch.Tensor:
-        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype, variant=self.cbscfd_variant)
+        sketch = CBSCFD(dim=self.policy_num_params, m=sketch_size, reg=self.fisher_reg, dtype=D.dtype, decomposition=self.sketch_decomposition)
         sketch.extend(D)
         out = sketch.solve(g)
 
@@ -657,6 +669,25 @@ class FisherNHD:
         # 2. Inverse-Fisher-vector product
         if implementation == "materialized":
             D = self._weighted_score_matrix(agent_trajs)
+
+            # HARDCODE
+            d_path = os.getenv("D_PATH")
+            g_path = os.getenv("G_PATH")
+
+            if d_path is not None:
+                path = Path(d_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(D.detach().cpu(), path)
+                print(f"Saved D matrix to {path}")
+
+            if g_path is not None:
+                path = Path(g_path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(d_outer_d_policy.detach().cpu(), path)
+                print(f"Saved g vector to {path}")
+
+            if d_path is not None or g_path is not None:
+                raise SystemExit(0)
 
             try:
                 with RAM() as ram:
@@ -739,12 +770,18 @@ class FisherNHD:
             self.scheduler.step()
 
         return hypergradient
-    
-    def d_inner_d_policy(self, trajs, verbose: bool = True) -> torch.Tensor:
+
+    def d_inner_d_policy(self, trajs, policy_old: Policy = None, verbose: bool = True) -> torch.Tensor:
         """
+        Compute d_L_inner / d_theta.
         DIAGNOSTICS ONLY.
         """
+        if self.beta > 0 and policy_old is None:
+            raise ValueError("policy_old is required when beta > 0.")
+
         out = torch.zeros(self.policy_num_params, dtype=torch.float32, device=self.device)
+
+        policy_params = list(self.policy.parameters())
 
         for traj in tqdm(trajs, desc="Inner gradient", leave=False, disable=not verbose):
             states = to_device(traj["states"], self.device)
@@ -753,31 +790,36 @@ class FisherNHD:
             log_probs = self.policy.log_prob(states, actions)
             rewards = self.reward(states, actions).detach()
 
+            if self.beta > 0:
+                with torch.no_grad():
+                    old_log_probs = policy_old.log_prob(states, actions)
+            else:
+                old_log_probs = torch.zeros_like(log_probs)
+
             T = log_probs.numel()
             weights = discount_weights(T, self.gamma, self.device, log_probs.dtype)
 
-            per_step_loss = weights * (self.alpha * log_probs.detach() - rewards)
-
+            per_step_loss = weights * (self.alpha + self.beta) * log_probs.detach() - self.beta * old_log_probs - rewards
             tail_losses = torch.flip(torch.cumsum(torch.flip(per_step_loss, dims=[0]), dim=0), dims=[0]).detach()
 
             score_term = torch.autograd.grad(
                 outputs=(tail_losses * log_probs).sum(),
-                inputs=list(self.policy.parameters()),
+                inputs=policy_params,
                 retain_graph=True,
                 create_graph=False,
             )
             score_term = flat_grad(score_term).detach()
 
-            entropy_direct_term = torch.autograd.grad(
-                outputs=self.alpha * (weights * log_probs).sum(),
-                inputs=list(self.policy.parameters()),
+            direct_term = torch.autograd.grad(
+                outputs=(self.alpha + self.beta) * (weights * log_probs).sum(),
+                inputs=policy_params,
                 retain_graph=False,
                 create_graph=False,
             )
-            entropy_direct_term = flat_grad(entropy_direct_term).detach()
+            direct_term = flat_grad(direct_term).detach()
 
             out.add_(score_term)
-            out.add_(entropy_direct_term)
+            out.add_(direct_term)
 
         out.div_(len(trajs))
         return out
