@@ -1,15 +1,3 @@
-"""
-Policy final training.
-
-Usage:
-    python -m src.irl.policy_final_training \
-        --env lqr \
-        --config config/lqr_final_fisher.yaml \
-        --checkpoint checkpoints/lqr/fisher.pt \
-        --run-name final_fisher \
-        --log-dir logs/lqr/exp1/final_policy_training
-"""
-
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -237,13 +225,8 @@ def main() -> None:
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-
     log_path = log_dir / f"{timestamp}.log"
-
-    logger = get_logger(
-        f"policy_final_training_{env_name}",
-        log_path=log_path,
-    )
+    logger = get_logger(f"policy_final_training_{env_name}", log_path=log_path)
 
     env_builders = import_env_builders(env_name)
 

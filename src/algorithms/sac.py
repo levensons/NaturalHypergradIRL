@@ -139,6 +139,7 @@ class SAC:
         n_hidden_layers: int = 1,
         gamma: float = 0.99,
         alpha: float = 1.0,
+        beta: float = 0.0,
         tau: float = 0.005,
         replay_buffer_capacity: int = 1_000_000,
     ):
@@ -166,6 +167,7 @@ class SAC:
         self.critic_optimizer = torch.optim.Adam(self.critic_params)
 
         self.alpha = alpha
+        self.beta = beta
         self.gamma = gamma
         self.tau = tau
 
@@ -228,6 +230,7 @@ class SAC:
     def optimize(
         self,
         train_env: Environment,
+        policy_old: Policy = None,
         total_steps: int = 1_000_000,
         batch_size: int = 256,
         max_grad_norm: float = 1.0,
@@ -264,10 +267,15 @@ class SAC:
                 with torch.no_grad():
                     next_actions, next_log_probs = self.policy.sample(next_states, return_log_probs=True)
 
+                    if policy_old is not None and self.beta > 0:
+                        next_old_log_probs = policy_old.log_prob(next_states, next_actions)
+                    else:
+                        next_old_log_probs = torch.zeros_like(next_log_probs)
+
                     next_q1 = self.q1_target(next_states, next_actions)
                     next_q2 = self.q2_target(next_states, next_actions)
                     next_q = torch.min(next_q1, next_q2)
-                    target_q = rewards + self.gamma * (1.0 - terminateds) * (next_q - self.alpha * next_log_probs)
+                    target_q = rewards + self.gamma * (1.0 - terminateds) * (next_q - (self.alpha + self.beta) * next_log_probs + self.beta * next_old_log_probs)
 
                 current_q1 = self.q1(states, actions)
                 current_q2 = self.q2(states, actions)
@@ -286,11 +294,16 @@ class SAC:
                 # ACTOR
                 new_actions, log_probs = self.policy.sample(states, return_log_probs=True)
 
+                if policy_old is not None and self.beta > 0:
+                    old_log_probs = policy_old.log_prob(states, new_actions)
+                else:
+                    old_log_probs = torch.zeros_like(log_probs)
+
                 q1 = self.q1(states, new_actions)
                 q2 = self.q2(states, new_actions)
                 q = torch.min(q1, q2)
 
-                policy_loss = torch.mean(self.alpha * log_probs - q)
+                policy_loss = torch.mean((self.alpha + self.beta) * log_probs - self.beta * old_log_probs - q)
 
                 self.policy_optimizer.zero_grad()
                 torch.autograd.backward(policy_loss, inputs=self.policy_params)

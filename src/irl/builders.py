@@ -22,7 +22,7 @@ def import_env_builders(env_name: str) -> ModuleType:
         raise
 
 
-def build_agent(policy, env, agent_cfg: dict, gamma: float, alpha: float):
+def build_agent(policy, env, agent_cfg: dict, gamma: float, alpha: float, beta: float):
     agent_type = agent_cfg["type"]
     params = agent_cfg["params"]
 
@@ -35,6 +35,7 @@ def build_agent(policy, env, agent_cfg: dict, gamma: float, alpha: float):
             n_hidden_layers=int(params["q_n_hidden_layers"]),
             gamma=float(gamma),
             alpha=float(alpha),
+            beta=float(beta),
             tau=float(params["tau"]),
             replay_buffer_capacity=int(params["replay_buffer_capacity"]),
         )

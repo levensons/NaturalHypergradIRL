@@ -107,16 +107,24 @@ def outer_loss(policy, expert_trajs, gamma: float) -> float:
 
 
 @torch.no_grad()
-def inner_loss(policy, reward, trajs, gamma: float, alpha: float) -> float:
+def inner_loss(policy, reward, trajs, gamma: float, alpha: float, beta: float = 0.0, policy_old=None) -> float:
     if not (0.0 < gamma <= 1.0):
         raise ValueError(f"`gamma` must satisfy 0 < gamma <= 1, got {gamma}.")
 
-    if not (0.0 < alpha):
-        raise ValueError(f"`alpha` must satisfy alpha > 0, got {alpha}.")
+    if alpha <= 0:
+        raise ValueError(f"`alpha` must be positive, got {alpha}.")
+
+    if beta < 0:
+        raise ValueError(f"`beta` must be non-negative, got {beta}.")
+
+    if beta > 0 and policy_old is None:
+        raise ValueError("policy_old is required when beta > 0.")
 
     device = next(policy.parameters()).device
     policy.eval()
     reward.eval()
+    if policy_old is not None:
+        policy_old.eval()
 
     loss = 0.0
     for traj in trajs:
@@ -126,8 +134,16 @@ def inner_loss(policy, reward, trajs, gamma: float, alpha: float) -> float:
 
         log_probs = policy.log_prob(states, actions)
         rewards = reward.rewards(states, actions)
+
+        if beta > 0:
+            old_log_probs = policy_old.log_prob(states, actions)
+        else:
+            old_log_probs = torch.zeros_like(log_probs)
+        
         weights = discount_weights(T, gamma, device, states.dtype)
-        loss += (weights * (alpha * log_probs - rewards)).sum().item()
+
+        per_step_loss = (alpha + beta) * log_probs - beta * old_log_probs - rewards
+        loss += (weights * per_step_loss).sum().item()
 
     return loss / len(trajs)
 
